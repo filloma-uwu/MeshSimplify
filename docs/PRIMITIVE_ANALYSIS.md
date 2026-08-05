@@ -65,10 +65,12 @@ configured circumferential segment count.
    primitive-count, support-depth, or per-merge triangle-reduction error gate:
    after conservative coverage is checked, the measured user-directed error
    limit alone decides whether the candidate is accepted. Failed candidates
-   are cached by the two endpoint versions. After an accepted merge, only the
-   changed patch and its neighbors are re-enqueued. Iteration stops at a fixed
-   point, and a final audit throws if any acceptable adjacent candidate
-   remains.
+   are cached by the two endpoint versions. The work list is streaming and
+   greedy: a pair is fitted only when it reaches the front, an accepted result
+   is applied immediately, and no global queue of already-fitted candidates is
+   built. After an accepted merge, only the changed patch and its neighbors are
+   re-enqueued. Iteration stops at a fixed point, and a final audit throws if
+   any acceptable adjacent candidate remains.
 
    Stage 3 creates surface candidates only. It never creates a fitted box,
    cylinder solid, frustum solid, or the boundary of such a fitted volume.

@@ -213,6 +213,11 @@ int main()
                     std::string::npos,
                 "adjacent surface merging must terminate at a verified fixed point");
         require(readText(root / "spatial_group_loose" /
+                         "surface_merge_profile.json").find(
+                    "\"strategy\":\"streaming_greedy_adjacent_fixed_point\"") !=
+                    std::string::npos,
+                "adjacent pairs must be evaluated and accepted immediately instead of pre-fitted globally");
+        require(readText(root / "spatial_group_loose" /
                          "coverage_audit_pre_repair.json").find(
                     "\"repair_face_count\":0") != std::string::npos,
                 "pre-canonicalization responsibility certificates must avoid safety repair");

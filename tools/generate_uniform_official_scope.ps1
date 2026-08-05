@@ -81,7 +81,7 @@ $models = foreach ($modelId in $modelIds) {
     [ordered]@{ id = $modelId; metadata = "models/$modelId/model.json" }
 }
 $manifest = [ordered]@{
-    algorithm = "CppAdjacentSurfaceFixedPointV4"
+    algorithm = "CppStreamingAdjacentSurfaceFixedPointV6"
     complete = $true
     model_count = $modelIds.Count
     models = @($models)

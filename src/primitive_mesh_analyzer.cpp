@@ -3412,19 +3412,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         std::size_t second = 0;
         std::uint64_t first_version = 0;
         std::uint64_t second_version = 0;
-        std::size_t triangles = 0;
-        double error = 0.0;
-    };
-    struct CandidateGreater
-    {
-        bool operator()(const Candidate& left, const Candidate& right) const
-        {
-            if (left.triangles != right.triangles)
-                return left.triangles > right.triangles;
-            if (left.error != right.error) return left.error > right.error;
-            if (left.first != right.first) return left.first > right.first;
-            return left.second > right.second;
-        }
     };
     struct Profile
     {
@@ -4185,16 +4172,19 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         cache[key] = {items[first].version, items[second].version, fit};
         return fit;
     };
-    std::priority_queue<Candidate, std::vector<Candidate>, CandidateGreater> queue;
+    // Process the current adjacency graph as a streaming greedy work list.
+    // Do not pre-fit and rank every edge: most of those expensive candidates
+    // become stale as soon as an earlier accepted merge changes an endpoint.
+    // The user contract is local and immediate: evaluate the current adjacent
+    // pair, merge it when the measured error passes, otherwise cache that
+    // failure until either endpoint version changes.
+    std::queue<Candidate> queue;
     const auto enqueue = [&](std::size_t first, std::size_t second)
     {
         if (first > second) std::swap(first, second);
         if (!items[first].active || !items[second].active ||
             !items[first].neighbors.contains(second)) return;
-        const auto fit = evaluate(first, second);
-        if (!fit) return;
-        queue.push({first, second, items[first].version, items[second].version,
-                    fit->triangles, fit->error});
+        queue.push({first, second, items[first].version, items[second].version});
     };
     for (std::size_t first = 0; first < items.size(); ++first)
         for (const auto second : items[first].neighbors)
@@ -4203,7 +4193,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
     merged_count = 0;
     while (!queue.empty())
     {
-        const Candidate candidate = queue.top();
+        const Candidate candidate = queue.front();
         queue.pop();
         if (!items[candidate.first].active || !items[candidate.second].active ||
             items[candidate.first].version != candidate.first_version ||
@@ -4298,7 +4288,9 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         if (item.active) result.push_back(std::move(item.output));
     std::ofstream profile_stream(profile_path);
     profile_stream << std::setprecision(17)
-        << "{\"complete\":true,\"input_primitives\":" << profile.input_primitives
+        << "{\"complete\":true"
+        << ",\"strategy\":\"streaming_greedy_adjacent_fixed_point\""
+        << ",\"input_primitives\":" << profile.input_primitives
         << ",\"initial_adjacencies\":" << profile.initial_adjacencies
         << ",\"responsibility_adjacencies\":"
         << profile.responsibility_adjacencies
