@@ -13,8 +13,8 @@ namespace pqss_proxy_mesh
 struct PrimitiveMeshAnalysisOptions
 {
     bool allow_polygon = true;
-    bool allow_frustum = true;
-    std::uint32_t frustum_segments = 24;
+    bool allow_round_surfaces = true;
+    std::uint32_t round_surface_segments = 24;
     // Legacy sweep control. The production path uses one structure policy.
     double analysis_strength = 0.5;
     // A non-negative value overrides the threshold derived from analysis_strength.
@@ -78,7 +78,6 @@ struct PrimitiveMeshAnalysisStats
     std::size_t discarded_degenerate_triangles = 0;
     std::size_t primitive_count = 0;
     std::size_t polygon_count = 0;
-    std::size_t frustum_count = 0;
     std::size_t disk_count = 0;
     std::size_t annulus_count = 0;
     std::size_t cylindrical_band_count = 0;

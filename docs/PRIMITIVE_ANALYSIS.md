@@ -37,10 +37,15 @@ configured circumferential segment count.
 
 1. Remove numerical zero-area faces and weld vertices by exact position.
 2. Form bounded normal domains from stable, high-area faces, then split them by
-   fitted plane distance and edge connectivity. This recovers one CAD surface
-   despite decimal-coordinate noise without merging arbitrary nearby faces.
-3. Classify circular planar domains as disks or annuli. Fit connected lateral
-   domains as cylindrical or conical bands and verify their side normals.
+   fitted plane distance and edge connectivity. Single-boundary approximate
+   planes become outward support polygons; this recovers one CAD surface despite
+   decimal-coordinate noise without merging arbitrary nearby faces.
+3. Classify circular planar domains as disks or annuli. A candidate takes
+   responsibility only for source triangles inside its actual radial domain;
+   islands inside an annular opening remain available to later analysis. Fit
+   connected lateral domains as cylindrical or conical bands and verify their
+   side normals. Their circumscribed tessellation is audited directly as a
+   surface, including complete 360-degree bands.
 4. Evaluate every inner boundary independently. Its conservative loop area
    times model depth is divided by the whole-model AABB volume. Small holes may
    close; a large body cavity remains. Repeated closed components with matching
@@ -49,27 +54,18 @@ configured circumferential segment count.
 5. Merge every adjacent patch that has the same certified analytic surface;
    clipped patches retain their parameter-domain boundary, while a certified
    original complete surface may be restored.
-6. Remove exact overlap and certified internal surfaces. Build a spatial
-   hierarchy over the complete phase-2 surface, including every retained large
-   cavity, independent of patch type. At each hierarchy node, fit the box
-   orientation to the proxy patches, minimally expand its local extents to
-   contain every original responsibility triangle, and test whether that
-   conservative shell can replace the complete descendant group. Accept the
-   coarsest admissible node; otherwise recurse to its children. Requests above
-   the default error first build the default-error fixed point and then simplify
-   that result further, so increasing the error limit cannot reintroduce work.
-   After every pass, primitives fully
-   enclosed by an accepted replacement transfer their source responsibility to
-   that enclosure and are deleted. The hierarchy is rebuilt and evaluated
-   again until neither a merge nor an enclosed-primitive deletion occurs. A
-   fixed-point local surface merge then handles remaining coplanar neighbors.
-   Every approximate replacement
-   must pass the sampled directed simplified-to-hole-filled distance limit
-   `maximum_open_error_distance`. Hole filling itself is not charged to this
-   error because phase 1 is the distance reference. PQSS workload and a target
-   primitive count are not part of the geometry decision. Source faces still
-   failing the final conservative audit are passed through the same bounded box
-   hierarchy; only faces that cannot be safely grouped remain exact triangles.
+6. Remove exact overlap and certified internal surfaces. Stage 3 is a
+   surface-candidate search only: a planar, circular, cylindrical, or conical
+   patch may merge only into another supported surface patch. A fitted box,
+   cylinder solid, frustum solid, or the boundary of such a fitted volume is not
+   an eligible simplification candidate. Volume certificates may prove that an
+   existing surface is occluded, but cannot create replacement geometry.
+   Every approximate surface replacement must pass the sampled directed
+   simplified-to-hole-filled distance limit `maximum_open_error_distance`.
+   Hole filling itself is not charged because phase 1 is the distance reference.
+   PQSS workload and a target primitive count are not part of the geometry
+   decision. Source faces still failing the final conservative audit remain exact
+   surface triangles; repair never introduces a fitted solid.
 7. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
@@ -96,14 +92,10 @@ Each analyzed model directory contains:
 - `model.json`: type counts, triangle counts, fill diagnostics, and timing.
 - `intercomponent_gap_profile.json`: accepted per-gap bridge bounds and volume
   ratios when repeated closed components contain fillable spaces;
-- `spatial_group_merge_profile.json`: spatial hierarchy candidate and accepted
-  box counts plus distance-evaluation time.
-- `spatial_group_fixed_point_profile.json`: number of rebuild passes, total
-  accepted groups, and primitives deleted after becoming enclosed.
+- `spatial_group_fixed_point_profile.json`: records that stage 3 is operating in
+  surface-only mode and the requested directed-error limit;
 - `coverage_audit_pre_repair.json`: exported workload before conservative
   fallback repair, the exact source-face IDs, and the reduced repair workload;
-- `coverage_repair_merge_profile.json`: candidates used to replace audit repair
-  triangles by conservative error-bounded boxes;
 - `final_occlusion_certificate_profile.json`: historical versus active closed
   certificates used by final overlap removal;
 - `stage_error_profile.jsonl`: primitive workload and measured maximum error at
@@ -112,8 +104,7 @@ Each analyzed model directory contains:
 The maximum and mean simplification errors in `model.json` and the viewer are
 directed from phase 3/4 to phase 1. Strict conservative coverage is still
 audited independently against `source.obj`. Exact source-triangle safety
-repairs are not approximation error; approximate box repairs are included in
-the phase-3 error audit.
+repairs are not approximation error and remain exact surface triangles.
 
 Audit a completed batch, including finite coordinates, zero-area triangles,
 exact duplicate triangles, containment, error limits, timings, and peak memory:

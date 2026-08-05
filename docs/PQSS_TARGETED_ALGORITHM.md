@@ -158,29 +158,22 @@ Three-axis paired ray intervals supplement the flood fill for thin or
 disconnected CAD exports.
 This is a CPU implementation and does not depend on PaMO's CUDA/Warp runtime.
 
-Every closed box or frustum candidate is voxelized in the same grid. The
-optimizer measures both total added volume and the largest six-connected added
-component against the complete-model reference. Local envelopes use the
-per-cavity limit; envelopes joining multiple components use the separate group
-limit. The final combined state is checked against the group limit rather than
-incorrectly reapplying the local limit. The final OBJ still comes from
-analytically enclosing polygons and frustums, not marching cubes.
+The grid may certify that an already existing surface is hidden by a closed
+region, but it never creates a closed box, cylinder, or frustum candidate.
+Candidate geometry is surface-only.  A box-shaped result, when it arises from
+the input geometry, is represented by six independently certified polygon
+faces; a round result is represented by disk/annulus faces and cylindrical or
+conical side faces.  The final OBJ comes only from triangulating those surfaces,
+not from marching cubes or from decomposing a fitted solid.
 
 ### 4.1 Analytic Sweep Atoms
 
-Approximate planar analysis proposes circular disk or annulus end surfaces.
-Pairs are eligible only when their normals are parallel to the center axis,
-their centers are coaxial, and their radii are compatible. Complete coplanar
-regions whose vertices lie inside the proposed sweep become its candidate
-responsibility. A final circumscribed frustum is then refit to all responsible
-vertices, so triangle tessellation remains a strict enclosure.
-
-Sweep atoms and all unclaimed planar regions form a second SAH hierarchy. Its
-frontier competes with the untouched planar/box hierarchy. A box cannot erase
-a certified sweep that is both long (axial aspect at least 2.5) and responsible
-for at least 5% of the complete model faces. Short bores, round chamfers, and
-small circular details remain ordinary optional candidates and never force the
-model down a curved path.
+Approximate planar analysis proposes circular disk or annulus surfaces.
+Non-planar analysis proposes cylindrical or conical side surfaces directly.
+Compatible disconnected CAD patches may be united only when they certify the
+same axis, radius law, axial domain, and complementary angular domain.  The
+candidate remains one side surface; end disks are separate candidates with
+their own responsibility.  No sweep volume exists in the candidate pool.
 
 ### 5. PQSS Static Work Vector
 

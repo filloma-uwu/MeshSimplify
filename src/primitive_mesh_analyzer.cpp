@@ -217,7 +217,6 @@ struct Mesh
 enum class Kind
 {
     Rectangle,
-    Frustum,
     Triangle,
     Polygon,
     Disk,
@@ -258,26 +257,6 @@ struct BoxFit
     double volume = 0.0;
 };
 
-struct VolumeFit
-{
-    BoxFit box;
-    Primitive frustum;
-    bool use_frustum = false;
-    double volume = 0.0;
-    double surface_area = 0.0;
-};
-
-VolumeFit boxVolumeFit(const BoxFit& box)
-{
-    VolumeFit fit;
-    fit.box = box;
-    fit.volume = box.volume;
-    const Vec3 extent = box.half_size * 2.0;
-    fit.surface_area = 2.0 * (extent.x() * extent.y() + extent.y() * extent.z() +
-                              extent.z() * extent.x());
-    return fit;
-}
-
 struct OutputPrimitive
 {
     Primitive primitive;
@@ -289,6 +268,24 @@ struct OutputPrimitive
     // bridge between different shells or between a shell and an unrelated face.
     std::uint64_t enclosure_group = 0;
 };
+
+bool isSurfaceCandidateKind(const Kind kind)
+{
+    return kind == Kind::Rectangle || kind == Kind::Triangle ||
+           kind == Kind::Polygon || kind == Kind::Disk ||
+           kind == Kind::Annulus || kind == Kind::CylindricalBand ||
+           kind == Kind::ConicalBand;
+}
+
+void requireSurfaceCandidates(const std::vector<OutputPrimitive>& primitives,
+                              const char* stage)
+{
+    for (const auto& item : primitives)
+        if (!isSurfaceCandidateKind(item.primitive.kind))
+            throw std::runtime_error(
+                std::string(stage) +
+                " produced a volumetric primitive; only surface candidates are allowed");
+}
 
 struct CertifiedExtrusion
 {
@@ -521,17 +518,6 @@ double primitiveSurfaceArea(const Primitive& primitive, const double dimensional
         return std::numbers::pi *
             (primitive.base_radius + primitive.top_radius) * slant;
     }
-    if (primitive.kind == Kind::Frustum)
-    {
-        if (primitive.height <= dimensional_tolerance)
-            return std::numbers::pi * primitive.base_radius * primitive.base_radius;
-        const double slant = std::hypot(
-            primitive.height, primitive.top_radius - primitive.base_radius);
-        return std::numbers::pi * (primitive.base_radius + primitive.top_radius) * slant +
-               std::numbers::pi * (primitive.base_radius * primitive.base_radius +
-                                   primitive.top_radius * primitive.top_radius);
-    }
-
     std::array<double, 3> extents{
         2.0 * primitive.half_size.x(),
         2.0 * primitive.half_size.y(),
@@ -632,6 +618,13 @@ BoxFit fitBox(const Mesh& mesh, const std::vector<std::uint32_t>& vertex_ids)
     return best;
 }
 
+double boxSurfaceArea(const BoxFit& box)
+{
+    const Vec3 extent = box.half_size * 2.0;
+    return 2.0 * (extent.x() * extent.y() + extent.y() * extent.z() +
+                  extent.z() * extent.x());
+}
+
 std::optional<Vec2> leastSquaresCircleCenter(
     const std::vector<Vec2>& points)
 {
@@ -723,8 +716,8 @@ Primitive fitConeOnAxis(const Mesh& mesh,
         if (local.x() <= lower + end_tolerance) base_radius = std::max(base_radius, radius);
         if (local.x() >= upper - end_tolerance) top_radius = std::max(top_radius, radius);
     }
-    // Expand both end radii by the largest deficit so the fitted frustum still
-    // contains every input vertex, including intermediate axial rings.
+    // Expand both end radii by the largest deficit so the fitted side surface
+    // still covers every input vertex, including intermediate axial rings.
     double deficit = 0.0;
     if (height > 0.0)
     {
@@ -748,7 +741,9 @@ Primitive fitConeOnAxis(const Mesh& mesh,
     base_radius *= polygon_expansion * (1.0 + 1.0e-12);
     top_radius *= polygon_expansion * (1.0 + 1.0e-12);
     Primitive result;
-    result.kind = Kind::Frustum;
+    result.kind = std::abs(base_radius - top_radius) <=
+            1.0e-8 * std::max({base_radius, top_radius, height})
+        ? Kind::CylindricalBand : Kind::ConicalBand;
     result.axes = frame;
     result.height = height;
     result.center = mean + frame.col(1) * radial_center.x() +
@@ -756,8 +751,6 @@ Primitive fitConeOnAxis(const Mesh& mesh,
     result.base_radius = base_radius;
     result.top_radius = top_radius;
     result.segments = segments;
-    result.volume = std::numbers::pi * height / 3.0 *
-        (base_radius * base_radius + base_radius * top_radius + top_radius * top_radius);
     return result;
 }
 
@@ -938,44 +931,32 @@ bool coneFitIsCertified(const Mesh& mesh,
     return true;
 }
 
-double boxSurfaceArea(const BoxFit& box)
-{
-    const Vec3 extent = box.half_size * 2.0;
-    return 2.0 * (extent.x() * extent.y() + extent.y() * extent.z() +
-                  extent.z() * extent.x());
-}
-
-VolumeFit fitBestVolume(const Mesh& mesh,
-                        const std::vector<std::uint32_t>& faces,
-                        const PrimitiveMeshAnalysisOptions& options,
-                        const double analytic_tolerance = 0.0,
-                        const bool allow_conservative_enclosing_frustum = false)
+std::optional<Primitive> fitCertifiedRevolvedSurface(
+    const Mesh& mesh,
+    const std::vector<std::uint32_t>& faces,
+    const PrimitiveMeshAnalysisOptions& options,
+    const double analytic_tolerance = 0.0)
 {
     const auto vertices = uniqueVertices(mesh, faces);
-    VolumeFit best;
-    best.box = fitBox(mesh, vertices);
-    best.volume = best.box.volume;
-    best.surface_area = boxSurfaceArea(best.box);
-    if (options.allow_frustum)
+    std::optional<Primitive> best;
+    double best_surface_area = std::numeric_limits<double>::infinity();
+    if (!options.allow_round_surfaces) return std::nullopt;
+    for (const Mat3& frame : candidateFrames(mesh, vertices))
     {
-        for (const Mat3& frame : candidateFrames(mesh, vertices))
+        for (int axis = 0; axis < 3; ++axis)
         {
-            for (int axis = 0; axis < 3; ++axis)
+            Primitive candidate = fitConeOnAxis(
+                mesh, vertices, static_cast<Vec3>(frame.col(axis)),
+                options.round_surface_segments, analytic_tolerance);
+            if (!coneFitIsCertified(
+                    mesh, faces, candidate,
+                    options.circle_radial_tolerance, analytic_tolerance))
+                continue;
+            const double surface_area = primitiveSurfaceArea(candidate, 1.0e-12);
+            if (!best || surface_area < best_surface_area)
             {
-                Primitive candidate = fitConeOnAxis(mesh, vertices, static_cast<Vec3>(frame.col(axis)),
-                                                      options.frustum_segments,
-                                                      analytic_tolerance);
-                if (candidate.volume < best.volume &&
-                    (allow_conservative_enclosing_frustum ||
-                     coneFitIsCertified(mesh, faces, candidate,
-                                        options.circle_radial_tolerance,
-                                        analytic_tolerance)))
-                {
-                    best.frustum = candidate;
-                    best.use_frustum = true;
-                    best.volume = candidate.volume;
-                    best.surface_area = primitiveSurfaceArea(candidate, 1.0e-12);
-                }
+                best = std::move(candidate);
+                best_surface_area = surface_area;
             }
         }
     }
@@ -2259,7 +2240,7 @@ std::vector<OutputPrimitive> classifyFinalRegion(
         }
     }
 
-    if (options.allow_frustum && polygon.size() >= 8)
+    if (options.allow_round_surfaces && polygon.size() >= 8)
     {
         Vec2 center = Vec2::Zero();
         for (const Vec2& point : polygon) center += point;
@@ -2282,7 +2263,17 @@ std::vector<OutputPrimitive> classifyFinalRegion(
         const double circularity = perimeter > 0.0
             ? 4.0 * std::numbers::pi * polygon_area / (perimeter * perimeter)
             : 0.0;
-        const double circle_area = std::numbers::pi * mean * mean;
+        const double maximum_radius = *std::max_element(
+            radii.begin(), radii.end());
+        const double polygon_expansion = options.round_surface_segments >= 3
+            ? 1.0 / std::cos(
+                std::numbers::pi /
+                static_cast<double>(options.round_surface_segments))
+            : std::numeric_limits<double>::infinity();
+        const double conservative_radius = maximum_radius *
+            polygon_expansion * (1.0 + 1.0e-12);
+        const double circle_area = std::numbers::pi *
+            conservative_radius * conservative_radius;
         const double circle_excess_ratio =
             std::max(circle_area - effective_source_area, 0.0) /
             std::max(model_surface_area, 1.0e-30);
@@ -2292,14 +2283,18 @@ std::vector<OutputPrimitive> classifyFinalRegion(
             circle_excess_ratio <= allowed_excess_ratio)
         {
             Primitive circle;
-            circle.kind = Kind::Frustum;
+            circle.kind = Kind::Disk;
             circle.center = origin + frame.col(0) * center.x() + frame.col(1) * center.y();
             circle.axes.col(0) = normal;
             circle.axes.col(1) = frame.col(0);
             circle.axes.col(2) = frame.col(1);
-            circle.base_radius = mean;
-            circle.top_radius = mean;
-            circle.segments = options.frustum_segments;
+            // The emitted regular polygon is inscribed in its radius.  Expand
+            // the fitted circle to the circumscribed radius so the triangle OBJ
+            // covers the complete source boundary rather than only its sampled
+            // vertices.
+            circle.base_radius = conservative_radius;
+            circle.top_radius = conservative_radius;
+            circle.segments = options.round_surface_segments;
             filled_holes += hole_count;
             return {{circle, faces}};
         }
@@ -2354,6 +2349,38 @@ CircularLoopFit fitCircularLoop(const std::vector<Vec2>& loop,
             2.0 * radial_tolerance * fit.mean_radius &&
         ringLooksCircular(centered, 2.0 * radial_tolerance);
     return fit;
+}
+
+bool analyticPlanarSurfaceOwnsFace(
+    const Mesh& mesh, const std::uint32_t face_id,
+    const Primitive& surface, const double tolerance)
+{
+    if (face_id >= mesh.faces.size() ||
+        (surface.kind != Kind::Disk && surface.kind != Kind::Annulus) ||
+        surface.segments < 3)
+        return false;
+    // The outer regular polygon is emitted with a circumscribed radius, so its
+    // inradius is the guaranteed radial coverage.  The inner annulus polygon is
+    // inscribed; retaining the continuous inner radius is conservative when
+    // deciding which source triangles this candidate may own.
+    const double outer_inradius = surface.base_radius * std::cos(
+        std::numbers::pi / static_cast<double>(surface.segments));
+    const auto covered = [&](const Vec3& point)
+    {
+        const Vec3 local = surface.axes.transposeMultiply(point - surface.center);
+        if (local.x() > tolerance) return false;
+        const double radius = std::hypot(local.y(), local.z());
+        if (radius > outer_inradius + tolerance) return false;
+        return surface.kind != Kind::Annulus ||
+               radius >= surface.inner_radius - tolerance;
+    };
+    const Face& face = mesh.faces[face_id];
+    if (!std::all_of(face.begin(), face.end(), [&](const auto vertex)
+        { return covered(mesh.vertices[vertex]); }))
+        return false;
+    const Vec3 centroid = (mesh.vertices[face[0]] + mesh.vertices[face[1]] +
+                           mesh.vertices[face[2]]) / 3.0;
+    return covered(centroid);
 }
 
 std::vector<std::vector<std::uint32_t>> approximatePlanarRegions(
@@ -2472,6 +2499,76 @@ std::vector<std::vector<std::uint32_t>> approximatePlanarRegions(
     return result;
 }
 
+std::vector<OutputPrimitive> classifyApproximatePlanarSurface(
+    const Mesh& mesh, const std::vector<std::uint32_t>& faces,
+    const Vec3& model_center, const double model_diagonal,
+    const PrimitiveMeshAnalysisOptions& options)
+{
+    if (faces.size() < 6 || faceComponentCount(mesh, faces) != 1) return {};
+    Vec3 reference = Vec3::Zero();
+    Vec3 normal_sum = Vec3::Zero();
+    for (const auto face_id : faces)
+    {
+        const Face& face = mesh.faces[face_id];
+        Vec3 doubled_area = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+            .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+        if (doubled_area.norm() <= 1.0e-30) continue;
+        if (reference.norm() == 0.0) reference = doubled_area.normalized();
+        if (doubled_area.dot(reference) < 0.0) doubled_area *= -1.0;
+        normal_sum += doubled_area;
+    }
+    if (normal_sum.norm() <= 1.0e-30) return {};
+    Vec3 normal = normal_sum.normalized();
+    const auto vertices = uniqueVertices(mesh, faces);
+    Vec3 center = Vec3::Zero();
+    for (const auto vertex : vertices) center += mesh.vertices[vertex];
+    center /= static_cast<double>(vertices.size());
+    const double tolerance = std::max(
+        model_diagonal * options.analytic_surface_relative_tolerance, 1.0e-10);
+    double lower = std::numeric_limits<double>::infinity();
+    double upper = -std::numeric_limits<double>::infinity();
+    for (const auto vertex : vertices)
+    {
+        const double distance = (mesh.vertices[vertex] - center).dot(normal);
+        lower = std::min(lower, distance);
+        upper = std::max(upper, distance);
+    }
+    if (upper - lower > 2.0 * tolerance) return {};
+
+    const auto loops = boundaryLoops(mesh, faces);
+    if (loops.size() != 1 || loops.front().size() < 3) return {};
+    if ((center - model_center).dot(normal) < 0.0) normal *= -1.0;
+    const Mat3 basis = orthonormalFrame(normal);
+    Mat3 frame;
+    frame.col(0) = static_cast<Vec3>(basis.col(1));
+    frame.col(1) = static_cast<Vec3>(basis.col(2));
+    frame.col(2) = normal;
+    std::vector<Vec2> boundary;
+    boundary.reserve(loops.front().size());
+    for (const auto vertex : loops.front())
+    {
+        const Vec3 local = frame.transposeMultiply(mesh.vertices[vertex] - center);
+        boundary.emplace_back(local.x(), local.y());
+    }
+    boundary = simplifyPolygon(std::move(boundary), tolerance);
+    if (boundary.size() < 3 || !simplePolygon(boundary, tolerance) ||
+        triangulatePolygon(boundary).size() + 2 != boundary.size())
+        return {};
+    for (const auto vertex : vertices)
+    {
+        const Vec3 local = frame.transposeMultiply(mesh.vertices[vertex] - center);
+        if (!pointInPolygon({local.x(), local.y()}, boundary, tolerance))
+            return {};
+    }
+    double support = -std::numeric_limits<double>::infinity();
+    for (const auto vertex : vertices)
+        support = std::max(
+            support, (mesh.vertices[vertex] - center).dot(normal));
+    Primitive polygon = polygonPrimitive(
+        boundary, center + normal * support, frame);
+    return {{std::move(polygon), faces}};
+}
+
 // Recognize a complete, connected CAD surface before exact coplanar clustering.
 // Independent decimal rounding can move vertices of one analytic plane by a few
 // micromodel units and amplify face-normal noise on skinny triangles. Requiring
@@ -2488,7 +2585,7 @@ std::vector<OutputPrimitive> classifyApproximateCircularSurface(
     std::size_t& filled_holes,
     double& filled_volume)
 {
-    if (!options.allow_frustum || faces.size() < 6 ||
+    if (!options.allow_round_surfaces || faces.size() < 6 ||
         faceComponentCount(mesh, faces) != 1) return {};
 
     Vec3 reference = Vec3::Zero();
@@ -2631,9 +2728,15 @@ std::vector<OutputPrimitive> classifyApproximateCircularSurface(
         support = std::max(support, (mesh.vertices[vertex] - plane_center).dot(normal));
     surface.center = plane_center + normal * support +
         frame.col(0) * outer.center.x() + frame.col(1) * outer.center.y();
-    surface.base_radius = outer.maximum_radius;
+    const double polygon_expansion = options.round_surface_segments >= 3
+        ? 1.0 / std::cos(
+            std::numbers::pi /
+            static_cast<double>(options.round_surface_segments))
+        : std::numeric_limits<double>::infinity();
+    surface.base_radius = outer.maximum_radius * polygon_expansion *
+        (1.0 + 1.0e-12);
     surface.top_radius = surface.base_radius;
-    surface.segments = options.frustum_segments;
+    surface.segments = options.round_surface_segments;
     if (!retained_holes.empty())
     {
         const CircularLoopFit& inner = loops[retained_holes.front()].circle;
@@ -2644,12 +2747,19 @@ std::vector<OutputPrimitive> classifyApproximateCircularSurface(
         surface.inner_radius = std::max(
             inner.minimum_radius - center_offset, 0.0);
     }
+    std::vector<std::uint32_t> owned_faces;
+    owned_faces.reserve(faces.size());
+    for (const auto face_id : faces)
+        if (analyticPlanarSurfaceOwnsFace(
+                mesh, face_id, surface, planar_tolerance))
+            owned_faces.push_back(face_id);
+    if (owned_faces.empty()) return {};
     filled_holes += candidate_filled_holes;
     filled_volume += candidate_accepted_volume;
-    return {{std::move(surface), faces}};
+    return {{std::move(surface), std::move(owned_faces)}};
 }
 
-void appendConicalSurfaceAssembly(std::vector<OutputPrimitive>& output,
+void appendRevolvedSurfacePatches(std::vector<OutputPrimitive>& output,
                                   const Mesh& mesh,
                                   const Primitive& fit,
                                   const std::vector<std::uint32_t>& faces,
@@ -2699,39 +2809,6 @@ void appendConicalSurfaceAssembly(std::vector<OutputPrimitive>& output,
     append_disk(fit.center, fit.base_radius, std::move(base_faces));
     append_disk(fit.center + fit.axes.col(0) * fit.height,
                 fit.top_radius, std::move(top_faces));
-}
-
-void appendEnclosingConicalSurfaceAssembly(
-    std::vector<OutputPrimitive>& output,
-    const Primitive& fit,
-    const std::vector<std::uint32_t>& faces,
-    const std::uint64_t enclosure_group)
-{
-    if (fit.height <= 0.0 || fit.segments < 3) return;
-    Primitive band = fit;
-    band.kind = std::abs(fit.base_radius - fit.top_radius) <=
-            1.0e-8 * std::max({fit.base_radius, fit.top_radius, fit.height})
-        ? Kind::CylindricalBand : Kind::ConicalBand;
-    OutputPrimitive band_item{std::move(band), faces};
-    band_item.enclosure_group = enclosure_group;
-    output.push_back(std::move(band_item));
-
-    const auto append_disk = [&](const Vec3& center, const double radius)
-    {
-        if (radius <= 0.0) return;
-        Primitive disk;
-        disk.kind = Kind::Disk;
-        disk.center = center;
-        disk.axes = fit.axes;
-        disk.base_radius = radius;
-        disk.top_radius = radius;
-        disk.segments = fit.segments;
-        OutputPrimitive disk_item{std::move(disk), faces};
-        disk_item.enclosure_group = enclosure_group;
-        output.push_back(std::move(disk_item));
-    };
-    append_disk(fit.center, fit.base_radius);
-    append_disk(fit.center + fit.axes.col(0) * fit.height, fit.top_radius);
 }
 
 PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
@@ -2797,8 +2874,7 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
     }
 
     const std::uint32_t segments = std::max<std::uint32_t>(primitive.segments, 3);
-    if (primitive.kind == Kind::Disk ||
-        (primitive.kind == Kind::Frustum && primitive.height == 0.0))
+    if (primitive.kind == Kind::Disk)
     {
         result.vertices.push_back(primitive.center);
         for (std::uint32_t index = 0; index < segments; ++index)
@@ -2829,7 +2905,6 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
         }
         return result;
     }
-    const Vec3 top_center = primitive.center + primitive.axes.col(0) * primitive.height;
     const bool band = primitive.kind == Kind::CylindricalBand ||
                       primitive.kind == Kind::ConicalBand;
     if (band && !primitive.band_axial_ranges.empty())
@@ -2872,10 +2947,9 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
         return result;
     }
     if (!band)
-    {
-        result.vertices.push_back(primitive.center);
-        result.vertices.push_back(top_center);
-    }
+        throw std::logic_error("unsupported non-surface primitive kind");
+    const Vec3 top_center = primitive.center +
+        primitive.axes.col(0) * primitive.height;
     for (std::uint32_t index = 0; index < segments; ++index)
     {
         const double angle = 2.0 * std::numbers::pi * index / segments;
@@ -2887,18 +2961,12 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
     for (std::uint32_t index = 0; index < segments; ++index)
     {
         const std::uint32_t next = (index + 1) % segments;
-        const std::uint32_t vertex_offset = band ? 0 : 2;
-        const std::uint32_t base = vertex_offset + 2 * index;
+        const std::uint32_t base = 2 * index;
         const std::uint32_t top = base + 1;
-        const std::uint32_t next_base = vertex_offset + 2 * next;
+        const std::uint32_t next_base = 2 * next;
         const std::uint32_t next_top = next_base + 1;
         result.faces.push_back({base, next_base, next_top});
         result.faces.push_back({base, next_top, top});
-        if (!band)
-        {
-            result.faces.push_back({0, next_base, base});
-            if (primitive.top_radius > 0.0) result.faces.push_back({1, top, next_top});
-        }
     }
     return result;
 }
@@ -2959,18 +3027,6 @@ bool containsPoint(const Primitive& primitive, const Vec3& point, const double t
                std::abs(local.y()) <= primitive.half_size.y() + tolerance &&
                std::abs(local.z()) <= primitive.half_size.z() + tolerance;
     }
-    if (primitive.kind == Kind::Frustum)
-    {
-        const Vec3 local = primitive.axes.transposeMultiply(point - primitive.center);
-        if (primitive.height <= tolerance)
-            return std::abs(local.x()) <= tolerance &&
-                   std::hypot(local.y(), local.z()) <= primitive.base_radius + tolerance;
-        if (local.x() < -tolerance || local.x() > primitive.height + tolerance) return false;
-        const double parameter = std::clamp(local.x() / primitive.height, 0.0, 1.0);
-        const double radius = primitive.base_radius +
-                              parameter * (primitive.top_radius - primitive.base_radius);
-        return std::hypot(local.y(), local.z()) <= radius + tolerance;
-    }
     const Vec3 first = primitive.triangle[1] - primitive.triangle[0];
     const Vec3 second = primitive.triangle[2] - primitive.triangle[0];
     const Vec3 normal = first.cross(second);
@@ -2991,15 +3047,22 @@ bool containsPoint(const Primitive& primitive, const Vec3& point, const double t
     return u >= -tolerance && v >= -tolerance && u + v <= 1.0 + tolerance;
 }
 
+bool planarNormal(const Primitive& primitive, double tolerance, Vec3& normal);
+Vec3 planarPoint(const Primitive& primitive);
+
 bool trimmedAnalyticBandContainsTriangle(
     const Primitive& primitive, const std::array<Vec3, 3>& triangle,
     const double tolerance)
 {
     if ((primitive.kind != Kind::CylindricalBand &&
          primitive.kind != Kind::ConicalBand) ||
-        primitive.band_axial_ranges.size() < 3 || primitive.height <= 0.0)
+        primitive.height <= 0.0)
         return false;
-    const std::size_t segments = primitive.band_axial_ranges.size();
+    const bool trimmed = !primitive.band_axial_ranges.empty();
+    const std::size_t segments = trimmed
+        ? primitive.band_axial_ranges.size()
+        : static_cast<std::size_t>(primitive.segments);
+    if (segments < 3) return false;
     const double step = 2.0 * std::numbers::pi /
                         static_cast<double>(segments);
     std::array<double, 3> angles{};
@@ -3036,12 +3099,14 @@ bool trimmedAnalyticBandContainsTriangle(
             std::floor(sample)) % segments;
         const std::size_t second = (first + 1) % segments;
         const double fraction = sample - std::floor(sample);
-        const double lower =
-            primitive.band_axial_ranges[first][0] * (1.0 - fraction) +
-            primitive.band_axial_ranges[second][0] * fraction;
-        const double upper =
-            primitive.band_axial_ranges[first][1] * (1.0 - fraction) +
-            primitive.band_axial_ranges[second][1] * fraction;
+        const double lower = trimmed
+            ? primitive.band_axial_ranges[first][0] * (1.0 - fraction) +
+                primitive.band_axial_ranges[second][0] * fraction
+            : 0.0;
+        const double upper = trimmed
+            ? primitive.band_axial_ranges[first][1] * (1.0 - fraction) +
+                primitive.band_axial_ranges[second][1] * fraction
+            : primitive.height;
         if (local[corner].x() < lower - tolerance ||
             local[corner].x() > upper + tolerance)
             return false;
@@ -3063,6 +3128,41 @@ bool trimmedAnalyticBandContainsTriangle(
         if (std::hypot(local[corner].y(), local[corner].z()) >
             polygon_radius + tolerance)
             return false;
+    }
+    return true;
+}
+
+bool outwardPlanarSupportContainsTriangle(
+    const Primitive& primitive, const std::array<Vec3, 3>& triangle,
+    const double tolerance)
+{
+    Vec3 normal;
+    if (!planarNormal(primitive, tolerance, normal)) return false;
+    const Vec3 point = planarPoint(primitive);
+    const PrimitiveMesh proxy = triangulatePrimitive(primitive);
+    if (proxy.faces.empty()) return false;
+    for (const Vec3& vertex : triangle)
+    {
+        const double signed_distance = (vertex - point).dot(normal);
+        // Analytic CAD planes are fitted on their outward support plane.  The
+        // source may lie microscopically behind that plane after decimal
+        // quantization, but it may never protrude through the proxy.
+        if (signed_distance > tolerance) return false;
+        const Vec3 projected = vertex - normal * signed_distance;
+        bool covered = false;
+        for (const Face& face : proxy.faces)
+        {
+            Primitive proxy_triangle;
+            proxy_triangle.kind = Kind::Triangle;
+            for (int corner = 0; corner < 3; ++corner)
+                proxy_triangle.triangle[corner] = proxy.vertices[face[corner]];
+            if (containsPoint(proxy_triangle, projected, tolerance))
+            {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) return false;
     }
     return true;
 }
@@ -3129,11 +3229,6 @@ bool planarNormal(const Primitive& primitive, const double tolerance, Vec3& norm
         normal = normal.normalized();
         return true;
     }
-    if (primitive.kind == Kind::Frustum && primitive.height <= tolerance)
-    {
-        normal = primitive.axes.col(0);
-        return true;
-    }
     return false;
 }
 
@@ -3141,6 +3236,100 @@ Vec3 planarPoint(const Primitive& primitive)
 {
     if (primitive.kind == Kind::Polygon) return primitive.polygon.front();
     return primitive.kind == Kind::Triangle ? primitive.triangle[0] : primitive.center;
+}
+
+std::vector<OutputPrimitive> removePlanarSurfacesOccludedByDisks(
+    std::vector<OutputPrimitive> primitives, const Vec3& model_center,
+    const double tolerance, std::size_t& removed_count)
+{
+    removed_count = 0;
+    std::vector<std::uint8_t> removed(primitives.size(), 0);
+    std::vector<PrimitiveMesh> meshes(primitives.size());
+    std::vector<std::size_t> disks;
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+    {
+        meshes[index] = triangulatePrimitive(primitives[index].primitive);
+        if (primitives[index].primitive.kind == Kind::Disk)
+            disks.push_back(index);
+    }
+    const auto pointInMesh = [&](const PrimitiveMesh& mesh, const Vec3& point)
+    {
+        for (const Face& face : mesh.faces)
+        {
+            Primitive triangle;
+            triangle.kind = Kind::Triangle;
+            for (int corner = 0; corner < 3; ++corner)
+                triangle.triangle[corner] = mesh.vertices[face[corner]];
+            if (containsPoint(triangle, point, tolerance)) return true;
+        }
+        return false;
+    };
+
+    for (std::size_t candidate = 0; candidate < primitives.size(); ++candidate)
+    {
+        if (primitives[candidate].preserves_cavity_opening) continue;
+        Vec3 candidate_normal;
+        if (!planarNormal(
+                primitives[candidate].primitive, tolerance, candidate_normal))
+            continue;
+        const Vec3 candidate_point = planarPoint(
+            primitives[candidate].primitive);
+        if ((candidate_point - model_center).dot(candidate_normal) < 0.0)
+            candidate_normal *= -1.0;
+        const double candidate_outward =
+            (candidate_point - model_center).dot(candidate_normal);
+
+        for (const std::size_t coverer : disks)
+        {
+            if (coverer == candidate || removed[coverer]) continue;
+            Vec3 coverer_normal = primitives[coverer].primitive.axes.col(0);
+            const Vec3 coverer_point = primitives[coverer].primitive.center;
+            if ((coverer_point - model_center).dot(coverer_normal) < 0.0)
+                coverer_normal *= -1.0;
+            if (coverer_normal.dot(candidate_normal) < 1.0 - 1.0e-8)
+                continue;
+            const double coverer_outward =
+                (coverer_point - model_center).dot(coverer_normal);
+            if (coverer_outward <= candidate_outward + tolerance) continue;
+
+            bool covered = true;
+            for (const Vec3& vertex : meshes[candidate].vertices)
+            {
+                const double distance =
+                    (vertex - coverer_point).dot(coverer_normal);
+                const Vec3 projected = vertex - coverer_normal * distance;
+                if (!pointInMesh(meshes[coverer], projected))
+                {
+                    covered = false;
+                    break;
+                }
+            }
+            if (!covered) continue;
+
+            auto& responsibility = primitives[coverer].source_faces;
+            responsibility.insert(
+                responsibility.end(),
+                primitives[candidate].source_faces.begin(),
+                primitives[candidate].source_faces.end());
+            removed[candidate] = 1;
+            ++removed_count;
+            break;
+        }
+    }
+
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size() - removed_count);
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+        if (!removed[index])
+        {
+            auto& responsibility = primitives[index].source_faces;
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            result.push_back(std::move(primitives[index]));
+        }
+    return result;
 }
 
 std::vector<Vec3> planarCorners(const Primitive& primitive)
@@ -3354,9 +3543,7 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
         const Primitive& second_primitive = items[second].output.primitive;
         Vec3 normal;
         Vec3 second_normal;
-        if (first_primitive.kind == Kind::Frustum ||
-            second_primitive.kind == Kind::Frustum ||
-            !planarNormal(first_primitive, tolerance, normal) ||
+        if (!planarNormal(first_primitive, tolerance, normal) ||
             !planarNormal(second_primitive, tolerance, second_normal) ||
             std::abs(normal.dot(second_normal)) < 1.0 - 1.0e-8)
             return std::nullopt;
@@ -5043,6 +5230,23 @@ FinalCoverageAudit auditFinalConservativeCoverage(
             continue;
         }
 
+        // Approximate planar recognition places disks, annuli, and polygons on
+        // an outward support plane.  They need not be exactly coplanar with a
+        // quantized source triangle, so certify the one-sided projection before
+        // the exact coplanar-union path below.
+        covered = std::any_of(
+            owners[face_id].begin(), owners[face_id].end(),
+            [&](const std::size_t owner)
+            {
+                return outwardPlanarSupportContainsTriangle(
+                    primitives[owner].primitive, triangle, tolerance);
+            });
+        if (covered)
+        {
+            ++audit.planar_source_faces;
+            continue;
+        }
+
         // Exact local repair triangles are a stronger certificate than the
         // projected polygon-union fallback below. At large CAD coordinates,
         // Clipper can report a microscopic remainder even when the retained
@@ -6367,186 +6571,6 @@ double maximumFilledSurfaceDistance(
     return measureFilledSurfaceDistance(
         *cache.reference, triangulateOutputPrimitives(output),
         sample_spacing, maximum_distance).maximum_distance;
-}
-
-std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
-    const Mesh& source_mesh,
-    const Mesh& filled_surface_mesh,
-    std::vector<OutputPrimitive> primitives,
-    const double tolerance,
-    const double maximum_error_distance,
-    const double error_sample_spacing,
-    std::size_t& merged_group_count,
-    std::vector<BoxFit>& accepted_boxes,
-    const std::filesystem::path& profile_path)
-{
-    merged_group_count = 0;
-    if (primitives.size() < 2) return primitives;
-    const auto started = std::chrono::steady_clock::now();
-    struct Record
-    {
-        std::size_t primitive = 0;
-        Bounds bounds;
-        Vec3 center = Vec3::Zero();
-        std::size_t triangles = 0;
-    };
-    std::vector<Record> records;
-    records.reserve(primitives.size());
-    for (std::size_t index = 0; index < primitives.size(); ++index)
-    {
-        const PrimitiveMesh mesh = triangulatePrimitive(
-            primitives[index].primitive);
-        Bounds bounds;
-        for (const Vec3& vertex : mesh.vertices)
-        {
-            bounds.lower = bounds.lower.cwiseMin(vertex);
-            bounds.upper = bounds.upper.cwiseMax(vertex);
-        }
-        records.push_back({index, bounds, (bounds.lower + bounds.upper) * 0.5,
-                           mesh.faces.size()});
-    }
-    std::vector<std::size_t> order(records.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::uint64_t next_enclosure_group = 1;
-    for (const OutputPrimitive& primitive : primitives)
-        next_enclosure_group = std::max(
-            next_enclosure_group, primitive.enclosure_group + 1);
-
-    struct Profile
-    {
-        std::size_t nodes = 0;
-        std::size_t box_candidates = 0;
-        std::size_t accepted_boxes = 0;
-        std::size_t distance_samples = 0;
-        double distance_seconds = 0.0;
-    } profile;
-    const auto writeProfile = [&](const bool complete)
-    {
-        std::ofstream stream(profile_path);
-        stream << std::setprecision(17)
-               << "{\"complete\":" << (complete ? "true" : "false")
-               << ",\"input_primitives\":" << primitives.size()
-               << ",\"hierarchy_nodes\":" << profile.nodes
-               << ",\"box_candidates\":" << profile.box_candidates
-               << ",\"accepted_boxes\":" << profile.accepted_boxes
-               << ",\"distance_seconds\":" << profile.distance_seconds
-               << ",\"total_seconds\":" << std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - started).count()
-               << "}\n";
-    };
-    writeProfile(false);
-
-    const auto solve = [&](auto&& self, const std::size_t begin,
-                           const std::size_t end)
-        -> std::vector<OutputPrimitive>
-    {
-        ++profile.nodes;
-        const std::size_t count = end - begin;
-        if (count == 1)
-            return {primitives[records[order[begin]].primitive]};
-
-        std::size_t original_triangles = 0;
-        Bounds group_bounds;
-        Bounds center_bounds;
-        for (std::size_t offset = begin; offset < end; ++offset)
-        {
-            const Record& record = records[order[offset]];
-            group_bounds.lower = group_bounds.lower.cwiseMin(record.bounds.lower);
-            group_bounds.upper = group_bounds.upper.cwiseMax(record.bounds.upper);
-            center_bounds.lower = center_bounds.lower.cwiseMin(record.center);
-            center_bounds.upper = center_bounds.upper.cwiseMax(record.center);
-            original_triangles += record.triangles;
-        }
-
-        if (original_triangles > 12)
-        {
-            Mesh fitting_mesh;
-            std::vector<std::uint32_t> fitting_vertices;
-            std::vector<std::uint32_t> responsibility;
-            for (std::size_t offset = begin; offset < end; ++offset)
-            {
-                const OutputPrimitive& item =
-                    primitives[records[order[offset]].primitive];
-                const PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
-                for (const Vec3& vertex : mesh.vertices)
-                {
-                    fitting_vertices.push_back(static_cast<std::uint32_t>(
-                        fitting_mesh.vertices.size()));
-                    fitting_mesh.vertices.push_back(vertex);
-                }
-                responsibility.insert(responsibility.end(),
-                                      item.source_faces.begin(),
-                                      item.source_faces.end());
-            }
-            std::sort(responsibility.begin(), responsibility.end());
-            responsibility.erase(
-                std::unique(responsibility.begin(), responsibility.end()),
-                responsibility.end());
-            BoxFit box = fitBox(fitting_mesh, fitting_vertices);
-            Vec3 local_lower = -box.half_size;
-            Vec3 local_upper = box.half_size;
-            for (const std::uint32_t face_id : responsibility)
-            {
-                if (face_id >= source_mesh.faces.size()) continue;
-                for (const std::uint32_t vertex_id : source_mesh.faces[face_id])
-                {
-                    if (vertex_id >= source_mesh.vertices.size()) continue;
-                    const Vec3 local = box.axes.transposeMultiply(
-                        source_mesh.vertices[vertex_id] - box.center);
-                    local_lower = local_lower.cwiseMin(local);
-                    local_upper = local_upper.cwiseMax(local);
-                }
-            }
-            const Vec3 local_center = (local_lower + local_upper) * 0.5;
-            box.center += box.axes * local_center;
-            box.half_size = (local_upper - local_lower) * 0.5;
-            box.volume = 8.0 * box.half_size.prod();
-            const Vec3 extent = box.half_size * 2.0;
-            if (extent.x() > tolerance && extent.y() > tolerance &&
-                extent.z() > tolerance)
-            {
-                std::vector<OutputPrimitive> candidate;
-                appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
-                                    next_enclosure_group);
-                ++profile.box_candidates;
-                const auto distance_started = std::chrono::steady_clock::now();
-                const double error = maximumFilledSurfaceDistance(
-                    filled_surface_mesh, candidate, error_sample_spacing,
-                    maximum_error_distance + tolerance);
-                profile.distance_seconds += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - distance_started).count();
-                if (error <= maximum_error_distance + tolerance)
-                {
-                    ++next_enclosure_group;
-                    ++profile.accepted_boxes;
-                    ++merged_group_count;
-                    accepted_boxes.push_back(box);
-                    return candidate;
-                }
-            }
-        }
-
-        const Vec3 center_extent = center_bounds.upper - center_bounds.lower;
-        int axis = 0;
-        if (center_extent.y() > center_extent.x()) axis = 1;
-        if (center_extent.z() > center_extent[axis]) axis = 2;
-        const std::size_t middle = begin + count / 2;
-        std::nth_element(order.begin() + begin, order.begin() + middle,
-                         order.begin() + end,
-            [&](const std::size_t first, const std::size_t second)
-            {
-                return records[first].center[axis] < records[second].center[axis];
-            });
-        auto left = self(self, begin, middle);
-        auto right = self(self, middle, end);
-        left.insert(left.end(), std::make_move_iterator(right.begin()),
-                    std::make_move_iterator(right.end()));
-        return left;
-    };
-
-    auto result = solve(solve, 0, order.size());
-    writeProfile(true);
-    return result;
 }
 
 std::vector<OutputPrimitive> fillCertifiedIntercomponentGaps(
@@ -8512,7 +8536,6 @@ const char* kindName(const Kind kind)
     switch (kind)
     {
     case Kind::Rectangle: return "rectangle";
-    case Kind::Frustum: return "frustum";
     case Kind::Triangle: return "triangle";
     case Kind::Polygon: return "polygon";
     case Kind::Disk: return "disk";
@@ -10693,7 +10716,6 @@ void writeMetadata(const std::filesystem::path& directory,
           << ",\"discarded_degenerate_triangles\":" << stats.discarded_degenerate_triangles
           << ",\"primitive_count\":" << stats.primitive_count
           << ",\"primitive_types\":{\"polygon\":" << stats.polygon_count
-          << ",\"frustum\":" << stats.frustum_count
           << ",\"disk\":" << stats.disk_count
           << ",\"annulus\":" << stats.annulus_count
           << ",\"cylindricalband\":" << stats.cylindrical_band_count
@@ -10863,8 +10885,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
 
     if (!effective_options.allow_polygon)
         throw std::invalid_argument("polygon must be enabled for exact fallback");
-    if (effective_options.frustum_segments < 3)
-        throw std::invalid_argument("frustum_segments must be at least 3");
+    if (effective_options.round_surface_segments < 3)
+        throw std::invalid_argument("round_surface_segments must be at least 3");
     if (effective_options.analysis_strength < 0.0 || effective_options.analysis_strength > 1.0)
         throw std::invalid_argument("analysis_strength must be in [0, 1]");
 
@@ -10902,76 +10924,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             : diagonal * 0.08;
     stats.maximum_open_error_distance_limit = maximum_open_error_distance;
 
-    std::vector<OutputPrimitive> envelope_output;
-    double envelope_added_ratio = std::numeric_limits<double>::infinity();
-    int envelope_axis = -1;
-    std::size_t envelope_remaining_cavities = std::numeric_limits<std::size_t>::max();
-    std::array<std::vector<OutputPrimitive>, 3> envelope_candidates;
-    if (effective_options.uniform_structure_policy &&
-        effective_options.enable_volume_evaluated_envelope)
-    {
-        for (int axis = 0; axis < 3; ++axis)
-        {
-            double added_ratio = 0.0;
-            std::size_t remaining_cavities = 0;
-            auto candidate = buildAxisEnvelopeCandidate(
-                mesh, effective_options, lower, upper, axis, added_ratio,
-                remaining_cavities);
-            stats.envelope_candidate_added_volume_ratios[axis] = added_ratio;
-            stats.envelope_candidate_primitive_counts[axis] = candidate.size();
-            stats.envelope_candidate_remaining_cavities[axis] = remaining_cavities;
-            envelope_candidates[axis] = candidate;
-            if (candidate.empty() ||
-                added_ratio > effective_options.maximum_envelope_added_volume_ratio)
-                continue;
-            if (envelope_output.empty() ||
-                remaining_cavities < envelope_remaining_cavities ||
-                (remaining_cavities == envelope_remaining_cavities &&
-                 candidate.size() < envelope_output.size()) ||
-                (remaining_cavities == envelope_remaining_cavities &&
-                 candidate.size() == envelope_output.size() &&
-                 added_ratio < envelope_added_ratio))
-            {
-                envelope_output = candidate;
-                envelope_added_ratio = added_ratio;
-                envelope_axis = axis;
-                envelope_remaining_cavities = remaining_cavities;
-            }
-        }
-
-        // Once an enclosing approximation has already spent a volume-error
-        // budget, evaluate a coarser envelope by its incremental cost.  Comparing
-        // every candidate only with the source rejected useful second-stage
-        // merges: for example, replacing dozens of raster stair faces by six box
-        // faces can add less volume than the cavity fill already accepted.  The
-        // rule is geometry-only and applies to every OBJ; it also requires a
-        // substantial primitive-count reduction and cannot hide more cavities.
-        if (!envelope_output.empty())
-        {
-            for (int axis = 0; axis < 3; ++axis)
-            {
-                const auto& candidate = envelope_candidates[axis];
-                const double candidate_added =
-                    stats.envelope_candidate_added_volume_ratios[axis];
-                const std::size_t candidate_cavities =
-                    stats.envelope_candidate_remaining_cavities[axis];
-                if (candidate.empty() || candidate.size() >= envelope_output.size() ||
-                    candidate_cavities > envelope_remaining_cavities ||
-                    envelope_output.size() <
-                        effective_options.minimum_envelope_primitive_reduction_ratio *
-                            candidate.size())
-                    continue;
-                const double incremental_added =
-                    std::max(candidate_added - envelope_added_ratio, 0.0);
-                if (incremental_added > envelope_added_ratio) continue;
-                envelope_output = candidate;
-                envelope_added_ratio = candidate_added;
-                envelope_axis = axis;
-                envelope_remaining_cavities = candidate_cavities;
-            }
-        }
-    }
-    markStage("envelope_candidates");
+    // There is deliberately no enclosing-volume candidate phase.  Every
+    // candidate created below is one surface patch.
+    markStage("surface_candidate_setup");
     StructuralCleanup structural_cleanup = identifyStructuralRedundantFaces(
         mesh, effective_options, diagonal, model_surface_area, model_volume);
     stats.removed_sealed_void_wall_primitives =
@@ -10994,7 +10949,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::vector<BoxFit> certified_closed_volumes;
     std::vector<CertifiedExtrusion> certified_closed_extrusions;
     double analytic_filled_cavity_volume = 0.0;
-    if (effective_options.allow_frustum)
+    if (effective_options.allow_round_surfaces)
     {
         // Surface recognition precedes exact coplanar clustering. It sees the
         // complete connected CAD patch, including all of its inner boundary
@@ -11007,33 +10962,43 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                 mesh, component, effective_options, (lower + upper) * 0.5,
                 diagonal, model_volume, stats.filled_planar_holes,
                 analytic_filled_cavity_volume);
+            if (surface.empty())
+                surface = classifyApproximatePlanarSurface(
+                    mesh, component, (lower + upper) * 0.5, diagonal,
+                    effective_options);
             if (surface.empty()) continue;
+            std::vector<std::uint32_t> recognized_faces;
+            for (const OutputPrimitive& item : surface)
+                recognized_faces.insert(recognized_faces.end(),
+                                        item.source_faces.begin(),
+                                        item.source_faces.end());
             output.insert(output.end(), std::make_move_iterator(surface.begin()),
                           std::make_move_iterator(surface.end()));
-            for (const auto face : component) responsibility_faces[face] = false;
+            for (const auto face : recognized_faces)
+                responsibility_faces[face] = false;
         }
     }
     markStage("analytic_surface_recognition");
     stats.filled_cavity_volume_ratio = analytic_filled_cavity_volume /
         std::max(model_volume, 1.0e-30);
-    if (effective_options.allow_frustum)
+    if (effective_options.allow_round_surfaces)
     {
-        // A round volume must be recognized from a complete connected surface.
-        // Greedy pairwise merging cannot certify a circle while it only sees one
-        // polygonal side strip, and accepting those partial fits caused unrelated
-        // strips to bridge a large empty region.
+        // Recognize only analytic surface patches.  A shared axis/radius fit may
+        // identify a lateral band and its planar end faces, but no closed
+        // closed round object is ever inserted into the candidate set.
         for (const auto& component : faceComponents(mesh, responsibility_faces))
         {
             const double analytic_tolerance = diagonal *
                 effective_options.analytic_surface_relative_tolerance;
-            VolumeFit fit = fitBestVolume(
+            const auto fit = fitCertifiedRevolvedSurface(
                 mesh, component, effective_options, analytic_tolerance);
-            if (!fit.use_frustum) continue;
-            appendConicalSurfaceAssembly(
-                output, mesh, fit.frustum, component, analytic_tolerance);
+            if (!fit) continue;
+            appendRevolvedSurfacePatches(
+                output, mesh, *fit, component, analytic_tolerance);
             for (const auto face : component) responsibility_faces[face] = false;
         }
     }
+    requireSurfaceCandidates(output, "analytic surface recognition");
     std::vector<std::unordered_set<std::uint32_t>> adjacency;
     auto clusters = coplanarClusters(
         mesh, diagonal * effective_options.coplanar_relative_tolerance,
@@ -11143,6 +11108,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::vector<OutputPrimitive> phase2_recognized_surfaces =
         withRestoredCavities(output);
     promoteToSemanticPrimitives(phase2_recognized_surfaces);
+    requireSurfaceCandidates(
+        phase2_recognized_surfaces, "phase 2 surface recognition");
     writeSemanticPrimitiveObj(
         output_directory / "phase2_recognized_surfaces.obj",
         phase2_recognized_surfaces);
@@ -11152,73 +11119,36 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // merging made them bypass the user's error limit: even an effectively
     // unlimited limit could not replace the whole model by one box shell.
     output = std::move(phase2_recognized_surfaces);
+    std::size_t disk_occluded_surfaces = 0;
+    output = removePlanarSurfacesOccludedByDisks(
+        std::move(output), (lower + upper) * 0.5,
+        std::max(diagonal * 1.0e-9, 1.0e-10), disk_occluded_surfaces);
+    stats.removed_contained_primitives += disk_occluded_surfaces;
     std::vector<std::uint32_t> excluded_faces =
         std::move(structural_cleanup.excluded_faces);
     structural_cleanup = StructuralCleanup{};
     std::vector<OutputPrimitive>().swap(restored_cavity_output);
     std::vector<bool>().swap(responsibility_faces);
-    std::vector<OutputPrimitive>().swap(envelope_output);
-    for (auto& candidate : envelope_candidates)
-        std::vector<OutputPrimitive>().swap(candidate);
     recordStageError("phase2_input", output);
     markStage("exact_surface_union");
 
     const double merge_tolerance =
         std::max(diagonal * 1.0e-9, 1.0e-10);
-    const double merge_sample_spacing =
-        std::max(diagonal / 192.0, 1.0e-30);
-    std::size_t spatial_merge_passes = 0;
-    std::size_t spatially_enclosed_primitives = 0;
-    constexpr std::size_t maximum_spatial_merge_passes = 8;
-    const double default_merge_limit = diagonal * 0.08;
-    std::vector<double> progressive_merge_limits;
-    if (maximum_open_error_distance > default_merge_limit + merge_tolerance)
-        progressive_merge_limits.push_back(default_merge_limit);
-    progressive_merge_limits.push_back(maximum_open_error_distance);
-    for (std::size_t phase = 0; phase < progressive_merge_limits.size(); ++phase)
-    {
-        for (std::size_t phase_pass = 0;
-             phase_pass < maximum_spatial_merge_passes; ++phase_pass)
-        {
-            std::size_t pass_merges = 0;
-            std::filesystem::path pass_profile;
-            if (phase == 0 && phase_pass == 0)
-                pass_profile = output_directory /
-                    "spatial_group_merge_profile.json";
-            else
-                pass_profile = output_directory /
-                    ("spatial_group_merge_profile_phase_" +
-                     std::to_string(phase + 1) + "_pass_" +
-                     std::to_string(phase_pass + 1) + ".json");
-            output = mergeSpatialPrimitiveGroups(
-                mesh, filled_surface_mesh, std::move(output), merge_tolerance,
-                progressive_merge_limits[phase], merge_sample_spacing,
-                pass_merges, certified_closed_volumes, pass_profile);
-            stats.merged_spatial_primitive_groups += pass_merges;
-
-            std::size_t pass_removed = 0;
-            output = removePrimitivesInsideEnclosureGroups(
-                mesh, std::move(output), merge_tolerance, pass_removed);
-            spatially_enclosed_primitives += pass_removed;
-            ++spatial_merge_passes;
-            if (pass_merges == 0 && pass_removed == 0) break;
-        }
-    }
-    stats.removed_contained_primitives += spatially_enclosed_primitives;
+    // Stage 3 is a surface-candidate search.  A set of neighboring surfaces may
+    // merge only into another supported surface primitive; it must never be
+    // replaced by the boundary of a fitted solid.  The former spatial hierarchy
+    // emitted six box faces as one enclosing-volume candidate and consequently
+    // destroyed correctly recognized disks and analytic bands on round CAD
+    // models.  Volume certificates remain valid for proving that an already
+    // existing surface is occluded, but they are not geometry candidates.
     {
         std::ofstream profile(
             output_directory / "spatial_group_fixed_point_profile.json");
-        profile << "{\"passes\":" << spatial_merge_passes
-                << ",\"threshold_phases\":"
-                << progressive_merge_limits.size()
-                << ",\"baseline_limit\":" << std::setprecision(17)
-                << default_merge_limit
-                << ",\"requested_limit\":"
+        profile << "{\"passes\":0,\"surface_only\":true"
+                << ",\"requested_limit\":" << std::setprecision(17)
                 << maximum_open_error_distance
-                << ",\"accepted_groups\":"
-                << stats.merged_spatial_primitive_groups
-                << ",\"removed_enclosed_primitives\":"
-                << spatially_enclosed_primitives
+                << ",\"accepted_groups\":0"
+                << ",\"removed_enclosed_primitives\":0"
                 << ",\"output_primitives\":" << output.size() << "}\n";
     }
     output = mergeLocalCoplanarPrimitives(
@@ -11228,6 +11158,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         std::max(diagonal / 192.0, 1.0e-30),
         stats.merged_local_planar_primitives,
         output_directory / "surface_merge_profile.json");
+    requireSurfaceCandidates(output, "phase 3 surface merging");
     std::size_t locally_enclosed_primitives = 0;
     output = removePrimitivesInsideEnclosureGroups(
         mesh, std::move(output), merge_tolerance,
@@ -11372,12 +11303,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                     mesh.vertices[mesh.faces[face_id][corner]];
             repair_output.push_back({std::move(triangle), {face_id}});
         }
-        std::vector<BoxFit> repair_boxes;
-        repair_output = mergeSpatialPrimitiveGroups(
-            mesh, filled_surface_mesh, std::move(repair_output),
-            final_tolerance, maximum_open_error_distance,
-            merge_sample_spacing, repair_merged_groups, repair_boxes,
-            output_directory / "coverage_repair_merge_profile.json");
+        // Coverage repair is exact surface fallback.  Do not turn failed source
+        // faces into a fitted box shell: that would reintroduce a solid candidate
+        // after the surface-only stage-3 search.
 
         std::uint64_t group_offset = 0;
         for (const auto& item : output)
@@ -11401,6 +11329,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             std::make_move_iterator(repair_output.begin()),
             std::make_move_iterator(repair_output.end()));
         promoteToSemanticPrimitives(output);
+        requireSurfaceCandidates(output, "coverage repair");
         coverage = auditFinalConservativeCoverage(
             mesh, output, final_tolerance, &coverage_certificate_primitives,
             &certified_closed_extrusions, &excluded_faces);
@@ -11477,6 +11406,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             "staged surface pipeline exceeded maximum open error distance");
     }
     std::filesystem::create_directories(output_directory);
+    requireSurfaceCandidates(output, "final export");
     writeSourceObj(output_directory / "source.obj", mesh);
     writeRegionsObj(
         output_directory / "regions.obj", mesh, output, excluded_faces);
@@ -11486,7 +11416,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         switch (item.primitive.kind)
         {
         case Kind::Polygon: ++stats.polygon_count; break;
-        case Kind::Frustum: ++stats.frustum_count; break;
         case Kind::Disk: ++stats.disk_count; break;
         case Kind::Annulus: ++stats.annulus_count; break;
         case Kind::CylindricalBand: ++stats.cylindrical_band_count; break;

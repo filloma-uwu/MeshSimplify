@@ -29,8 +29,8 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
         $process = Start-Process -FilePath $executablePath -ArgumentList @(
             "--input", (Join-Path $inputPath "$modelId.obj"),
             "--output-dir", $directory,
-            "--primitive-types", "polygon,frustum",
-            "--frustum-segments", "24"
+            "--primitive-types", "polygon,surface",
+            "--round-surface-segments", "24"
         ) -RedirectStandardOutput (Join-Path $directory "analysis.stdout.txt") `
           -RedirectStandardError (Join-Path $directory "analysis.stderr.txt") `
           -WindowStyle Hidden -PassThru

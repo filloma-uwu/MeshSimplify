@@ -21,7 +21,7 @@ void usage()
 {
     std::cerr
         << "usage: pqss-primitive-mesh-analyze --input model.obj --output-dir directory\n"
-        << "       [--primitive-types polygon,surface] [--frustum-segments 24]\n"
+        << "       [--primitive-types polygon,surface] [--round-surface-segments 24]\n"
         << "       [--legacy-analysis-strength 0.5] [--maximum-added-volume-ratio 0.01]\n"
         << "       [--maximum-group-box-added-volume-ratio 0.05]\n"
         << "       [--protrusion-max-area-excess-ratio 0.03] [--diagnostic-volume-envelope]\n"
@@ -104,12 +104,12 @@ int main(int argc, char** argv)
             {
                 const std::string types = value();
                 options.allow_polygon = containsType(types, "polygon");
-                options.allow_frustum = containsType(types, "surface") ||
-                                         containsType(types, "frustum");
+                options.allow_round_surfaces = containsType(types, "surface");
             }
-            else if (argument == "--frustum-segments")
+            else if (argument == "--round-surface-segments")
             {
-                options.frustum_segments = static_cast<std::uint32_t>(std::stoul(value()));
+                options.round_surface_segments =
+                    static_cast<std::uint32_t>(std::stoul(value()));
             }
             else if (argument == "--analysis-strength")
             {

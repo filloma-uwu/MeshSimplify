@@ -20,7 +20,6 @@ test('proxy OBJ modes preserve the camera and expose no legacy responsibility UI
 
   const initial = await page.evaluate(() => window.__primitiveViewerDiagnostics());
   expect(initial.primitiveCount).toBeGreaterThan(0);
-  expect(initial.primitiveTypeCounts.frustum || 0).toBe(0);
   expect(initial.primitiveTypeCounts.obb).toBeUndefined();
 
   for (const mode of ['source', 'phase1', 'phase2', 'phase3', 'phase4', 'split']) {

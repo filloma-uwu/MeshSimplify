@@ -100,15 +100,14 @@ and conical bands. These are surfaces rather than closed physics colliders. It
 writes `primitives.obj`, where an n-sided planar region remains one OBJ polygon,
 then writes `proxy.obj` in a distinct triangulation stage for direct PQSS
 consumption. Each simple n-gon produces exactly n-2 triangles; circular-surface
-density is controlled by `--frustum-segments` (the option name is retained for
-CLI compatibility).
+density is controlled by `--round-surface-segments`.
 
 ```powershell
 .\build\Release\pqss-primitive-mesh-analyze.exe `
   --input test_data/real_scene/source_pool/4.obj `
   --output-dir outputs/model4 `
   --primitive-types polygon,surface `
-  --frustum-segments 24 `
+  --round-surface-segments 24 `
   --maximum-open-error-distance 80 `
   --maximum-process-memory-gb 2
 ```

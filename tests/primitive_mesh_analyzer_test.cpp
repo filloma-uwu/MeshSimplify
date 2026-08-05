@@ -59,6 +59,34 @@ void appendBoxObj(std::ostringstream& obj, std::size_t& next_vertex,
     next_vertex += 8;
 }
 
+void appendCylinderBandObj(std::ostringstream& obj, std::size_t& next_vertex,
+                           const std::size_t segments,
+                           const double radius, const double height)
+{
+    const std::size_t base = next_vertex;
+    constexpr double pi = 3.14159265358979323846;
+    for (std::size_t index = 0; index < segments; ++index)
+    {
+        const double angle = 2.0 * pi * static_cast<double>(index) /
+                             static_cast<double>(segments);
+        const double x = radius * std::cos(angle);
+        const double y = radius * std::sin(angle);
+        obj << "v " << x << ' ' << y << " 0\n"
+            << "v " << x << ' ' << y << ' ' << height << '\n';
+    }
+    for (std::size_t index = 0; index < segments; ++index)
+    {
+        const std::size_t next = (index + 1) % segments;
+        const std::size_t lower = base + 2 * index;
+        const std::size_t upper = lower + 1;
+        const std::size_t next_lower = base + 2 * next;
+        const std::size_t next_upper = next_lower + 1;
+        obj << "f " << lower << ' ' << next_lower << ' ' << next_upper << '\n'
+            << "f " << lower << ' ' << next_upper << ' ' << upper << '\n';
+    }
+    next_vertex += 2 * segments;
+}
+
 } // namespace
 
 int main()
@@ -78,7 +106,7 @@ int main()
             "f 1 5 6\nf 1 6 2\nf 2 6 7\nf 2 7 3\n"
             "f 3 7 8\nf 3 8 4\nf 4 8 5\nf 4 5 1\n");
         pqss_proxy_mesh::PrimitiveMeshAnalysisOptions exact;
-        exact.allow_frustum = false;
+        exact.allow_round_surfaces = false;
         exact.maximum_open_error_distance = 0.0;
         const auto box_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
             box, root / "box", exact);
@@ -103,7 +131,26 @@ int main()
                 box_metadata.find(
                     "\"reference\":\"phase1_hole_filled.obj\"") !=
                     std::string::npos,
-                "metadata must state that simplification error uses phase 1");
+                "metadata must use the phase-1 error reference");
+
+        // A complete analytic side surface is a surface primitive, not a solid
+        // cylinder candidate.  Its outward circumscribed tessellation must pass
+        // coverage directly without falling back to the source triangles.
+        const auto cylinder_band = root / "cylinder_band.obj";
+        std::ostringstream cylinder_band_obj;
+        std::size_t cylinder_vertex = 1;
+        appendCylinderBandObj(
+            cylinder_band_obj, cylinder_vertex, 24, 1.0, 2.0);
+        writeText(cylinder_band, cylinder_band_obj.str());
+        auto analytic = exact;
+        analytic.allow_round_surfaces = true;
+        const auto cylinder_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
+            cylinder_band, root / "cylinder_band", analytic);
+        require(cylinder_stats.containment_validation_passed &&
+                    cylinder_stats.cylindrical_band_count == 1 &&
+                    cylinder_stats.primitive_count == 1 &&
+                    cylinder_stats.proxy_triangles == 48,
+                "a complete cylinder side must remain one certified surface");
 
         // Three disconnected coplanar rectangles need two accepted merges.
         // The filled gaps are 0.1 wide, so the directed maximum is 0.05.
@@ -137,9 +184,8 @@ int main()
                     strict_stats.merged_local_planar_primitives == 0,
                 "a merge beyond the directed Hausdorff limit must be rejected");
 
-        // A spatial group is not restricted to coplanar surfaces. A loose
-        // directed-distance limit may replace this non-convex L assembly by
-        // one conservative six-face box; an exact limit must reject it.
+        // Stage 3 contains surface candidates only.  A large error limit must
+        // not introduce a fitted box solid around a non-convex surface set.
         const auto spatial_group = root / "spatial_group.obj";
         writeText(spatial_group,
             "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 1 1 0\nv 1 3 0\nv 0 3 0\n"
@@ -157,10 +203,9 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
-                    group_loose_stats.primitive_count == 6 &&
-                    group_loose_stats.proxy_triangles == 12 &&
-                    group_loose_stats.merged_spatial_primitive_groups > 0,
-                "loose error must permit a noncoplanar spatial group box");
+                    group_loose_stats.primitive_count > 6 &&
+                    group_loose_stats.merged_spatial_primitive_groups == 0,
+                "a loose error must not create a fitted solid candidate");
 
         auto group_strict = group_loose;
         group_strict.maximum_open_error_distance = 0.0;
@@ -169,7 +214,7 @@ int main()
                 spatial_group, root / "spatial_group_strict", group_strict);
         require(group_strict_stats.merged_spatial_primitive_groups == 0 &&
                     group_strict_stats.primitive_count > 6,
-                "exact error must reject the noncoplanar spatial group box");
+                "exact error must also preserve the surface-only candidate set");
 
         // Three equal closed components contain two independent narrow gaps.
         // Each gap is assessed against the model volume on its own.

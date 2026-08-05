@@ -42,8 +42,8 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
         $arguments = @(
             "--input", (Join-Path $inputPath "$modelId.obj"),
             "--output-dir", $directory,
-            "--primitive-types", "polygon,frustum",
-            "--cone-segments", "24",
+            "--primitive-types", "polygon,surface",
+            "--round-surface-segments", "24",
             "--analysis-strength", $strengthText
         )
         $process = Start-Process -FilePath $executablePath -ArgumentList $arguments `
