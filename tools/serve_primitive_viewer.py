@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/surface_adjacent_fixed_point_full_v4/viewer_manifest.json"),
+        default=Path("outputs/surface_adjacent_fixed_point_full_v6/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",

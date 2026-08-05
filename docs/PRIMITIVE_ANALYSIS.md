@@ -130,7 +130,7 @@ exact duplicate triangles, containment, error limits, timings, and peak memory:
 
 ```powershell
 python tools/audit_staged_surface_outputs.py `
-  outputs/surface_adjacent_fixed_point_full_v4/viewer_manifest.json
+  outputs/surface_adjacent_fixed_point_full_v6/viewer_manifest.json
 ```
 
 The output root contains `viewer_manifest.json`. Group names use matching IDs:
