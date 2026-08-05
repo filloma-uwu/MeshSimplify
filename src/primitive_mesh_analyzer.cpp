@@ -4427,7 +4427,64 @@ void appendBoxRectangles(std::vector<OutputPrimitive>& output,
             item.enclosure_group = enclosure_group;
             output.push_back(std::move(item));
         }
+    }
 }
+
+std::vector<BoxFit> selectActiveBoxCertificates(
+    const std::vector<OutputPrimitive>& active_primitives,
+    const std::vector<BoxFit>& historical_boxes,
+    const double tolerance)
+{
+    std::unordered_map<std::uint64_t, std::vector<Vec3>> group_vertices;
+    for (const auto& item : active_primitives)
+    {
+        if (item.enclosure_group == 0) continue;
+        const PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
+        auto& vertices = group_vertices[item.enclosure_group];
+        vertices.insert(vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
+    }
+
+    std::vector<BoxFit> active;
+    active.reserve(group_vertices.size());
+    const double match_tolerance = tolerance * 32.0;
+    for (const auto& [group, vertices] : group_vertices)
+    {
+        (void)group;
+        if (vertices.size() < 8) continue;
+        for (const BoxFit& box : historical_boxes)
+        {
+            const bool vertices_inside = std::all_of(
+                vertices.begin(), vertices.end(), [&](const Vec3& vertex)
+                {
+                    const Vec3 local = box.axes.transposeMultiply(
+                        vertex - box.center);
+                    return std::abs(local.x()) <=
+                               box.half_size.x() + match_tolerance &&
+                           std::abs(local.y()) <=
+                               box.half_size.y() + match_tolerance &&
+                           std::abs(local.z()) <=
+                               box.half_size.z() + match_tolerance;
+                });
+            if (!vertices_inside) continue;
+
+            bool all_corners_present = true;
+            for (int corner = 0; corner < 8 && all_corners_present; ++corner)
+            {
+                Vec3 position = box.center;
+                for (int axis = 0; axis < 3; ++axis)
+                    position += box.axes.col(axis) *
+                        ((corner & (1 << axis)) ? box.half_size[axis]
+                                                : -box.half_size[axis]);
+                all_corners_present = std::any_of(
+                    vertices.begin(), vertices.end(), [&](const Vec3& vertex)
+                    { return (vertex - position).norm() <= match_tolerance; });
+            }
+            if (!all_corners_present) continue;
+            active.push_back(box);
+            break;
+        }
+    }
+    return active;
 }
 
 std::vector<std::uint32_t> removeContainedPrimitives(
@@ -6313,6 +6370,7 @@ double maximumFilledSurfaceDistance(
 }
 
 std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
+    const Mesh& source_mesh,
     const Mesh& filled_surface_mesh,
     std::vector<OutputPrimitive> primitives,
     const double tolerance,
@@ -6400,10 +6458,6 @@ std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
             original_triangles += record.triangles;
         }
 
-        // Small adjacent structures are often exactly the ones that should be
-        // absorbed into a simple enclosure. Do not require an arbitrary
-        // minimum primitive count; the replacement still has to reduce the
-        // triangulated workload and pass the directed-error limit.
         if (original_triangles > 12)
         {
             Mesh fitting_mesh;
@@ -6428,7 +6482,25 @@ std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
             responsibility.erase(
                 std::unique(responsibility.begin(), responsibility.end()),
                 responsibility.end());
-            const BoxFit box = fitBox(fitting_mesh, fitting_vertices);
+            BoxFit box = fitBox(fitting_mesh, fitting_vertices);
+            Vec3 local_lower = -box.half_size;
+            Vec3 local_upper = box.half_size;
+            for (const std::uint32_t face_id : responsibility)
+            {
+                if (face_id >= source_mesh.faces.size()) continue;
+                for (const std::uint32_t vertex_id : source_mesh.faces[face_id])
+                {
+                    if (vertex_id >= source_mesh.vertices.size()) continue;
+                    const Vec3 local = box.axes.transposeMultiply(
+                        source_mesh.vertices[vertex_id] - box.center);
+                    local_lower = local_lower.cwiseMin(local);
+                    local_upper = local_upper.cwiseMax(local);
+                }
+            }
+            const Vec3 local_center = (local_lower + local_upper) * 0.5;
+            box.center += box.axes * local_center;
+            box.half_size = (local_upper - local_lower) * 0.5;
+            box.volume = 8.0 * box.half_size.prod();
             const Vec3 extent = box.half_size * 2.0;
             if (extent.x() > tolerance && extent.y() > tolerance &&
                 extent.z() > tolerance)
@@ -10784,6 +10856,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         std::ofstream progress(output_directory / "analysis_stages.txt");
         progress << "start 0\n";
     }
+    {
+        std::ofstream profile(output_directory / "stage_error_profile.jsonl");
+    }
     PrimitiveMeshAnalysisOptions effective_options = options;
 
     if (!effective_options.allow_polygon)
@@ -10897,7 +10972,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         }
     }
     markStage("envelope_candidates");
-    const StructuralCleanup structural_cleanup = identifyStructuralRedundantFaces(
+    StructuralCleanup structural_cleanup = identifyStructuralRedundantFaces(
         mesh, effective_options, diagonal, model_surface_area, model_volume);
     stats.removed_sealed_void_wall_primitives =
         structural_cleanup.sealed_void_wall_primitives;
@@ -10960,7 +11035,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         }
     }
     std::vector<std::unordered_set<std::uint32_t>> adjacency;
-    const auto clusters = coplanarClusters(
+    auto clusters = coplanarClusters(
         mesh, diagonal * effective_options.coplanar_relative_tolerance,
         adjacency, &responsibility_faces);
     for (const auto& cluster : clusters)
@@ -10973,6 +11048,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             std::make_move_iterator(classified.begin()),
             std::make_move_iterator(classified.end()));
     }
+    decltype(adjacency){}.swap(adjacency);
+    decltype(clusters){}.swap(clusters);
     output = fillCertifiedIntercomponentGaps(
         mesh, std::move(output), model_volume,
         effective_options.maximum_cavity_added_volume_ratio,
@@ -11030,11 +11107,30 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     };
     std::vector<OutputPrimitive> phase1_hole_filled =
         withRestoredCavities(output);
-    const PrimitiveMesh phase1_triangulated =
+    PrimitiveMesh phase1_triangulated =
         triangulateOutputPrimitives(phase1_hole_filled);
+    (void)writeTriangulatedObj(
+        output_directory / "phase1_hole_filled.obj", phase1_hole_filled);
     Mesh filled_surface_mesh;
-    filled_surface_mesh.vertices = phase1_triangulated.vertices;
-    filled_surface_mesh.faces = phase1_triangulated.faces;
+    filled_surface_mesh.vertices = std::move(phase1_triangulated.vertices);
+    filled_surface_mesh.faces = std::move(phase1_triangulated.faces);
+    std::vector<OutputPrimitive>().swap(phase1_hole_filled);
+    const double stage_error_sample_spacing =
+        std::max(diagonal / 192.0, 1.0e-30);
+    const auto recordStageError = [&](const char* stage,
+                                      const std::vector<OutputPrimitive>& stage_output)
+    {
+        const double maximum_distance = maximumFilledSurfaceDistance(
+            filled_surface_mesh, stage_output, stage_error_sample_spacing,
+            std::numeric_limits<double>::infinity());
+        std::ofstream profile(output_directory / "stage_error_profile.jsonl",
+                              std::ios::app);
+        profile << std::setprecision(17)
+                << "{\"stage\":\"" << stage
+                << "\",\"primitives\":" << stage_output.size()
+                << ",\"triangles\":" << triangulatedFaceCount(stage_output)
+                << ",\"maximum_distance\":" << maximum_distance << "}\n";
+    };
     markStage("phase1_hole_filled_reference");
 
     CoplanarCanonicalizationStats coplanar_stats;
@@ -11047,6 +11143,24 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::vector<OutputPrimitive> phase2_recognized_surfaces =
         withRestoredCavities(output);
     promoteToSemanticPrimitives(phase2_recognized_surfaces);
+    writeSemanticPrimitiveObj(
+        output_directory / "phase2_recognized_surfaces.obj",
+        phase2_recognized_surfaces);
+    // Stage 3 must simplify the complete stage-2 surface, including every
+    // cavity opening that phase 1 deliberately retained.  Keeping those
+    // restored surfaces on a side channel and appending them after Hausdorff
+    // merging made them bypass the user's error limit: even an effectively
+    // unlimited limit could not replace the whole model by one box shell.
+    output = std::move(phase2_recognized_surfaces);
+    std::vector<std::uint32_t> excluded_faces =
+        std::move(structural_cleanup.excluded_faces);
+    structural_cleanup = StructuralCleanup{};
+    std::vector<OutputPrimitive>().swap(restored_cavity_output);
+    std::vector<bool>().swap(responsibility_faces);
+    std::vector<OutputPrimitive>().swap(envelope_output);
+    for (auto& candidate : envelope_candidates)
+        std::vector<OutputPrimitive>().swap(candidate);
+    recordStageError("phase2_input", output);
     markStage("exact_surface_union");
 
     const double merge_tolerance =
@@ -11056,29 +11170,38 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::size_t spatial_merge_passes = 0;
     std::size_t spatially_enclosed_primitives = 0;
     constexpr std::size_t maximum_spatial_merge_passes = 8;
-    for (; spatial_merge_passes < maximum_spatial_merge_passes;
-         ++spatial_merge_passes)
+    const double default_merge_limit = diagonal * 0.08;
+    std::vector<double> progressive_merge_limits;
+    if (maximum_open_error_distance > default_merge_limit + merge_tolerance)
+        progressive_merge_limits.push_back(default_merge_limit);
+    progressive_merge_limits.push_back(maximum_open_error_distance);
+    for (std::size_t phase = 0; phase < progressive_merge_limits.size(); ++phase)
     {
-        std::size_t pass_merges = 0;
-        const std::filesystem::path pass_profile = spatial_merge_passes == 0
-            ? output_directory / "spatial_group_merge_profile.json"
-            : output_directory /
-                ("spatial_group_merge_profile_pass_" +
-                 std::to_string(spatial_merge_passes + 1) + ".json");
-        output = mergeSpatialPrimitiveGroups(
-            filled_surface_mesh, std::move(output), merge_tolerance,
-            maximum_open_error_distance, merge_sample_spacing,
-            pass_merges, certified_closed_volumes, pass_profile);
-        stats.merged_spatial_primitive_groups += pass_merges;
-
-        std::size_t pass_removed = 0;
-        output = removePrimitivesInsideEnclosureGroups(
-            mesh, std::move(output), merge_tolerance, pass_removed);
-        spatially_enclosed_primitives += pass_removed;
-        if (pass_merges == 0 && pass_removed == 0)
+        for (std::size_t phase_pass = 0;
+             phase_pass < maximum_spatial_merge_passes; ++phase_pass)
         {
+            std::size_t pass_merges = 0;
+            std::filesystem::path pass_profile;
+            if (phase == 0 && phase_pass == 0)
+                pass_profile = output_directory /
+                    "spatial_group_merge_profile.json";
+            else
+                pass_profile = output_directory /
+                    ("spatial_group_merge_profile_phase_" +
+                     std::to_string(phase + 1) + "_pass_" +
+                     std::to_string(phase_pass + 1) + ".json");
+            output = mergeSpatialPrimitiveGroups(
+                mesh, filled_surface_mesh, std::move(output), merge_tolerance,
+                progressive_merge_limits[phase], merge_sample_spacing,
+                pass_merges, certified_closed_volumes, pass_profile);
+            stats.merged_spatial_primitive_groups += pass_merges;
+
+            std::size_t pass_removed = 0;
+            output = removePrimitivesInsideEnclosureGroups(
+                mesh, std::move(output), merge_tolerance, pass_removed);
+            spatially_enclosed_primitives += pass_removed;
             ++spatial_merge_passes;
-            break;
+            if (pass_merges == 0 && pass_removed == 0) break;
         }
     }
     stats.removed_contained_primitives += spatially_enclosed_primitives;
@@ -11086,6 +11209,12 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         std::ofstream profile(
             output_directory / "spatial_group_fixed_point_profile.json");
         profile << "{\"passes\":" << spatial_merge_passes
+                << ",\"threshold_phases\":"
+                << progressive_merge_limits.size()
+                << ",\"baseline_limit\":" << std::setprecision(17)
+                << default_merge_limit
+                << ",\"requested_limit\":"
+                << maximum_open_error_distance
                 << ",\"accepted_groups\":"
                 << stats.merged_spatial_primitive_groups
                 << ",\"removed_enclosed_primitives\":"
@@ -11110,7 +11239,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // coplanar rewriting; ordinary items preserve the source-face
     // responsibility map. This snapshot already includes every responsibility
     // transferred from primitives removed inside an enclosure above.
-    const std::vector<OutputPrimitive> coverage_certificate_primitives = output;
+    std::vector<OutputPrimitive> coverage_certificate_primitives = output;
 
     CoplanarCanonicalizationStats post_merge_coplanar_stats;
     output = canonicalizeCoplanarPrimitiveUnion(
@@ -11121,9 +11250,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         post_merge_coplanar_stats.removed_primitives;
     stats.removed_coplanar_overlap_area +=
         post_merge_coplanar_stats.removed_overlap_area;
+    recordStageError("phase3_merged", output);
     markStage("hausdorff_surface_merging");
 
-    const std::vector<std::uint32_t>& excluded_faces = structural_cleanup.excluded_faces;
     // Closed-box recognition is bookkeeping only. Its six rectangles remain the
     // actual primitives; there is no box primitive in the type system.
     std::vector<RecognizedProtrusion> discovered_closed_boxes;
@@ -11165,31 +11294,54 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         export_coplanar_stats.removed_overlap_area;
     markStage("export_canonicalization");
 
-    output.insert(output.end(), restored_cavity_output.begin(),
-                  restored_cavity_output.end());
-    output = reopenRestoredCavityVolumes(
-        mesh, std::move(output), structural_cleanup,
-        effective_options.maximum_cavity_added_volume_ratio, model_volume,
-        std::max(diagonal * 1.0e-9, 1.0e-10));
+    // Restored cavity surfaces already participated in stage 3. Do not append
+    // or reopen them here: doing so would undo a valid error-bounded merge and
+    // reintroduce geometry that the user explicitly allowed us to remove.
     CoplanarCanonicalizationStats final_surface_coplanar_stats;
     output = canonicalizeCoplanarPrimitiveUnion(
         mesh, std::move(output), std::max(diagonal * 1.0e-9, 1.0e-10),
         final_surface_coplanar_stats);
-    auto final_closed_extrusions = recognizeCertifiedPrismaticVolumes(
-        output, std::max(diagonal * 1.0e-9, 1.0e-10));
-    certified_closed_extrusions.insert(
-        certified_closed_extrusions.end(),
-        std::make_move_iterator(final_closed_extrusions.begin()),
-        std::make_move_iterator(final_closed_extrusions.end()));
+    markStage("final_surface_union");
+    // Rebuild the occlusion certificates from the active fixed-point result.
+    // Historical accepted boxes include candidates that were later swallowed
+    // by a larger enclosure. Feeding both generations to Clipper creates a
+    // dense arrangement of overlapping sections and can exhaust the 2 GB job
+    // limit on large CAD meshes.
+    certified_closed_extrusions = recognizeEnclosureGroupExtrusions(
+        coverage_certificate_primitives,
+        std::max(diagonal * 1.0e-9, 1.0e-10), true);
+    const std::vector<BoxFit> active_closed_volumes =
+        selectActiveBoxCertificates(
+            coverage_certificate_primitives, certified_closed_volumes,
+            std::max(diagonal * 1.0e-9, 1.0e-10));
+    {
+        std::size_t boundary_vertices = 0;
+        for (const auto& extrusion : certified_closed_extrusions)
+            boundary_vertices += extrusion.boundary.size();
+        std::ofstream profile(output_directory /
+                              "final_occlusion_certificate_profile.json");
+        profile << "{\"historical_box_count\":"
+                << certified_closed_volumes.size()
+                << ",\"active_box_count\":"
+                << active_closed_volumes.size()
+                << ",\"active_extrusion_count\":"
+                << certified_closed_extrusions.size()
+                << ",\"active_boundary_vertices\":"
+                << boundary_vertices << "}\n";
+    }
+    markStage("final_volume_recognition");
     std::size_t volume_occluded_primitives = 0;
     output = clipPlanarOcclusionByClosedVolumes(
-        std::move(output), certified_closed_volumes, certified_closed_extrusions,
+        std::move(output), active_closed_volumes, certified_closed_extrusions,
         std::max(diagonal * 1.0e-9, 1.0e-10), volume_occluded_primitives,
         nullptr, false);
     stats.removed_contained_primitives += volume_occluded_primitives;
+    markStage("final_volume_occlusion");
     output = clipParallelOuterOcclusion(
         std::move(output), (lower + upper) * 0.5, diagonal * 0.03,
         std::max(diagonal * 1.0e-9, 1.0e-10));
+    recordStageError("final_surface_cleanup", output);
+    std::vector<OutputPrimitive> simplification_error_primitives = output;
     markStage("final_surface_canonicalization");
 
     const double final_tolerance = std::max(
@@ -11197,29 +11349,19 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     FinalCoverageAudit coverage = auditFinalConservativeCoverage(
         mesh, output, final_tolerance, &coverage_certificate_primitives,
         &certified_closed_extrusions, &excluded_faces);
-    {
-        std::ofstream profile(output_directory /
-                              "coverage_audit_pre_repair.json");
-        profile << "{\"output_primitives\":" << output.size()
-                << ",\"output_triangles\":"
-                << triangulatedFaceCount(output)
-                << ",\"unassigned_source_faces\":"
-                << coverage.unassigned_source_faces
-                << ",\"failed_source_faces\":"
-                << coverage.failed_source_faces
-                << ",\"repair_face_count\":"
-                << coverage.failed_face_ids.size()
-                << ",\"repair_face_ids\":[";
-        for (std::size_t index = 0;
-             index < coverage.failed_face_ids.size(); ++index)
-        {
-            if (index != 0) profile << ',';
-            profile << coverage.failed_face_ids[index];
-        }
-        profile << "]}\n";
-    }
+    markStage("coverage_audit_pre_repair");
+    const std::size_t pre_repair_primitives = output.size();
+    const std::size_t pre_repair_triangles = triangulatedFaceCount(output);
+    const std::size_t pre_repair_unassigned = coverage.unassigned_source_faces;
+    const std::size_t pre_repair_failed = coverage.failed_source_faces;
+    const std::vector<std::uint32_t> repair_face_ids = coverage.failed_face_ids;
+    std::size_t repair_merged_groups = 0;
+    std::size_t repair_output_primitives = 0;
+    std::size_t repair_output_triangles = 0;
     if (!coverage.failed_face_ids.empty())
     {
+        std::vector<OutputPrimitive> repair_output;
+        repair_output.reserve(coverage.failed_face_ids.size());
         for (const auto face_id : coverage.failed_face_ids)
         {
             if (face_id >= mesh.faces.size()) continue;
@@ -11228,13 +11370,68 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             for (int corner = 0; corner < 3; ++corner)
                 triangle.triangle[corner] =
                     mesh.vertices[mesh.faces[face_id][corner]];
-            output.push_back({std::move(triangle), {face_id}});
+            repair_output.push_back({std::move(triangle), {face_id}});
         }
+        std::vector<BoxFit> repair_boxes;
+        repair_output = mergeSpatialPrimitiveGroups(
+            mesh, filled_surface_mesh, std::move(repair_output),
+            final_tolerance, maximum_open_error_distance,
+            merge_sample_spacing, repair_merged_groups, repair_boxes,
+            output_directory / "coverage_repair_merge_profile.json");
+
+        std::uint64_t group_offset = 0;
+        for (const auto& item : output)
+            group_offset = std::max(group_offset, item.enclosure_group);
+        for (auto& item : repair_output)
+            if (item.enclosure_group != 0)
+                item.enclosure_group += group_offset;
+
+        repair_output_primitives = repair_output.size();
+        repair_output_triangles = triangulatedFaceCount(repair_output);
+        for (const auto& item : repair_output)
+        {
+            coverage_certificate_primitives.push_back(item);
+            // Approximate repair enclosures are part of stage-3 error. Exact
+            // source triangles have zero error to the original mesh but may be
+            // absent from the intentionally hole-filled phase-1 reference.
+            if (item.enclosure_group != 0)
+                simplification_error_primitives.push_back(item);
+        }
+        output.insert(output.end(),
+            std::make_move_iterator(repair_output.begin()),
+            std::make_move_iterator(repair_output.end()));
         promoteToSemanticPrimitives(output);
         coverage = auditFinalConservativeCoverage(
             mesh, output, final_tolerance, &coverage_certificate_primitives,
             &certified_closed_extrusions, &excluded_faces);
     }
+    {
+        std::ofstream profile(output_directory /
+                              "coverage_audit_pre_repair.json");
+        profile << "{\"output_primitives\":" << pre_repair_primitives
+                << ",\"output_triangles\":" << pre_repair_triangles
+                << ",\"unassigned_source_faces\":"
+                << pre_repair_unassigned
+                << ",\"failed_source_faces\":" << pre_repair_failed
+                << ",\"repair_face_count\":" << repair_face_ids.size()
+                << ",\"repair_merged_groups\":" << repair_merged_groups
+                << ",\"repair_output_primitives\":"
+                << repair_output_primitives
+                << ",\"repair_output_triangles\":"
+                << repair_output_triangles
+                << ",\"repair_face_ids\":[";
+        for (std::size_t index = 0; index < repair_face_ids.size(); ++index)
+        {
+            if (index != 0) profile << ',';
+            profile << repair_face_ids[index];
+        }
+        profile << "]}\n";
+    }
+    recordStageError("coverage_repaired", output);
+    const PrimitiveMesh simplification_error_proxy =
+        triangulateOutputPrimitives(simplification_error_primitives);
+    std::vector<OutputPrimitive>().swap(simplification_error_primitives);
+    markStage("coverage_audit_final");
     stats.coverage_assigned_source_faces = coverage.assigned_source_faces;
     stats.coverage_enclosure_source_faces = coverage.enclosure_source_faces;
     stats.coverage_planar_source_faces = coverage.planar_source_faces;
@@ -11253,8 +11450,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const auto error_audit_started = std::chrono::steady_clock::now();
     const SourceTriangleBvh filled_surface_reference(filled_surface_mesh);
     const FinalOpenErrorAudit open_error = measureFilledSurfaceDistance(
-        filled_surface_reference, triangulateOutputPrimitives(output),
+        filled_surface_reference, simplification_error_proxy,
         std::max(diagonal / 192.0, 1.0e-30));
+    markStage("open_error_audit");
     stats.open_error_audit_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - error_audit_started).count();
     stats.open_error_distance_sample_count = open_error.distance_sample_count;
@@ -11280,11 +11478,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     }
     std::filesystem::create_directories(output_directory);
     writeSourceObj(output_directory / "source.obj", mesh);
-    (void)writeTriangulatedObj(
-        output_directory / "phase1_hole_filled.obj", phase1_hole_filled);
-    writeSemanticPrimitiveObj(
-        output_directory / "phase2_recognized_surfaces.obj",
-        phase2_recognized_surfaces);
     writeRegionsObj(
         output_directory / "regions.obj", mesh, output, excluded_faces);
     stats.primitive_count = output.size();

@@ -50,10 +50,15 @@ configured circumferential segment count.
    clipped patches retain their parameter-domain boundary, while a certified
    original complete surface may be restored.
 6. Remove exact overlap and certified internal surfaces. Build a spatial
-   hierarchy over all recognized surface patches, independent of their surface
-   type. At each hierarchy node, test whether one tight conservative box shell
-   can replace the complete descendant group. Accept the coarsest admissible
-   node; otherwise recurse to its children. After every pass, primitives fully
+   hierarchy over the complete phase-2 surface, including every retained large
+   cavity, independent of patch type. At each hierarchy node, fit the box
+   orientation to the proxy patches, minimally expand its local extents to
+   contain every original responsibility triangle, and test whether that
+   conservative shell can replace the complete descendant group. Accept the
+   coarsest admissible node; otherwise recurse to its children. Requests above
+   the default error first build the default-error fixed point and then simplify
+   that result further, so increasing the error limit cannot reintroduce work.
+   After every pass, primitives fully
    enclosed by an accepted replacement transfer their source responsibility to
    that enclosure and are deleted. The hierarchy is rebuilt and evaluated
    again until neither a merge nor an enclosed-primitive deletion occurs. A
@@ -62,7 +67,9 @@ configured circumferential segment count.
    must pass the sampled directed simplified-to-hole-filled distance limit
    `maximum_open_error_distance`. Hole filling itself is not charged to this
    error because phase 1 is the distance reference. PQSS workload and a target
-   primitive count are not part of the geometry decision.
+   primitive count are not part of the geometry decision. Source faces still
+   failing the final conservative audit are passed through the same bounded box
+   hierarchy; only faces that cannot be safely grouped remain exact triangles.
 7. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
@@ -94,11 +101,27 @@ Each analyzed model directory contains:
 - `spatial_group_fixed_point_profile.json`: number of rebuild passes, total
   accepted groups, and primitives deleted after becoming enclosed.
 - `coverage_audit_pre_repair.json`: exported workload before conservative
-  fallback repair and the exact source-face IDs that required local repair.
+  fallback repair, the exact source-face IDs, and the reduced repair workload;
+- `coverage_repair_merge_profile.json`: candidates used to replace audit repair
+  triangles by conservative error-bounded boxes;
+- `final_occlusion_certificate_profile.json`: historical versus active closed
+  certificates used by final overlap removal;
+- `stage_error_profile.jsonl`: primitive workload and measured maximum error at
+  phase 2, phase 3, final cleanup, and conservative repair.
 
 The maximum and mean simplification errors in `model.json` and the viewer are
 directed from phase 3/4 to phase 1. Strict conservative coverage is still
-audited independently against `source.obj`.
+audited independently against `source.obj`. Exact source-triangle safety
+repairs are not approximation error; approximate box repairs are included in
+the phase-3 error audit.
+
+Audit a completed batch, including finite coordinates, zero-area triangles,
+exact duplicate triangles, containment, error limits, timings, and peak memory:
+
+```powershell
+python tools/audit_staged_surface_outputs.py `
+  outputs/surface_primitives_stage3_complete_v4/viewer_manifest.json
+```
 
 The output root contains `viewer_manifest.json`. Group names use matching IDs:
 
