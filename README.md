@@ -109,7 +109,6 @@ CLI compatibility).
   --output-dir outputs/model4 `
   --primitive-types polygon,surface `
   --frustum-segments 24 `
-  --unified-candidates `
   --maximum-open-error-distance 80 `
   --maximum-process-memory-gb 2
 ```

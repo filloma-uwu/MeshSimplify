@@ -63,20 +63,6 @@ struct PrimitiveMeshAnalysisOptions
     // retaining its dominant recess. Normalized by the whole-model surface.
     double shallow_shell_silhouette_added_area_ratio = 0.005;
     bool uniform_structure_policy = true;
-    // Production pipeline: repair holes, recognize complete surfaces, perform
-    // error-bounded fixed-point surface merging, clean the outer boundary, and
-    // triangulate. Disable only to exercise the retired unified-frontier path
-    // in compatibility tests.
-    bool use_staged_surface_pipeline = true;
-    // Replacement architecture: all surface and enclosing-volume candidates
-    // compete in one hierarchy instead of greedily claiming source faces in
-    // geometry-specific passes.
-    bool use_unified_candidate_optimizer = false;
-    // A complete closed-volume certificate enables internal-overlap removal.
-    // Treat full-model certified responsibility as this many saved proxy
-    // triangles, but keep the benefit bounded so it can never select a huge
-    // fragmented shell merely because its approximation error is zero.
-    double unified_enclosure_workload_credit = 64.0;
     // In the uniform policy a high-error whole-body box remains forbidden.
     // Geometry-connected local structures may still merge into a six-polygon
     // box when both globally normalized added-volume and added-area budgets pass.
@@ -84,9 +70,6 @@ struct PrimitiveMeshAnalysisOptions
     // Hard one-sided proxy-to-source distance limit in model units. A negative
     // value selects the default of 8% of the model AABB diagonal.
     double maximum_open_error_distance = -1.0;
-    // Debug-only bounded export of failed unified leaf candidates. Production
-    // analysis keeps this disabled to avoid extra mesh copies and disk output.
-    bool write_unified_region_diagnostics = false;
 };
 
 struct PrimitiveMeshAnalysisStats
@@ -122,72 +105,6 @@ struct PrimitiveMeshAnalysisStats
     std::array<std::size_t, 3> envelope_candidate_primitive_counts{{0, 0, 0}};
     std::array<std::size_t, 3> envelope_candidate_remaining_cavities{{0, 0, 0}};
     std::size_t excluded_redundant_triangles = 0;
-    // Unified-candidate optimizer telemetry. Counts and inclusive timings are
-    // persisted so expensive offline analyses can be diagnosed without
-    // inferring bottlenecks from total wall time.
-    std::size_t unified_approximate_planar_regions = 0;
-    std::size_t unified_exact_coplanar_regions = 0;
-    std::size_t unified_hierarchy_regions = 0;
-    std::size_t unified_connected_components = 0;
-    std::size_t unified_lateral_sweep_axes = 0;
-    std::size_t unified_lateral_sweep_patches = 0;
-    std::size_t unified_lateral_sweep_certified = 0;
-    std::size_t unified_lateral_sweep_candidates = 0;
-    std::size_t unified_lateral_sweep_max_faces = 0;
-    std::size_t unified_lateral_significant_candidates = 0;
-    double unified_lateral_sweep_max_axial_aspect = 0.0;
-    double unified_lateral_sweep_max_area_ratio = 0.0;
-    std::size_t unified_lateral_reject_geometry = 0;
-    std::size_t unified_lateral_reject_end_ring = 0;
-    std::size_t unified_lateral_reject_normal = 0;
-    std::size_t unified_lateral_reject_radial = 0;
-    std::size_t unified_lateral_best_end_ring_min_points = 0;
-    double unified_lateral_best_end_ring_spread_ratio = -1.0;
-    double unified_lateral_best_end_ring_gap_ratio = -1.0;
-    double unified_lateral_best_end_ring_score = -1.0;
-    std::size_t unified_final_frontier_size = 0;
-    // True only when the error-constrained optimizer has no admissible
-    // candidate and returns the source triangles verbatim.  The export path
-    // must keep this representation linear; running the global coplanar union
-    // over thousands of one-face primitives is both unnecessary and can have
-    // quadratic memory cost.
-    bool unified_exact_fallback_selected = false;
-    std::size_t unified_final_analytic_choices = 0;
-    double unified_selected_workload = -1.0;
-    double unified_selected_static_workload = -1.0;
-    std::size_t unified_selected_enclosure_overlap_pairs = 0;
-    double unified_selected_enclosure_overlap_score = 0.0;
-    std::size_t unified_selected_analytic_faces = 0;
-    double unified_selected_analytic_area_ratio = 0.0;
-    double unified_best_analytic_workload = -1.0;
-    std::size_t unified_best_analytic_faces = 0;
-    double unified_best_analytic_area_ratio = 0.0;
-    double unified_whole_model_box_workload = -1.0;
-    bool unified_whole_model_box_passed_local_budget = false;
-    std::size_t unified_adaptive_refinements = 0;
-    std::size_t unified_skipped_final_audits = 0;
-    std::size_t unified_skipped_industrial_fallback_candidates = 0;
-    std::vector<double> unified_final_frontier_workloads;
-    std::size_t unified_enclosure_extrusions = 0;
-    std::size_t unified_occlusion_clipped_primitives = 0;
-    std::size_t unified_occlusion_removed_primitives = 0;
-    std::size_t unified_occlusion_input_triangles = 0;
-    std::size_t unified_occlusion_output_triangles = 0;
-    double unified_occlusion_removed_area = 0.0;
-    bool unified_occlusion_rolled_back = false;
-    double unified_occlusion_seconds = 0.0;
-    std::size_t unified_classify_calls = 0;
-    std::size_t unified_classify_faces = 0;
-    std::size_t unified_frontier_prune_calls = 0;
-    std::size_t unified_frontier_prune_choices = 0;
-    std::size_t unified_frontier_prune_max_choices = 0;
-    std::uint64_t unified_frontier_prune_comparisons = 0;
-    double unified_planar_region_seconds = 0.0;
-    double unified_connected_component_seconds = 0.0;
-    double unified_analytic_recognition_seconds = 0.0;
-    double unified_classify_seconds = 0.0;
-    double unified_frontier_prune_seconds = 0.0;
-    double unified_hierarchy_seconds = 0.0;
     // Final export gate. Local candidates are certified while they are built;
     // these counters verify that post-selection containment removal and planar
     // canonicalization still conservatively cover every source triangle.
@@ -219,13 +136,6 @@ struct PrimitiveMeshAnalysisStats
 [[nodiscard]] PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const std::filesystem::path& input_obj,
     const std::filesystem::path& output_directory,
-    const PrimitiveMeshAnalysisOptions& options);
-
-// Builds the expensive merge hierarchy once, then emits strengths 0.00 through
-// 1.00 at 0.01 intervals into s000 ... s100.
-[[nodiscard]] std::vector<PrimitiveMeshAnalysisStats> analyzePrimitiveMeshObjStrengthSweep(
-    const std::filesystem::path& input_obj,
-    const std::filesystem::path& output_root,
     const PrimitiveMeshAnalysisOptions& options);
 
 } // namespace pqss_proxy_mesh

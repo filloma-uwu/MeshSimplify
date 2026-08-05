@@ -25,11 +25,13 @@ These rules are mandatory for every simplification change in this repository.
 7. Never delete a proxy because it merely looks internal or unimportant. Delete
    it only after union-coverage certification; record the reason in statistics.
 8. Offline generation must not use scene poses or collision-query outcomes.
-   Candidate quality targets PQSS Optimized static workload surrogates; held-out
-   query BV tests and triangle tests are acceptance measurements only.
-9. BVH depth and primitive count are diagnostics, not primary objectives. Prefer
-   lower expected BV tests and triangle tests while preserving conservative
-   coverage.
+   Geometry recognition and simplification granularity are decided only by
+   geometric type certificates, conservative coverage, and the user-provided
+   directed proxy-to-source Hausdorff limit. PQSS workload must not prune,
+   rank, or select geometry candidates.
+9. BV tests, triangle tests, BVH depth, and primitive count are post-generation
+   evaluation diagnostics. They may motivate a later algorithm redesign, but
+   they never override a geometric merge decision in the current run.
 10. Every algorithm change must add a model-independent regression, run the full
     test suite, regenerate every evaluated model with identical options, and
     update one non-mixed visualization manifest. Do not compare outputs produced

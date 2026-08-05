@@ -25,11 +25,9 @@ void usage()
         << "       [--legacy-analysis-strength 0.5] [--maximum-added-volume-ratio 0.01]\n"
         << "       [--maximum-group-box-added-volume-ratio 0.05]\n"
         << "       [--protrusion-max-area-excess-ratio 0.03] [--diagnostic-volume-envelope]\n"
-        << "       [--unified-candidates]\n"
         << "       [--maximum-open-error-distance value]\n"
-        << "       [--write-region-diagnostics]\n"
         << "       [--maximum-process-memory-gb 2]\n"
-        << "       [--strength-sweep]\n";
+        ;
 }
 
 void applyProcessMemoryLimit(const double gigabytes)
@@ -91,7 +89,6 @@ int main(int argc, char** argv)
         std::filesystem::path input;
         std::filesystem::path output;
         pqss_proxy_mesh::PrimitiveMeshAnalysisOptions options;
-        bool strength_sweep = false;
         double maximum_process_memory_gb = 2.0;
         for (int index = 1; index < argc; ++index)
         {
@@ -140,10 +137,6 @@ int main(int argc, char** argv)
             {
                 options.enable_volume_evaluated_envelope = true;
             }
-            else if (argument == "--unified-candidates")
-            {
-                options.use_unified_candidate_optimizer = true;
-            }
             else if (argument == "--maximum-open-error-distance")
             {
                 options.maximum_open_error_distance = std::stod(value());
@@ -155,15 +148,6 @@ int main(int argc, char** argv)
             else if (argument == "--maximum-process-memory-gb")
             {
                 maximum_process_memory_gb = std::stod(value());
-            }
-            else if (argument == "--write-region-diagnostics")
-            {
-                options.write_unified_region_diagnostics = true;
-            }
-            else if (argument == "--strength-sweep")
-            {
-                strength_sweep = true;
-                options.uniform_structure_policy = false;
             }
             else
             {
@@ -177,16 +161,6 @@ int main(int argc, char** argv)
             return 2;
         }
         applyProcessMemoryLimit(maximum_process_memory_gb);
-        if (strength_sweep)
-        {
-            const auto sweep = pqss_proxy_mesh::analyzePrimitiveMeshObjStrengthSweep(
-                input, output, options);
-            std::cout << "strength_variants=" << sweep.size() << '\n'
-                      << "hierarchy_and_emit_seconds="
-                      << (sweep.empty() ? 0.0 : sweep.back().analysis_seconds) << '\n'
-                      << "manifest=" << (output / "viewer_manifest.json").string() << '\n';
-            return 0;
-        }
         const auto stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(input, output, options);
         std::cout << "source_triangles=" << stats.source_triangles << '\n'
                   << "primitives=" << stats.primitive_count << '\n'

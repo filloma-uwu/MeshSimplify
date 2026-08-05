@@ -6,7 +6,7 @@ param(
     [int]$MaxParallel = 1,
     [double]$MaxProcessMemoryGB = 2.0,
     [double]$MinimumFreeMemoryGB = 8.0,
-    [string]$Algorithm = "UnifiedSurfacePrimitiveOptimizer"
+    [string]$Algorithm = "StagedSurfacePrimitivePipeline"
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,7 +37,6 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
         $arguments = @(
             "--input", (Join-Path $inputPath "$modelId.obj"),
             "--output-dir", $directory,
-            "--unified-candidates",
             "--maximum-process-memory-gb", $MaxProcessMemoryGB
         )
         $process = Start-Process -FilePath $executablePath -ArgumentList $arguments `
@@ -106,7 +105,7 @@ $manifestModels = foreach ($modelId in $ModelIds) {
 $manifest = [ordered]@{
     algorithm = $Algorithm
     complete = $true
-    note = "One Release binary and identical unified-candidate options for every model."
+    note = "One Release binary and identical staged-pipeline options for every model."
     model_count = $ModelIds.Count
     models = @($manifestModels)
 }

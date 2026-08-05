@@ -92,7 +92,6 @@ class Handler(SimpleHTTPRequestHandler):
                         str(server.executable),
                         "--input", str(source_path),
                         "--output-dir", str(output),
-                        "--unified-candidates",
                         "--maximum-open-error-distance", format(maximum_error, ".17g"),
                     ]
                     completed = subprocess.run(

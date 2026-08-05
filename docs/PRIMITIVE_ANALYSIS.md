@@ -44,15 +44,16 @@ configured circumferential segment count.
 4. Evaluate every inner boundary independently. Its conservative loop area
    times model depth is divided by the whole-model AABB volume. Small holes may
    close; a large body cavity remains.
-5. Build a model-level hierarchy of surface and enclosing candidates. A merge
-   is admissible only when the maximum sampled directed distance from its proxy
-   surface to the source open surface does not exceed
-   `maximum_open_error_distance`. The deterministic MeshLab-style sampling
-   covers vertices, edges, and area-weighted face interiors; every sampled
-   point uses an exact closest-triangle query. Added volume is not a merge
-   criterion.
-6. Among admissible candidates, minimize triangulated proxy workload, then
-   canonicalize exact coplanar coverage and triangulate the semantic surfaces.
+5. Merge every adjacent patch that has the same certified analytic surface;
+   clipped patches retain their parameter-domain boundary, while a certified
+   original complete surface may be restored.
+6. Remove exact overlap and certified internal surfaces. Then repeatedly test
+   adjacent primitive merges and accept the lowest-error admissible merge.
+   Acceptance requires conservative source coverage and a sampled directed
+   proxy-to-source distance no greater than `maximum_open_error_distance`.
+   Accepted merges update adjacency and candidate errors; iteration stops only
+   when no candidate remains. PQSS workload is not part of this decision.
+7. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
 Falcidieno, and Spagnuolo (2006), *Hierarchical Mesh Segmentation Based on
