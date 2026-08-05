@@ -10687,6 +10687,20 @@ std::size_t writeTriangulatedObj(const std::filesystem::path& path,
     stream << std::setprecision(17);
     std::uint32_t offset = 0;
     std::size_t triangle_count = 0;
+    Bounds bounds;
+    for (const auto& item : primitives)
+        for (const Vec3& vertex : triangulatePrimitive(item.primitive).vertices)
+        {
+            bounds.lower = bounds.lower.cwiseMin(vertex);
+            bounds.upper = bounds.upper.cwiseMax(vertex);
+        }
+    const double diagonal = (bounds.upper - bounds.lower).norm();
+    const double area_epsilon_squared = std::max(
+        std::pow(diagonal, 4.0) * 1.0e-28, 1.0e-48);
+    const double quantum = std::max(diagonal * 1.0e-10, 1.0e-12);
+    using Coordinate = std::array<std::int64_t, 3>;
+    using TriangleKey = std::array<Coordinate, 3>;
+    std::set<TriangleKey> emitted_triangles;
     for (std::size_t id = 0; id < primitives.size(); ++id)
     {
         const PrimitiveMesh mesh = triangulatePrimitive(primitives[id].primitive);
@@ -10695,10 +10709,32 @@ std::size_t writeTriangulatedObj(const std::filesystem::path& path,
         for (const Vec3& vertex : mesh.vertices)
             stream << "v " << vertex.x() << ' ' << vertex.y() << ' ' << vertex.z() << '\n';
         for (const Face& face : mesh.faces)
-            stream << "f " << offset + face[0] + 1 << ' ' << offset + face[1] + 1 << ' '
+        {
+            const Vec3& first = mesh.vertices[face[0]];
+            const Vec3& second = mesh.vertices[face[1]];
+            const Vec3& third = mesh.vertices[face[2]];
+            const Vec3 cross = (second - first).cross(third - first);
+            if (cross.squaredNorm() <= area_epsilon_squared)
+                continue;
+            TriangleKey key{{
+                Coordinate{{std::llround(first.x() / quantum),
+                            std::llround(first.y() / quantum),
+                            std::llround(first.z() / quantum)}},
+                Coordinate{{std::llround(second.x() / quantum),
+                            std::llround(second.y() / quantum),
+                            std::llround(second.z() / quantum)}},
+                Coordinate{{std::llround(third.x() / quantum),
+                            std::llround(third.y() / quantum),
+                            std::llround(third.z() / quantum)}},
+            }};
+            std::sort(key.begin(), key.end());
+            if (!emitted_triangles.insert(key).second) continue;
+            stream << "f " << offset + face[0] + 1 << ' '
+                   << offset + face[1] + 1 << ' '
                    << offset + face[2] + 1 << '\n';
+            ++triangle_count;
+        }
         offset += static_cast<std::uint32_t>(mesh.vertices.size());
-        triangle_count += mesh.faces.size();
     }
     return triangle_count;
 }

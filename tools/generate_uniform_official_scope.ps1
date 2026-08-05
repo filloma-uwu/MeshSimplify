@@ -2,7 +2,7 @@ param(
     [string]$Executable = "$PSScriptRoot\..\build\Release\pqss-primitive-mesh-analyze.exe",
     [string]$InputRoot = "$PSScriptRoot\..\test_data\real_scene\source_pool",
     [string]$OutputRoot = "$PSScriptRoot\..\outputs\primitive_mesh_cpp_uniform_official_scope_001",
-    [int]$MaxParallel = 13
+    [int]$MaxParallel = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,19 +30,37 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
             "--input", (Join-Path $inputPath "$modelId.obj"),
             "--output-dir", $directory,
             "--primitive-types", "polygon,surface",
-            "--round-surface-segments", "24"
+            "--round-surface-segments", "24",
+            "--maximum-process-memory-gb", "2"
         ) -RedirectStandardOutput (Join-Path $directory "analysis.stdout.txt") `
           -RedirectStandardError (Join-Path $directory "analysis.stderr.txt") `
           -WindowStyle Hidden -PassThru
         $running[$process.Id] = [pscustomobject]@{
             Process = $process; ModelId = $modelId; Directory = $directory
+            PeakWorkingSetBytes = 0L; PeakPrivateBytes = 0L
         }
     }
     Start-Sleep -Milliseconds 200
     foreach ($processId in @($running.Keys)) {
         $job = $running[$processId]
-        if (-not $job.Process.HasExited) { continue }
+        $job.Process.Refresh()
+        if (-not $job.Process.HasExited) {
+            $job.PeakWorkingSetBytes = [math]::Max(
+                $job.PeakWorkingSetBytes, $job.Process.WorkingSet64)
+            $job.PeakPrivateBytes = [math]::Max(
+                $job.PeakPrivateBytes, $job.Process.PrivateMemorySize64)
+            continue
+        }
         $job.Process.WaitForExit()
+        $job.Process.Refresh()
+        $job.PeakWorkingSetBytes = [math]::Max(
+            $job.PeakWorkingSetBytes, $job.Process.PeakWorkingSet64)
+        ($job.PeakWorkingSetBytes / 1MB).ToString(
+            "R", [Globalization.CultureInfo]::InvariantCulture) | Set-Content `
+            (Join-Path $job.Directory "peak_memory_mb.txt") -Encoding ASCII
+        ($job.PeakPrivateBytes / 1MB).ToString(
+            "R", [Globalization.CultureInfo]::InvariantCulture) | Set-Content `
+            (Join-Path $job.Directory "peak_private_memory_mb.txt") -Encoding ASCII
         if (-not (Test-Path (Join-Path $job.Directory "model.json"))) {
             $errorText = Get-Content (Join-Path $job.Directory "analysis.stderr.txt") -Raw
             $failures += "Model $($job.ModelId) failed: $errorText"
@@ -63,7 +81,7 @@ $models = foreach ($modelId in $modelIds) {
     [ordered]@{ id = $modelId; metadata = "models/$modelId/model.json" }
 }
 $manifest = [ordered]@{
-    algorithm = "CppCertifiedExtrudedShellPriorityMergeV58"
+    algorithm = "CppSurfaceOnlyCandidatesE2CA684"
     complete = $true
     model_count = $modelIds.Count
     models = @($models)

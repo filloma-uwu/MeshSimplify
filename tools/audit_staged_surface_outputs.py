@@ -80,7 +80,9 @@ def proxy_geometry_audit(path: Path) -> dict[str, int]:
     }
 
 
-def read_float(path: Path) -> float:
+def read_optional_float(path: Path) -> float | None:
+    if not path.is_file():
+        return None
     return float(path.read_text(encoding="ascii").strip())
 
 
@@ -108,8 +110,9 @@ def main() -> int:
         limit_tolerance = max(1.0e-8, abs(limit) * 1.0e-10)
         pre_repair_path = metadata_path.parent / "coverage_audit_pre_repair.json"
         pre_repair = json.loads(pre_repair_path.read_text(encoding="utf-8"))
-        peak_memory = read_float(metadata_path.parent / "peak_memory_mb.txt")
-        peak_private = read_float(metadata_path.parent / "peak_private_memory_mb.txt")
+        peak_memory = read_optional_float(metadata_path.parent / "peak_memory_mb.txt")
+        peak_private = read_optional_float(
+            metadata_path.parent / "peak_private_memory_mb.txt")
         model_failures: list[str] = []
         if not stats["containment_validation"]["passed"]:
             model_failures.append("containment validation failed")
@@ -163,12 +166,14 @@ def main() -> int:
     )
     lines = [header]
     for row in rows:
+        peak_private_text = (f"{row['peak_private_mb']:.1f}"
+                             if row['peak_private_mb'] is not None else "—")
         lines.append(
             f"| {row['model']} | {row['source_triangles']} | {row['primitive_count']} | "
             f"{row['proxy_triangles']} | {row['maximum_error']:.6g}/"
             f"{row['maximum_error_limit']:.6g} | {row['coverage_repairs']}→"
             f"{row['coverage_repair_output_triangles']} | "
-            f"{row['analysis_seconds']:.3f} | {row['peak_private_mb']:.1f} | "
+            f"{row['analysis_seconds']:.3f} | {peak_private_text} | "
             f"{'通过' if row['passed'] else '失败'} |\n"
         )
     if failures:

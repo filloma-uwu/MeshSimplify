@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/spatial_group_gap_validation/viewer_manifest.json"),
+        default=Path("outputs/surface_only_full_e2ca684_v2/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",
