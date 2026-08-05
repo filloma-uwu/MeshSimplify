@@ -50,7 +50,9 @@ configured circumferential segment count.
 6. Remove exact overlap and certified internal surfaces. Then repeatedly test
    adjacent primitive merges and accept the lowest-error admissible merge.
    Acceptance requires conservative source coverage and a sampled directed
-   proxy-to-source distance no greater than `maximum_open_error_distance`.
+   simplified-to-hole-filled distance no greater than
+   `maximum_open_error_distance`. Hole filling itself is not charged to this
+   error because phase 1 is the distance reference.
    Accepted merges update adjacency and candidate errors; iteration stops only
    when no candidate remains. PQSS workload is not part of this decision.
 7. Canonicalize the final outer surface and triangulate each semantic patch.
@@ -68,10 +70,19 @@ property is required.
 Each analyzed model directory contains:
 
 - `source.obj`: source surface after numerical-degenerate filtering;
+- `phase1_hole_filled.obj`: accepted holes sealed, their hidden inner walls
+  removed, and over-budget cavities retained;
+- `phase2_recognized_surfaces.obj`: adjacent certified analytic surfaces after
+  exact same-surface merging;
+- `primitives.obj`: phase 3 after overlap/internal removal and iterative
+  Hausdorff-limited merging;
+- `proxy.obj`: phase 4, the ordinary triangulated collision input;
 - `regions.obj`: source triangles grouped by final responsibility;
-- `primitives.obj`: semantic surface groups for inspection;
-- `proxy.obj`: the triangulated collision input;
 - `model.json`: type counts, triangle counts, fill diagnostics, and timing.
+
+The maximum and mean simplification errors in `model.json` and the viewer are
+directed from phase 3/4 to phase 1. Strict conservative coverage is still
+audited independently against `source.obj`.
 
 The output root contains `viewer_manifest.json`. Group names use matching IDs:
 

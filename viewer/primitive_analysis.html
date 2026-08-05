@@ -178,7 +178,7 @@
 <body>
   <div id="viewport"></div>
   <header id="topbar">
-    <div class="brand">代理 Mesh</div>
+    <div class="brand">四阶段代理 Mesh</div>
     <div class="model-nav">
       <button id="previousButton" class="icon-button" title="上一个模型" aria-label="上一个模型">&larr;</button>
       <select id="modelSelect" aria-label="模型"></select>
@@ -186,11 +186,12 @@
     </div>
     <div class="modes" aria-label="查看模式">
       <button data-mode="source">原模型</button>
-      <button data-mode="primitives">图元分析</button>
-      <button data-mode="triangulated">三角化结果</button>
-      <button data-mode="overlay">叠加</button>
+      <button data-mode="phase1">1 填洞</button>
+      <button data-mode="phase2">2 几何面合并</button>
+      <button data-mode="phase3">3 误差合并</button>
+      <button data-mode="phase4">4 三角化</button>
       <button data-mode="error">误差位置</button>
-      <button data-mode="split" class="active">两阶段对比</button>
+      <button data-mode="split" class="active">原始/最终对比</button>
     </div>
     <button id="fitButton" title="使模型适应当前视图">适应视图</button>
   </header>
@@ -231,13 +232,11 @@
       <dl id="stats"></dl>
     </section>
     <section id="errorSection" class="section" hidden>
-      <h2 class="section-title">开放区域误差</h2>
+      <h2 class="section-title">简化误差（阶段 3 → 阶段 1）</h2>
       <div id="legend">
-        <span class="swatch" style="background:#ef5b43"></span><span>代理新增的开放区域</span><span></span>
         <span class="swatch" style="background:#ffb33c"></span><span>最大误差代理点</span><span></span>
-        <span class="swatch" style="background:#43d6db"></span><span>最近原始表面点</span><span></span>
+        <span class="swatch" style="background:#43d6db"></span><span>最近填洞后表面点</span><span></span>
       </div>
-      <label class="check" style="margin-top:10px"><input id="showErrorRegion" type="checkbox" checked>显示开放区域</label>
       <button id="focusErrorButton" type="button" style="width:100%;margin-top:10px">定位最大误差</button>
     </section>
     <section class="section">
@@ -246,7 +245,7 @@
     </section>
   </aside>
 
-  <div id="labels"><span>原模型</span><span>三角化结果</span></div>
+  <div id="labels"><span>原模型</span><span>阶段 4：三角化结果</span></div>
   <div id="loading"><div id="loadingText">正在加载分析结果...</div></div>
 
   <script type="importmap">
@@ -291,8 +290,10 @@
 
     const roots = {
       source: new THREE.Group(),
-      primitives: new THREE.Group(),
-      triangulated: new THREE.Group(),
+      phase1: new THREE.Group(),
+      phase2: new THREE.Group(),
+      phase3: new THREE.Group(),
+      phase4: new THREE.Group(),
       error: new THREE.Group(),
     };
     Object.values(roots).forEach(root => scene.add(root));
@@ -306,8 +307,10 @@
     let loadGeneration = 0;
     let openError = null;
     const batchedPrimitiveData = {
-      primitives: new Map(),
-      triangulated: new Map(),
+      phase1: new Map(),
+      phase2: new Map(),
+      phase3: new Map(),
+      phase4: new Map(),
     };
     const primitiveTypes = ['polygon', 'disk', 'annulus', 'cylindricalband', 'conicalband'];
     const primitiveTypeNames = {
@@ -349,8 +352,8 @@
       const boundary = data.boundary_points || [];
       const pair = data.maximum_pair;
       const modelBox = new THREE.Box3();
-      modelBox.expandByObject(roots.source);
-      modelBox.expandByObject(roots.triangulated);
+      modelBox.expandByObject(roots.phase1);
+      modelBox.expandByObject(roots.phase4);
       const modelScale = Math.max(modelBox.getSize(new THREE.Vector3()).length(), 1e-6);
       if (boundary.length) {
         const geometry = new THREE.BufferGeometry();
@@ -434,7 +437,7 @@
         }
       }
       const populated = groups.filter(group => group.indices.length);
-      if ((role === 'primitives' || role === 'triangulated') && populated.length > 2000) {
+      if ((role === 'phase1' || role === 'phase2' || role === 'phase3' || role === 'phase4') && populated.length > 2000) {
         batchedPrimitiveData[role].clear();
         const buckets = new Map();
         for (const group of populated) {
@@ -467,12 +470,12 @@
           geometry.computeBoundingSphere();
           const material = new THREE.MeshStandardMaterial({
             vertexColors: true, roughness: 0.66, metalness: 0.04,
-            transparent: role === 'primitives',
-            opacity: role === 'primitives' ? 0.65 : 1,
-            depthWrite: role !== 'primitives', side: THREE.DoubleSide,
+            transparent: role === 'phase2',
+            opacity: role === 'phase2' ? 0.72 : 1,
+            depthWrite: role !== 'phase2', side: THREE.DoubleSide,
           });
           const mesh = new THREE.Mesh(geometry, material);
-          if (role === 'triangulated') attachTriangleWireframe(mesh);
+          if (role === 'phase4') attachTriangleWireframe(mesh);
           mesh.name = `batched_${type}`;
           mesh.userData = {
             role, primitiveId: null, primitiveType: type, batched: true,
@@ -513,14 +516,14 @@
             color: colorFor(identity.id || 0),
             roughness: 0.66,
             metalness: 0.04,
-          transparent: role === 'primitives',
-          opacity: role === 'primitives' ? 0.65 : 1,
-          depthWrite: role !== 'primitives',
+          transparent: role === 'phase2',
+          opacity: role === 'phase2' ? 0.72 : 1,
+          depthWrite: role !== 'phase2',
             side: THREE.DoubleSide,
           });
         }
         const mesh = new THREE.Mesh(geometry, material);
-        if (role === 'triangulated') {
+        if (role === 'phase4') {
           attachTriangleWireframe(mesh);
         }
         mesh.name = group.name;
@@ -624,12 +627,12 @@
         role, primitiveId: Number(primitiveId), primitiveType: data.type,
         selectionOverlay: true,
       };
-      if (role === 'triangulated') attachTriangleWireframe(mesh);
+      if (role === 'phase4') attachTriangleWireframe(mesh);
       return mesh;
     }
 
     function syncSelectionOverlays() {
-      for (const role of ['primitives', 'triangulated']) {
+      for (const role of ['phase3', 'phase4']) {
         const root = roots[role];
         removeSelectionOverlays(root);
         if (selectedPrimitive === 'all') continue;
@@ -658,8 +661,8 @@
     function resetPrimitiveSelection() {
       selectedPrimitive = 'all';
       primitiveSelect.value = 'all';
-      removeSelectionOverlays(roots.primitives);
-      removeSelectionOverlays(roots.triangulated);
+      removeSelectionOverlays(roots.phase3);
+      removeSelectionOverlays(roots.phase4);
       updateVisibility();
       updatePrimitiveStats();
       applyMaterialControls();
@@ -669,7 +672,7 @@
       const opacity = Number(document.querySelector('#opacity').value) / 100;
       const otherOpacity = Number(document.querySelector('#otherOpacity').value) / 100;
       const wireframe = document.querySelector('#wireframe').checked;
-      roots.primitives.children.forEach(mesh => {
+      for (const role of ['phase2', 'phase3']) roots[role].children.forEach(mesh => {
         const selected = mesh.userData.selectionOverlay || selectedPrimitive === 'all' ||
           mesh.userData.primitiveId === Number(selectedPrimitive);
         const meshOpacity = mesh.userData.batched && selectedPrimitive !== 'all'
@@ -680,7 +683,7 @@
         mesh.material.wireframe = wireframe;
         mesh.renderOrder = selected ? 2 : 0;
       });
-      roots.triangulated.children.forEach(mesh => {
+      roots.phase4.children.forEach(mesh => {
         const selected = mesh.userData.selectionOverlay || selectedPrimitive === 'all' ||
           mesh.userData.primitiveId === Number(selectedPrimitive);
         const meshOpacity = mesh.userData.batched && selectedPrimitive !== 'all'
@@ -700,6 +703,11 @@
         });
       });
       roots.source.children.forEach(mesh => {
+        mesh.material.opacity = mode === 'error' ? 0.24 : 1;
+        mesh.material.transparent = mode === 'error';
+        mesh.material.depthWrite = mode !== 'error';
+      });
+      roots.phase1.children.forEach(mesh => {
         mesh.material.opacity = mode === 'error' ? 0.24 : 1;
         mesh.material.transparent = mode === 'error';
         mesh.material.depthWrite = mode !== 'error';
@@ -730,19 +738,20 @@
     }
 
     function updateVisibility() {
-      roots.source.visible = mode === 'source' || mode === 'split' || mode === 'error';
-      roots.primitives.visible = mode === 'primitives' || mode === 'overlay';
-      roots.triangulated.visible = mode === 'triangulated' || mode === 'overlay' || mode === 'split' || mode === 'error';
+      roots.source.visible = mode === 'source' || mode === 'split';
+      roots.phase1.visible = mode === 'phase1' || mode === 'error';
+      roots.phase2.visible = mode === 'phase2';
+      roots.phase3.visible = mode === 'phase3';
+      roots.phase4.visible = mode === 'phase4' || mode === 'split' || mode === 'error';
       roots.error.visible = mode === 'error';
-      roots.error.children.forEach(object => {
-        object.visible = object.name !== 'open_error_boundary' ||
-          document.querySelector('#showErrorRegion').checked;
-      });
-      roots.primitives.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
-      roots.triangulated.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
+      roots.phase2.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
+      roots.phase3.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
+      roots.phase4.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
       roots.source.position.set(0, 0, 0);
-      roots.primitives.position.set(0, 0, 0);
-      roots.triangulated.position.set(0, 0, 0);
+      roots.phase1.position.set(0, 0, 0);
+      roots.phase2.position.set(0, 0, 0);
+      roots.phase3.position.set(0, 0, 0);
+      roots.phase4.position.set(0, 0, 0);
       roots.error.position.set(0, 0, 0);
       labels.classList.toggle('visible', mode === 'split');
 
@@ -753,7 +762,7 @@
         const gap = Math.max(size.x, size.y, size.z) * 0.18;
         const shift = 0.5 * (size[axis] + gap);
         roots.source.position[axis] = -shift;
-        roots.triangulated.position[axis] = shift;
+        roots.phase4.position[axis] = shift;
       }
     }
 
@@ -828,7 +837,7 @@
       const containment = s.containment_validation;
       if (containment) statRow('严格包围验证', containment.passed ? '通过' : '失败',
         containment.passed ? 'valid' : 'invalid');
-      const error = s.open_region_error;
+      const error = s.simplification_error || s.open_region_error;
       if (error) {
         statRow('最大误差上限', scalarValue(error.maximum_distance_limit));
         statRow('平均误差', scalarValue(error.mean_distance));
@@ -870,12 +879,19 @@
       const metadataUrl = new URL(
         options.metadata || requestedModel.metadata, manifestUrl);
       const loadedMetadata = await fetchJson(metadataUrl);
-      const [sourceText, primitiveText, triangulatedText, errorData] = await Promise.all([
+      const [sourceText, phase1Text, phase2Text, phase3Text, phase4Text, errorData] = await Promise.all([
         fetchText(new URL(loadedMetadata.source, metadataUrl)),
         fetchText(new URL(
-          loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
+          loadedMetadata.phase1_hole_filled || loadedMetadata.source, metadataUrl)),
         fetchText(new URL(
-          loadedMetadata.triangulated_proxy || loadedMetadata.proxy, metadataUrl)),
+          loadedMetadata.phase2_recognized_surfaces ||
+            loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
+        fetchText(new URL(
+          loadedMetadata.phase3_simplified_surfaces ||
+            loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
+        fetchText(new URL(
+          loadedMetadata.phase4_triangulated ||
+            loadedMetadata.triangulated_proxy || loadedMetadata.proxy, metadataUrl)),
         loadedMetadata.open_error_visualization
           ? fetchJson(new URL(loadedMetadata.open_error_visualization, metadataUrl))
           : Promise.resolve(null),
@@ -885,8 +901,10 @@
       metadata = loadedMetadata;
       Object.values(roots).forEach(disposeRoot);
       addMeshes(roots.source, parseOBJ(sourceText, 'source'));
-      addMeshes(roots.primitives, parseOBJ(primitiveText, 'primitives'));
-      addMeshes(roots.triangulated, parseOBJ(triangulatedText, 'triangulated'));
+      addMeshes(roots.phase1, parseOBJ(phase1Text, 'phase1'));
+      addMeshes(roots.phase2, parseOBJ(phase2Text, 'phase2'));
+      addMeshes(roots.phase3, parseOBJ(phase3Text, 'phase3'));
+      addMeshes(roots.phase4, parseOBJ(phase4Text, 'phase4'));
       addOpenErrorVisualization(errorData);
       modelSelect.value = String(modelId);
       params.set('model', modelId);
@@ -959,7 +977,7 @@
       const proxy = new THREE.Vector3().fromArray(pair.proxy);
       const source = new THREE.Vector3().fromArray(pair.source);
       const center = proxy.clone().add(source).multiplyScalar(0.5);
-      const modelBox = new THREE.Box3().expandByObject(roots.source).expandByObject(roots.triangulated);
+      const modelBox = new THREE.Box3().expandByObject(roots.phase1).expandByObject(roots.phase4);
       const modelScale = Math.max(modelBox.getSize(new THREE.Vector3()).length(), 1e-6);
       const radius = Math.max(proxy.distanceTo(source) * 2.0, modelScale * 0.025);
       const direction = camera.position.clone().sub(controls.target).normalize();
@@ -978,7 +996,6 @@
     maximumErrorInput.addEventListener('keydown', event => {
       if (event.key === 'Enter') regenerateWithMaximumError();
     });
-    document.querySelector('#showErrorRegion').addEventListener('change', updateVisibility);
     document.querySelector('#previousButton').addEventListener('click', () => adjacentModel(-1));
     document.querySelector('#nextButton').addEventListener('click', () => adjacentModel(1));
     modelSelect.addEventListener('change', () => selectModel(Number(modelSelect.value)).catch(showError));
@@ -1010,7 +1027,7 @@
     document.querySelector('#wireframe').addEventListener('change', applyMaterialControls);
 
     renderer.domElement.addEventListener('dblclick', event => {
-      const selectableRoot = roots.primitives.visible ? roots.primitives : roots.triangulated;
+      const selectableRoot = roots.phase3.visible ? roots.phase3 : roots.phase4;
       if (!selectableRoot.visible) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1045,18 +1062,21 @@
       model: currentModel ? Number(currentModel.id) : null,
       mode,
       sourceMeshes: roots.source.children.length,
-      primitiveMeshes: roots.primitives.children.length,
-      triangulatedMeshes: roots.triangulated.children.length,
-      visiblePrimitives: roots.primitives.children.filter(mesh => mesh.visible).reduce(
+      phase1Meshes: roots.phase1.children.length,
+      phase2Meshes: roots.phase2.children.length,
+      primitiveMeshes: roots.phase3.children.length,
+      triangulatedMeshes: roots.phase4.children.length,
+      visiblePrimitives: roots.phase3.children.filter(mesh => mesh.visible).reduce(
         (sum, mesh) => sum + (mesh.userData.batched
           ? Number(metadata?.stats?.primitive_types?.[mesh.userData.primitiveType] || 0) : 1), 0),
       sourceVisible: roots.source.visible,
-      primitivesVisible: roots.primitives.visible,
-      triangulatedVisible: roots.triangulated.visible,
+      primitivesVisible: roots.phase3.visible,
+      triangulatedVisible: roots.phase4.visible,
       errorVisible: roots.error.visible,
       errorBoundaryPoints: openError?.boundary_points?.length || 0,
       maximumErrorDistance: Number(openError?.maximum_pair?.distance || 0),
-      maximumErrorLimit: Number(metadata?.stats?.open_region_error?.maximum_distance_limit),
+      maximumErrorLimit: Number((metadata?.stats?.simplification_error ||
+        metadata?.stats?.open_region_error)?.maximum_distance_limit),
       maximumErrorInput: Number(maximumErrorInput.value),
       regenerateStatus: regenerateStatus.textContent,
       maximumErrorSegmentCount: roots.error.children.filter(
@@ -1072,27 +1092,27 @@
       cameraTarget: controls.target.toArray(),
       drawCalls: renderer.info.render.calls,
       triangles: renderer.info.render.triangles,
-      primitiveOpacity: roots.primitives.children[0]?.material.opacity ?? null,
-      triangulatedOpacity: roots.triangulated.children.find(
+      primitiveOpacity: roots.phase3.children[0]?.material.opacity ?? null,
+      triangulatedOpacity: roots.phase4.children.find(
         mesh => !mesh.userData.selectionOverlay)?.material.opacity ?? null,
-      allBaseMaterialsOpaque: [...roots.primitives.children, ...roots.triangulated.children]
+      allBaseMaterialsOpaque: [...roots.phase3.children, ...roots.phase4.children]
         .filter(mesh => !mesh.userData.selectionOverlay)
         .every(mesh => Math.abs(mesh.material.opacity - 1) < 1e-8),
       primitiveOptionCount: primitiveSelect.options.length - 1,
-      selectionOverlayCount: [...roots.primitives.children, ...roots.triangulated.children]
+      selectionOverlayCount: [...roots.phase3.children, ...roots.phase4.children]
         .filter(mesh => mesh.userData.selectionOverlay).length,
-      selectedBaseMeshCount: [...roots.primitives.children, ...roots.triangulated.children]
+      selectedBaseMeshCount: [...roots.phase3.children, ...roots.phase4.children]
         .filter(mesh => !mesh.userData.selectionOverlay &&
           mesh.userData.primitiveId === Number(selectedPrimitive)).length,
-      selectedBaseMaterialsOpaque: [...roots.primitives.children, ...roots.triangulated.children]
+      selectedBaseMaterialsOpaque: [...roots.phase3.children, ...roots.phase4.children]
         .filter(mesh => !mesh.userData.selectionOverlay &&
           mesh.userData.primitiveId === Number(selectedPrimitive))
         .every(mesh => Math.abs(mesh.material.opacity - 1) < 1e-8),
-      nonSelectedBaseMaterialsFaded: [...roots.primitives.children, ...roots.triangulated.children]
+      nonSelectedBaseMaterialsFaded: [...roots.phase3.children, ...roots.phase4.children]
         .filter(mesh => !mesh.userData.selectionOverlay &&
           mesh.userData.primitiveId !== Number(selectedPrimitive))
         .every(mesh => Math.abs(mesh.material.opacity - 0.15) < 1e-8),
-      primitiveWireframe: roots.primitives.children[0]?.material.wireframe ?? null,
+      primitiveWireframe: roots.phase3.children[0]?.material.wireframe ?? null,
       manifestModelCount: manifest?.models?.length || 0,
       manifestComplete: manifest?.complete ?? null,
       loading: !loading.classList.contains('hidden'),

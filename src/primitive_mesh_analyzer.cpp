@@ -3173,11 +3173,11 @@ double planarPrimitiveArea(const Primitive& primitive)
     return 0.0;
 }
 
-double maximumChargeableOpenSurfaceDistance(
-    const Mesh& source_mesh,
+double maximumFilledSurfaceDistance(
+    const Mesh& filled_surface_mesh,
     const std::vector<OutputPrimitive>& output,
     double sample_spacing,
-    double tolerance);
+    double maximum_distance);
 
 std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
     const Mesh& source_mesh,
@@ -3185,8 +3185,69 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
     const double tolerance,
     const double maximum_open_error_distance,
     const double error_sample_spacing,
-    std::size_t& merged_count)
+    std::size_t& merged_count,
+    const std::filesystem::path& profile_path)
 {
+    const auto merge_started = std::chrono::steady_clock::now();
+    struct MergeProfile
+    {
+        std::size_t input_primitives = 0;
+        std::size_t plane_groups = 0;
+        std::size_t maximum_plane_group_size = 0;
+        std::size_t sweep_pairs_visited = 0;
+        std::size_t adjacency_tests = 0;
+        std::size_t adjacency_passes = 0;
+        std::size_t evaluate_calls = 0;
+        std::size_t evaluation_cache_hits = 0;
+        std::size_t evaluation_cache_misses = 0;
+        std::size_t hull_attempts = 0;
+        std::size_t rectangle_hulls = 0;
+        std::size_t hausdorff_calls = 0;
+        std::size_t recompute_calls = 0;
+        std::size_t recompute_partner_scans = 0;
+        std::size_t accepted_merges = 0;
+        double plane_grouping_seconds = 0.0;
+        double hausdorff_seconds = 0.0;
+    } profile;
+    profile.input_primitives = primitives.size();
+    auto last_profile_flush = merge_started - std::chrono::seconds(2);
+    const auto writeProfile = [&](const bool force = false,
+                                  const bool complete = false)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_profile_flush < std::chrono::seconds(1)) return;
+        last_profile_flush = now;
+        std::ofstream stream(profile_path);
+        stream << std::setprecision(17)
+               << "{\"complete\":" << (complete ? "true" : "false")
+               << ",\"input_primitives\":" << profile.input_primitives
+               << ",\"plane_groups\":" << profile.plane_groups
+               << ",\"maximum_plane_group_size\":"
+               << profile.maximum_plane_group_size
+               << ",\"plane_grouping_seconds\":"
+               << profile.plane_grouping_seconds
+               << ",\"sweep_pairs_visited\":"
+               << profile.sweep_pairs_visited
+               << ",\"adjacency_tests\":" << profile.adjacency_tests
+               << ",\"adjacency_passes\":" << profile.adjacency_passes
+               << ",\"evaluate_calls\":" << profile.evaluate_calls
+               << ",\"evaluation_cache_hits\":"
+               << profile.evaluation_cache_hits
+               << ",\"evaluation_cache_misses\":"
+               << profile.evaluation_cache_misses
+               << ",\"hull_attempts\":" << profile.hull_attempts
+               << ",\"rectangle_hulls\":" << profile.rectangle_hulls
+               << ",\"hausdorff_calls\":" << profile.hausdorff_calls
+               << ",\"hausdorff_seconds\":" << profile.hausdorff_seconds
+               << ",\"recompute_calls\":" << profile.recompute_calls
+               << ",\"recompute_partner_scans\":"
+               << profile.recompute_partner_scans
+               << ",\"accepted_merges\":" << profile.accepted_merges
+               << ",\"total_seconds\":"
+               << std::chrono::duration<double>(now - merge_started).count()
+               << "}\n";
+    };
+    writeProfile();
     merged_count = 0;
     struct Item
     {
@@ -3225,8 +3286,53 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
     for (auto& primitive : primitives)
         items.push_back({std::move(primitive)});
 
-    const auto evaluate = [&](const std::size_t first,
-                               const std::size_t second) -> std::optional<MergeFit>
+    const auto primitiveBounds = [&](const Primitive& primitive)
+    {
+        Bounds bounds;
+        for (const Vec3& corner : planarCorners(primitive))
+        {
+            bounds.lower = bounds.lower.cwiseMin(corner);
+            bounds.upper = bounds.upper.cwiseMax(corner);
+        }
+        return bounds;
+    };
+    std::vector<Bounds> item_bounds(items.size());
+    for (std::size_t index = 0; index < items.size(); ++index)
+        item_bounds[index] = primitiveBounds(items[index].output.primitive);
+    const auto potentiallyAdjacent = [&](const std::size_t first,
+                                         const std::size_t second)
+    {
+        ++profile.adjacency_tests;
+        const Bounds& first_bounds = item_bounds[first];
+        const Bounds& second_bounds = item_bounds[second];
+        Vec3 separation = Vec3::Zero();
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            if (first_bounds.upper[axis] < second_bounds.lower[axis])
+                separation[axis] =
+                    second_bounds.lower[axis] - first_bounds.upper[axis];
+            else if (second_bounds.upper[axis] < first_bounds.lower[axis])
+                separation[axis] =
+                    first_bounds.lower[axis] - second_bounds.upper[axis];
+        }
+        const Vec3 first_extent = first_bounds.upper - first_bounds.lower;
+        const Vec3 second_extent = second_bounds.upper - second_bounds.lower;
+        const double first_scale = std::max(
+            {first_extent.x(), first_extent.y(), first_extent.z()});
+        const double second_scale = std::max(
+            {second_extent.x(), second_extent.y(), second_extent.z()});
+        const double local_adjacency_distance = std::max(
+            tolerance * 8.0,
+            0.25 * std::max(std::min(first_scale, second_scale), tolerance));
+        const bool adjacent = separation.norm() <= std::min(
+            2.0 * maximum_open_error_distance + tolerance,
+            local_adjacency_distance);
+        if (adjacent) ++profile.adjacency_passes;
+        return adjacent;
+    };
+
+    const auto evaluateUncached = [&](const std::size_t first,
+                                       const std::size_t second) -> std::optional<MergeFit>
     {
         if (first == second || !items[first].active || !items[second].active)
             return std::nullopt;
@@ -3257,6 +3363,9 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
         const Vec3 origin = planarPoint(first_primitive);
         if (std::abs((planarPoint(second_primitive) - origin).dot(normal)) > tolerance)
             return std::nullopt;
+
+        if (!potentiallyAdjacent(first, second))
+            return std::nullopt;
         const Mat3 basis = orthonormalFrame(normal);
         Mat3 frame;
         frame.col(0) = basis.col(1);
@@ -3269,6 +3378,7 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
                 const Vec3 local = frame.transposeMultiply(corner - origin);
                 points.emplace_back(local.x(), local.y());
             }
+        ++profile.hull_attempts;
         auto hull = simplifyPolygon(convexHull(std::move(points), tolerance), tolerance);
         // This pass deliberately performs only 2-to-1 rectangle merges.
         // General n-gon replacement belongs in the region classifier.
@@ -3279,6 +3389,7 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
             std::abs(first_edge.dot(second_edge)) >
                 1.0e-8 * first_edge.norm() * second_edge.norm())
             return std::nullopt;
+        ++profile.rectangle_hulls;
         Primitive rectangle;
         rectangle.kind = Kind::Rectangle;
         rectangle.axes.col(0) = frame.col(0) * (first_edge.x() / first_edge.norm()) +
@@ -3297,62 +3408,95 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
             merged.source_faces.end(),
             items[second].output.source_faces.begin(),
             items[second].output.source_faces.end());
-        const double maximum_distance = maximumChargeableOpenSurfaceDistance(
-            source_mesh, {merged}, error_sample_spacing, tolerance);
+        const auto hausdorff_started = std::chrono::steady_clock::now();
+        ++profile.hausdorff_calls;
+        const double maximum_distance = maximumFilledSurfaceDistance(
+            source_mesh, {merged}, error_sample_spacing,
+            maximum_open_error_distance + tolerance);
+        profile.hausdorff_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - hausdorff_started).count();
         if (maximum_distance > maximum_open_error_distance + tolerance)
             return std::nullopt;
         return MergeFit{maximum_distance, std::move(rectangle)};
     };
-
-    // Coplanar planes are independent merge domains.  Build those domains with
-    // a linear-memory disjoint set, then allocate a candidate heap for only one
-    // plane at a time.  This preserves the exact pairwise acceptance/order
-    // within every plane while avoiding a global O(n^2) resident candidate set.
-    std::vector<std::size_t> parent(items.size());
-    std::iota(parent.begin(), parent.end(), 0);
-    const auto rootOf = [&](std::size_t index)
+    struct CachedEvaluation
     {
-        std::size_t root = index;
-        while (parent[root] != root) root = parent[root];
-        while (parent[index] != index)
-        {
-            const std::size_t next = parent[index];
-            parent[index] = root;
-            index = next;
-        }
-        return root;
+        std::uint64_t first_version = 0;
+        std::uint64_t second_version = 0;
+        std::optional<MergeFit> fit;
     };
-    std::vector<Vec3> plane_normals(items.size(), Vec3::Zero());
-    std::vector<Vec3> plane_points(items.size(), Vec3::Zero());
-    for (std::size_t index = 0; index < items.size(); ++index)
+    std::unordered_map<std::uint64_t, CachedEvaluation> evaluation_cache;
+    evaluation_cache.reserve(items.size() * 2);
+    const auto evaluate = [&](std::size_t first,
+                              std::size_t second) -> std::optional<MergeFit>
     {
-        (void)planarNormal(items[index].output.primitive, tolerance,
-                           plane_normals[index]);
-        plane_points[index] = planarPoint(items[index].output.primitive);
-    }
-    for (std::size_t first = 0; first < items.size(); ++first)
-    {
-        if (plane_normals[first].norm() == 0.0) continue;
-        for (std::size_t second = first + 1; second < items.size(); ++second)
+        ++profile.evaluate_calls;
+        writeProfile();
+        if (first > second) std::swap(first, second);
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(first) << 32U) |
+            static_cast<std::uint64_t>(second);
+        const auto found = evaluation_cache.find(key);
+        if (found != evaluation_cache.end() &&
+            found->second.first_version == items[first].version &&
+            found->second.second_version == items[second].version)
         {
-            if (plane_normals[second].norm() == 0.0 ||
-                std::abs(plane_normals[first].dot(plane_normals[second])) <
-                    1.0 - 1.0e-8 ||
-                std::abs((plane_points[second] - plane_points[first]).dot(
-                    plane_normals[first])) > tolerance)
-                continue;
-            const std::size_t first_root = rootOf(first);
-            const std::size_t second_root = rootOf(second);
-            if (first_root != second_root) parent[second_root] = first_root;
+            ++profile.evaluation_cache_hits;
+            return found->second.fit;
         }
-    }
-    std::map<std::size_t, std::vector<std::size_t>> plane_groups;
-    for (std::size_t index = 0; index < items.size(); ++index)
-        plane_groups[rootOf(index)].push_back(index);
+        ++profile.evaluation_cache_misses;
+        auto fit = evaluateUncached(first, second);
+        evaluation_cache[key] = {
+            items[first].version, items[second].version, fit};
+        return fit;
+    };
 
-    for (const auto& [root, group] : plane_groups)
+    // Coplanar planes are independent merge domains. Quantized analytic plane
+    // keys replace the former all-pairs disjoint-set construction; splitting a
+    // numerically borderline plane is safe, while quadratic grouping is not.
+    using PlaneKey = std::array<std::int64_t, 4>;
+    const auto grouping_started = std::chrono::steady_clock::now();
+    std::map<PlaneKey, std::vector<std::size_t>> plane_groups;
+    constexpr double normal_quantization = 1.0e8;
+    const double distance_quantization = 1.0 /
+        std::max(tolerance * 2.0, 1.0e-12);
+    for (std::size_t index = 0; index < items.size(); ++index)
     {
-        (void)root;
+        Vec3 normal;
+        if (!planarNormal(items[index].output.primitive, tolerance, normal))
+            continue;
+        int dominant = 0;
+        for (int axis = 1; axis < 3; ++axis)
+            if (std::abs(normal[axis]) > std::abs(normal[dominant]))
+                dominant = axis;
+        if (normal[dominant] < 0.0) normal *= -1.0;
+        const double distance = normal.dot(
+            planarPoint(items[index].output.primitive));
+        const PlaneKey key{{
+            static_cast<std::int64_t>(std::llround(
+                normal.x() * normal_quantization)),
+            static_cast<std::int64_t>(std::llround(
+                normal.y() * normal_quantization)),
+            static_cast<std::int64_t>(std::llround(
+                normal.z() * normal_quantization)),
+            static_cast<std::int64_t>(std::llround(
+                distance * distance_quantization))}};
+        plane_groups[key].push_back(index);
+    }
+    profile.plane_groups = plane_groups.size();
+    for (const auto& [key, group] : plane_groups)
+    {
+        (void)key;
+        profile.maximum_plane_group_size = std::max(
+            profile.maximum_plane_group_size, group.size());
+    }
+    profile.plane_grouping_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - grouping_started).count();
+    writeProfile(true);
+
+    for (auto& [plane_key, group] : plane_groups)
+    {
+        (void)plane_key;
         if (group.size() < 2) continue;
         std::priority_queue<MergeCandidate, std::vector<MergeCandidate>,
                             MergeCandidateGreater> candidates;
@@ -3396,27 +3540,68 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
                              items[first].version, items[second].version,
                              owner, best_generation[owner]});
         };
+        int sweep_axis = 0;
+        Vec3 center_lower = Vec3::Constant(
+            std::numeric_limits<double>::infinity());
+        Vec3 center_upper = Vec3::Constant(
+            -std::numeric_limits<double>::infinity());
+        for (const std::size_t id : group)
+        {
+            const Vec3 center =
+                (item_bounds[id].lower + item_bounds[id].upper) * 0.5;
+            center_lower = center_lower.cwiseMin(center);
+            center_upper = center_upper.cwiseMax(center);
+        }
+        for (int axis = 1; axis < 3; ++axis)
+            if (center_upper[axis] - center_lower[axis] >
+                center_upper[sweep_axis] - center_lower[sweep_axis])
+                sweep_axis = axis;
+        std::sort(group.begin(), group.end(), [&](const auto first,
+                                                  const auto second)
+        {
+            return item_bounds[first].lower[sweep_axis] <
+                   item_bounds[second].lower[sweep_axis];
+        });
         for (std::size_t first = 0; first < group.size(); ++first)
-            for (std::size_t second = first + 1; second < group.size(); ++second)
+        {
+            const std::size_t first_id = group[first];
+            const Vec3 first_extent = item_bounds[first_id].upper -
+                                      item_bounds[first_id].lower;
+            const double first_scale = std::max(
+                {first_extent.x(), first_extent.y(), first_extent.z()});
+            const double sweep_gap = std::min(
+                2.0 * maximum_open_error_distance + tolerance,
+                std::max(tolerance * 8.0,
+                         0.25 * std::max(first_scale, tolerance)));
+            for (std::size_t second = first + 1;
+                 second < group.size(); ++second)
             {
-                const std::size_t first_id = group[first];
+                ++profile.sweep_pairs_visited;
                 const std::size_t second_id = group[second];
+                if (item_bounds[second_id].lower[sweep_axis] >
+                    item_bounds[first_id].upper[sweep_axis] + sweep_gap)
+                    break;
+                if (!potentiallyAdjacent(first_id, second_id)) continue;
                 const auto fit = evaluate(first_id, second_id);
                 if (!fit) continue;
                 (void)consider(first_id, second_id, *fit);
                 (void)consider(second_id, first_id, *fit);
             }
+        }
         for (const std::size_t owner : group) pushCurrent(owner);
 
         const auto recompute = [&](const std::size_t owner)
         {
+            ++profile.recompute_calls;
             best_partner[owner] = no_partner;
             best_excess[owner] = std::numeric_limits<double>::infinity();
             ++best_generation[owner];
             if (!items[owner].active) return;
             for (const std::size_t partner : group)
             {
+                ++profile.recompute_partner_scans;
                 if (partner == owner || !items[partner].active) continue;
+                if (!potentiallyAdjacent(owner, partner)) continue;
                 const auto [first, second] = canonicalPair(owner, partner);
                 const auto fit = evaluate(first, second);
                 if (fit) (void)consider(owner, partner, *fit);
@@ -3454,10 +3639,13 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
             replacement.enclosure_group =
                 items[candidate.first].output.enclosure_group;
             items[candidate.first].output = std::move(replacement);
+            item_bounds[candidate.first] = primitiveBounds(
+                items[candidate.first].output.primitive);
             ++items[candidate.first].version;
             items[candidate.second].active = false;
             ++items[candidate.second].version;
             ++merged_count;
+            ++profile.accepted_merges;
             ++best_generation[candidate.second];
             best_partner[candidate.second] = no_partner;
             std::size_t active_count = 0;
@@ -3472,6 +3660,7 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
                     recompute(other);
                     continue;
                 }
+                if (!potentiallyAdjacent(other, candidate.first)) continue;
                 const auto [first, second] = canonicalPair(other, candidate.first);
                 const auto new_fit = evaluate(first, second);
                 if (new_fit && consider(other, candidate.first, *new_fit))
@@ -3493,6 +3682,7 @@ std::vector<OutputPrimitive> mergeLocalCoplanarPrimitives(
     result.reserve(items.size() - merged_count);
     for (auto& item : items)
         if (item.active) result.push_back(std::move(item.output));
+    writeProfile(true, true);
     return result;
 }
 
@@ -5811,6 +6001,87 @@ struct SourceOpenSurfaceReference
     std::vector<std::uint8_t> open_faces;
 };
 
+FinalOpenErrorAudit measureFilledSurfaceDistance(
+    const SourceTriangleBvh& filled_surface,
+    const PrimitiveMesh& proxy,
+    const double sample_spacing,
+    const double early_exit_distance = std::numeric_limits<double>::infinity())
+{
+    FinalOpenErrorAudit audit;
+    double weighted_distance = 0.0;
+    double total_weight = 0.0;
+    bool exceeded = false;
+    for (const Face& face : proxy.faces)
+    {
+        const Vec3& first = proxy.vertices[face[0]];
+        const Vec3& second = proxy.vertices[face[1]];
+        const Vec3& third = proxy.vertices[face[2]];
+        const double area = 0.5 * (second - first).cross(third - first).norm();
+        if (area <= 1.0e-30) continue;
+        const double maximum_edge = std::max({
+            (second - first).norm(), (third - second).norm(),
+            (first - third).norm()});
+        const int subdivisions = std::clamp(
+            static_cast<int>(std::ceil(maximum_edge /
+                std::max(sample_spacing, 1.0e-30))), 1, 128);
+        const double sample_weight = area /
+            static_cast<double>(subdivisions * subdivisions);
+        const auto sample = [&](const double second_weight,
+                                const double third_weight,
+                                const double area_weight)
+        {
+            const Vec3 proxy_point = first + (second - first) * second_weight +
+                (third - first) * third_weight;
+            const auto closest = filled_surface.closestPoint(proxy_point);
+            const double distance = (closest.point - proxy_point).norm();
+            weighted_distance += distance * area_weight;
+            total_weight += area_weight;
+            ++audit.distance_sample_count;
+            if (distance > audit.maximum_distance)
+            {
+                audit.maximum_distance = distance;
+                audit.maximum_proxy_point = proxy_point;
+                audit.maximum_source_point = closest.point;
+            }
+            exceeded = distance > early_exit_distance;
+        };
+
+        sample(0.0, 0.0, 0.0);
+        if (exceeded) break;
+        sample(1.0, 0.0, 0.0);
+        if (exceeded) break;
+        sample(0.0, 1.0, 0.0);
+        if (exceeded) break;
+        for (int step = 1; step < subdivisions && !exceeded; ++step)
+        {
+            const double weight = static_cast<double>(step) / subdivisions;
+            sample(weight, 0.0, 0.0);
+            if (exceeded) break;
+            sample(0.0, weight, 0.0);
+            if (exceeded) break;
+            sample(1.0 - weight, weight, 0.0);
+        }
+        for (int row = 0; row < subdivisions && !exceeded; ++row)
+            for (int column = 0; column < subdivisions - row && !exceeded;
+                 ++column)
+            {
+                sample((static_cast<double>(row) + 1.0 / 3.0) / subdivisions,
+                       (static_cast<double>(column) + 1.0 / 3.0) / subdivisions,
+                       sample_weight);
+                if (exceeded) break;
+                if (row + column + 1 < subdivisions)
+                    sample((static_cast<double>(row) + 2.0 / 3.0) / subdivisions,
+                           (static_cast<double>(column) + 2.0 / 3.0) / subdivisions,
+                           sample_weight);
+            }
+        if (exceeded) break;
+    }
+    if (total_weight > 0.0)
+        audit.mean_distance = weighted_distance / total_weight;
+    audit.distance_area_integral = weighted_distance;
+    return audit;
+}
+
 FinalOpenErrorAudit measureOpenSurfaceDistance(
     const SourceOpenSurfaceReference& source,
     const PrimitiveMesh& proxy,
@@ -6009,24 +6280,36 @@ FinalOpenErrorAudit measureChargeableOpenSurfaceDistance(
         exclusions.empty() ? nullptr : &exclusions);
 }
 
-double maximumChargeableOpenSurfaceDistance(
-    const Mesh& source_mesh,
+double maximumFilledSurfaceDistance(
+    const Mesh& filled_surface_mesh,
     const std::vector<OutputPrimitive>& output,
     const double sample_spacing,
-    const double tolerance)
+    const double maximum_distance)
 {
-    Vec3 lower = Vec3::Constant(std::numeric_limits<double>::infinity());
-    Vec3 upper = Vec3::Constant(-std::numeric_limits<double>::infinity());
-    for (const Vec3& vertex : source_mesh.vertices)
+    struct CachedReference
     {
-        lower = lower.cwiseMin(vertex);
-        upper = upper.cwiseMax(vertex);
+        const Vec3* vertices = nullptr;
+        const Face* faces = nullptr;
+        std::size_t vertex_count = 0;
+        std::size_t face_count = 0;
+        std::unique_ptr<SourceTriangleBvh> reference;
+    };
+    static thread_local CachedReference cache;
+    if (cache.vertices != filled_surface_mesh.vertices.data() ||
+        cache.faces != filled_surface_mesh.faces.data() ||
+        cache.vertex_count != filled_surface_mesh.vertices.size() ||
+        cache.face_count != filled_surface_mesh.faces.size())
+    {
+        cache.vertices = filled_surface_mesh.vertices.data();
+        cache.faces = filled_surface_mesh.faces.data();
+        cache.vertex_count = filled_surface_mesh.vertices.size();
+        cache.face_count = filled_surface_mesh.faces.size();
+        cache.reference = std::make_unique<SourceTriangleBvh>(
+            filled_surface_mesh);
     }
-    const SourceOpenSurfaceReference source(
-        source_mesh, (upper - lower).norm());
-    return measureChargeableOpenSurfaceDistance(
-        source, source_mesh, output, sample_spacing, tolerance)
-        .maximum_distance;
+    return measureFilledSurfaceDistance(
+        *cache.reference, triangulateOutputPrimitives(output),
+        sample_spacing, maximum_distance).maximum_distance;
 }
 
 void writeOpenErrorVisualization(
@@ -9923,10 +10206,11 @@ void writeMetadata(const std::filesystem::path& directory,
           << stats.coverage_unassigned_source_faces
           << ",\"failed_source_triangles\":"
           << stats.coverage_failed_source_faces << '}'
-           << ",\"open_region_error\":{\"distance_method\":"
-              "\"sampled_closest_source_open_surface_directed_distance\""
+           << ",\"simplification_error\":{\"distance_method\":"
+              "\"sampled_directed_phase3_to_phase1_surface_distance\""
            << ",\"sampling_method\":"
               "\"deterministic_area_surface_with_vertices_and_edges\""
+           << ",\"reference\":\"phase1_hole_filled.obj\""
            << ",\"maximum_is_sample_estimate\":true"
            << ",\"maximum_distance_limit\":"
           << stats.maximum_open_error_distance_limit
@@ -9969,6 +10253,10 @@ void writeMetadata(const std::filesystem::path& directory,
           << (options.uniform_structure_policy ? "true" : "false")
           << ",\"timings_seconds\":{\"total\":"
           << stats.analysis_seconds << "}},\"source\":\"source.obj\""
+          << ",\"phase1_hole_filled\":\"phase1_hole_filled.obj\""
+          << ",\"phase2_recognized_surfaces\":\"phase2_recognized_surfaces.obj\""
+          << ",\"phase3_simplified_surfaces\":\"primitives.obj\""
+          << ",\"phase4_triangulated\":\"proxy.obj\""
           << ",\"regions\":\"regions.obj\""
           << ",\"primitive_analysis\":\"primitives.obj\""
           << ",\"triangulated_proxy\":\"proxy.obj\""
@@ -10218,12 +10506,62 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     }
     markStage("region_classification");
 
-    output = mergeLocalCoplanarPrimitives(
-        mesh, std::move(output),
-        std::max(diagonal * 1.0e-9, 1.0e-10),
-        maximum_open_error_distance,
-        std::max(diagonal / 192.0, 1.0e-30),
-        stats.merged_local_planar_primitives);
+    // Phase 1 reference: make every accepted hole/cavity decision explicit.
+    // Large cavities are restored here, while accepted fills keep their cap and
+    // omit the now-occluded inner wall. Later simplification error is measured
+    // against this surface, so filling a hole itself is intentionally free.
+    std::vector<OutputPrimitive> restored_cavity_output;
+    if (!structural_cleanup.restored_cavity_faces.empty())
+    {
+        std::vector<bool> cavity_mask(mesh.faces.size(), false);
+        for (const auto face : structural_cleanup.restored_cavity_faces)
+            cavity_mask[face] = true;
+        std::vector<std::unordered_set<std::uint32_t>> cavity_adjacency;
+        const auto cavity_clusters = coplanarClusters(
+            mesh, diagonal * effective_options.coplanar_relative_tolerance,
+            cavity_adjacency, &cavity_mask);
+        for (const auto& cluster : cavity_clusters)
+        {
+            auto classified = classifyFinalRegion(
+                mesh, cluster, effective_options, threshold,
+                model_surface_area,
+                stats.filled_planar_holes, stats.filled_boundary_voids,
+                stats.filled_boundary_void_area);
+            for (OutputPrimitive& item : classified)
+                item.preserves_cavity_opening = true;
+            restored_cavity_output.insert(restored_cavity_output.end(),
+                std::make_move_iterator(classified.begin()),
+                std::make_move_iterator(classified.end()));
+        }
+        CoplanarCanonicalizationStats cavity_coplanar_stats;
+        restored_cavity_output = canonicalizeCoplanarPrimitiveUnion(
+            mesh, std::move(restored_cavity_output),
+            std::max(diagonal * 1.0e-9, 1.0e-10), cavity_coplanar_stats);
+        promoteToSemanticPrimitives(restored_cavity_output);
+    }
+    const auto withRestoredCavities = [&](std::vector<OutputPrimitive> stage)
+    {
+        stage.insert(stage.end(), restored_cavity_output.begin(),
+                     restored_cavity_output.end());
+        stage = reopenRestoredCavityVolumes(
+            mesh, std::move(stage), structural_cleanup,
+            effective_options.maximum_cavity_added_volume_ratio, model_volume,
+            std::max(diagonal * 1.0e-9, 1.0e-10));
+        CoplanarCanonicalizationStats stage_coplanar_stats;
+        stage = canonicalizeCoplanarPrimitiveUnion(
+            mesh, std::move(stage), std::max(diagonal * 1.0e-9, 1.0e-10),
+            stage_coplanar_stats);
+        return stage;
+    };
+    std::vector<OutputPrimitive> phase1_hole_filled =
+        withRestoredCavities(output);
+    const PrimitiveMesh phase1_triangulated =
+        triangulateOutputPrimitives(phase1_hole_filled);
+    Mesh filled_surface_mesh;
+    filled_surface_mesh.vertices = phase1_triangulated.vertices;
+    filled_surface_mesh.faces = phase1_triangulated.faces;
+    markStage("phase1_hole_filled_reference");
+
     CoplanarCanonicalizationStats coplanar_stats;
     output = canonicalizeCoplanarPrimitiveUnion(
         mesh, std::move(output), std::max(diagonal * 1.0e-9, 1.0e-10),
@@ -10231,7 +10569,28 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     stats.canonicalized_coplanar_groups = coplanar_stats.groups;
     stats.removed_coplanar_redundant_primitives = coplanar_stats.removed_primitives;
     stats.removed_coplanar_overlap_area = coplanar_stats.removed_overlap_area;
-    markStage("initial_coplanar_processing");
+    std::vector<OutputPrimitive> phase2_recognized_surfaces =
+        withRestoredCavities(output);
+    promoteToSemanticPrimitives(phase2_recognized_surfaces);
+    markStage("exact_surface_union");
+
+    output = mergeLocalCoplanarPrimitives(
+        filled_surface_mesh, std::move(output),
+        std::max(diagonal * 1.0e-9, 1.0e-10),
+        maximum_open_error_distance,
+        std::max(diagonal / 192.0, 1.0e-30),
+        stats.merged_local_planar_primitives,
+        output_directory / "surface_merge_profile.json");
+    CoplanarCanonicalizationStats post_merge_coplanar_stats;
+    output = canonicalizeCoplanarPrimitiveUnion(
+        mesh, std::move(output), std::max(diagonal * 1.0e-9, 1.0e-10),
+        post_merge_coplanar_stats);
+    stats.canonicalized_coplanar_groups += post_merge_coplanar_stats.groups;
+    stats.removed_coplanar_redundant_primitives +=
+        post_merge_coplanar_stats.removed_primitives;
+    stats.removed_coplanar_overlap_area +=
+        post_merge_coplanar_stats.removed_overlap_area;
+    markStage("hausdorff_surface_merging");
 
     const std::vector<std::uint32_t>& excluded_faces = structural_cleanup.excluded_faces;
     // Closed-box recognition is bookkeeping only. Its six rectangles remain the
@@ -10275,43 +10634,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         export_coplanar_stats.removed_overlap_area;
     markStage("export_canonicalization");
 
-    if (!structural_cleanup.restored_cavity_faces.empty())
-    {
-        // Restore only the interior surfaces of over-budget cavities.  They do
-        // not participate in exterior box/protrusion merging, shallow-shell
-        // coalescing, or silhouette synchronization.  The exterior pass above
-        // therefore keeps a stable partition independent of whether a candidate
-        // cavity is ultimately accepted or restored.
-        std::vector<bool> cavity_mask(mesh.faces.size(), false);
-        for (const auto face : structural_cleanup.restored_cavity_faces)
-            cavity_mask[face] = true;
-        std::vector<std::unordered_set<std::uint32_t>> cavity_adjacency;
-        const auto cavity_clusters = coplanarClusters(
-            mesh, diagonal * effective_options.coplanar_relative_tolerance,
-            cavity_adjacency, &cavity_mask);
-        std::vector<OutputPrimitive> cavity_output;
-        for (const auto& cluster : cavity_clusters)
-        {
-            auto classified = classifyFinalRegion(
-                mesh, cluster, effective_options, threshold,
-                model_surface_area,
-                stats.filled_planar_holes, stats.filled_boundary_voids,
-                stats.filled_boundary_void_area);
-            for (OutputPrimitive& item : classified)
-                item.preserves_cavity_opening = true;
-            cavity_output.insert(cavity_output.end(),
-                std::make_move_iterator(classified.begin()),
-                std::make_move_iterator(classified.end()));
-        }
-        CoplanarCanonicalizationStats cavity_coplanar_stats;
-        cavity_output = canonicalizeCoplanarPrimitiveUnion(
-            mesh, std::move(cavity_output),
-            std::max(diagonal * 1.0e-9, 1.0e-10), cavity_coplanar_stats);
-        promoteToSemanticPrimitives(cavity_output);
-        output.insert(output.end(),
-            std::make_move_iterator(cavity_output.begin()),
-            std::make_move_iterator(cavity_output.end()));
-    }
+    output.insert(output.end(), restored_cavity_output.begin(),
+                  restored_cavity_output.end());
     output = reopenRestoredCavityVolumes(
         mesh, std::move(output), structural_cleanup,
         effective_options.maximum_cavity_added_volume_ratio, model_volume,
@@ -10372,10 +10696,13 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             "staged surface pipeline failed conservative coverage audit");
     }
 
-    const SourceOpenSurfaceReference open_surface_reference(mesh, diagonal);
-    const FinalOpenErrorAudit open_error = measureChargeableOpenSurfaceDistance(
-        open_surface_reference, mesh, output,
-        std::max(diagonal / 192.0, 1.0e-30), final_tolerance, &output);
+    const auto error_audit_started = std::chrono::steady_clock::now();
+    const SourceTriangleBvh filled_surface_reference(filled_surface_mesh);
+    const FinalOpenErrorAudit open_error = measureFilledSurfaceDistance(
+        filled_surface_reference, triangulateOutputPrimitives(output),
+        std::max(diagonal / 192.0, 1.0e-30));
+    stats.open_error_audit_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - error_audit_started).count();
     stats.open_error_distance_sample_count = open_error.distance_sample_count;
     stats.open_mean_distance = open_error.mean_distance;
     stats.open_max_distance = open_error.maximum_distance;
@@ -10399,6 +10726,11 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     }
     std::filesystem::create_directories(output_directory);
     writeSourceObj(output_directory / "source.obj", mesh);
+    (void)writeTriangulatedObj(
+        output_directory / "phase1_hole_filled.obj", phase1_hole_filled);
+    writeSemanticPrimitiveObj(
+        output_directory / "phase2_recognized_surfaces.obj",
+        phase2_recognized_surfaces);
     writeRegionsObj(
         output_directory / "regions.obj", mesh, output, excluded_faces);
     stats.primitive_count = output.size();

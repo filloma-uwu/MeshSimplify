@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -20,6 +21,13 @@ void writeText(const std::filesystem::path& path, const std::string& text)
 void require(const bool condition, const char* message)
 {
     if (!condition) throw std::runtime_error(message);
+}
+
+std::string readText(const std::filesystem::path& path)
+{
+    std::ifstream stream(path);
+    return {std::istreambuf_iterator<char>(stream),
+            std::istreambuf_iterator<char>()};
 }
 
 } // namespace
@@ -51,7 +59,22 @@ int main()
                     box_stats.proxy_triangles == 12,
                 "box must become six polygon surfaces and twelve triangles");
         require(box_stats.open_max_distance <= 1.0e-9,
-                "exact box must have zero directed open-surface error");
+                "exact box must have zero phase3-to-phase1 surface error");
+        for (const char* file : {
+                 "phase1_hole_filled.obj",
+                 "phase2_recognized_surfaces.obj",
+                 "primitives.obj",
+                 "proxy.obj"})
+            require(std::filesystem::is_regular_file(root / "box" / file),
+                    "every pipeline phase must have a viewer asset");
+        const std::string box_metadata = readText(root / "box" / "model.json");
+        require(box_metadata.find(
+                    "sampled_directed_phase3_to_phase1_surface_distance") !=
+                    std::string::npos &&
+                box_metadata.find(
+                    "\"reference\":\"phase1_hole_filled.obj\"") !=
+                    std::string::npos,
+                "metadata must state that simplification error uses phase 1");
 
         // Three disconnected coplanar rectangles need two accepted merges.
         // The filled gaps are 0.1 wide, so the directed maximum is 0.05.

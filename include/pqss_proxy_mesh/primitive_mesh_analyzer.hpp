@@ -115,7 +115,8 @@ struct PrimitiveMeshAnalysisStats
     std::size_t coverage_failed_source_faces = 0;
     double coverage_audit_seconds = 0.0;
     // Final, model-independent validation of the exported proxy. Distance is
-    // one-sided from proxy to source and excludes certified planar hole fills.
+    // one-sided from the simplified proxy to the phase-1 hole-filled surface;
+    // hole filling itself is therefore outside the simplification error.
     bool containment_validation_passed = false;
     std::size_t open_error_distance_sample_count = 0;
     double open_mean_distance = 0.0;
