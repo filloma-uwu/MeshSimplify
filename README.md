@@ -157,7 +157,7 @@ primitives with the standalone viewer:
 
 ```powershell
 python tools/serve_primitive_viewer.py `
-  --manifest outputs/surface_primitives_v190_uniform_final/viewer_manifest.json `
+  --manifest outputs/spatial_group_gap_validation/viewer_manifest.json `
   --port 8091
 ```
 

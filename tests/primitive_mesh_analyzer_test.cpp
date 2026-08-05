@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -28,6 +29,34 @@ std::string readText(const std::filesystem::path& path)
     std::ifstream stream(path);
     return {std::istreambuf_iterator<char>(stream),
             std::istreambuf_iterator<char>()};
+}
+
+void appendBoxObj(std::ostringstream& obj, std::size_t& next_vertex,
+                  const double x0, const double y0, const double z0,
+                  const double x1, const double y1, const double z1)
+{
+    const std::size_t base = next_vertex;
+    obj << "v " << x0 << ' ' << y0 << ' ' << z0 << '\n'
+        << "v " << x1 << ' ' << y0 << ' ' << z0 << '\n'
+        << "v " << x1 << ' ' << y1 << ' ' << z0 << '\n'
+        << "v " << x0 << ' ' << y1 << ' ' << z0 << '\n'
+        << "v " << x0 << ' ' << y0 << ' ' << z1 << '\n'
+        << "v " << x1 << ' ' << y0 << ' ' << z1 << '\n'
+        << "v " << x1 << ' ' << y1 << ' ' << z1 << '\n'
+        << "v " << x0 << ' ' << y1 << ' ' << z1 << '\n';
+    const auto face = [&](const std::size_t a, const std::size_t b,
+                          const std::size_t c)
+    {
+        obj << "f " << base + a << ' ' << base + b << ' ' << base + c
+            << '\n';
+    };
+    face(0, 1, 2); face(0, 2, 3);
+    face(4, 6, 5); face(4, 7, 6);
+    face(0, 4, 5); face(0, 5, 1);
+    face(1, 5, 6); face(1, 6, 2);
+    face(2, 6, 7); face(2, 7, 3);
+    face(3, 7, 4); face(3, 4, 0);
+    next_vertex += 8;
 }
 
 } // namespace
@@ -107,6 +136,70 @@ int main()
                     strict_stats.proxy_triangles == 6 &&
                     strict_stats.merged_local_planar_primitives == 0,
                 "a merge beyond the directed Hausdorff limit must be rejected");
+
+        // A spatial group is not restricted to coplanar surfaces. A loose
+        // directed-distance limit may replace this non-convex L assembly by
+        // one conservative six-face box; an exact limit must reject it.
+        const auto spatial_group = root / "spatial_group.obj";
+        writeText(spatial_group,
+            "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 1 1 0\nv 1 3 0\nv 0 3 0\n"
+            "v 0 0 1\nv 2 0 1\nv 2 1 1\nv 1 1 1\nv 1 3 1\nv 0 3 1\n"
+            "f 1 3 2\nf 1 4 3\nf 1 5 4\nf 1 6 5\n"
+            "f 7 8 9\nf 7 9 10\nf 7 10 11\nf 7 11 12\n"
+            "f 1 2 8\nf 1 8 7\nf 2 3 9\nf 2 9 8\n"
+            "f 3 4 10\nf 3 10 9\nf 4 5 11\nf 4 11 10\n"
+            "f 5 6 12\nf 5 12 11\nf 6 1 7\nf 6 7 12\n");
+
+        auto group_loose = exact;
+        group_loose.maximum_cavity_added_volume_ratio = 0.0;
+        group_loose.maximum_open_error_distance = 10.0;
+        const auto group_loose_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                spatial_group, root / "spatial_group_loose", group_loose);
+        require(group_loose_stats.containment_validation_passed &&
+                    group_loose_stats.primitive_count == 6 &&
+                    group_loose_stats.proxy_triangles == 12 &&
+                    group_loose_stats.merged_spatial_primitive_groups > 0,
+                "loose error must permit a noncoplanar spatial group box");
+
+        auto group_strict = group_loose;
+        group_strict.maximum_open_error_distance = 0.0;
+        const auto group_strict_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                spatial_group, root / "spatial_group_strict", group_strict);
+        require(group_strict_stats.merged_spatial_primitive_groups == 0 &&
+                    group_strict_stats.primitive_count > 6,
+                "exact error must reject the noncoplanar spatial group box");
+
+        // Three equal closed components contain two independent narrow gaps.
+        // Each gap is assessed against the model volume on its own.
+        const auto narrow_gaps = root / "narrow_component_gaps.obj";
+        std::ostringstream narrow_gap_obj;
+        std::size_t next_vertex = 1;
+        appendBoxObj(narrow_gap_obj, next_vertex, 0.0, 0, 0, 1.0, 1, 1);
+        appendBoxObj(narrow_gap_obj, next_vertex, 1.1, 0, 0, 2.1, 1, 1);
+        appendBoxObj(narrow_gap_obj, next_vertex, 2.2, 0, 0, 3.2, 1, 1);
+        writeText(narrow_gaps, narrow_gap_obj.str());
+        auto gap_fill = exact;
+        gap_fill.maximum_open_error_distance = 0.0;
+        gap_fill.maximum_cavity_added_volume_ratio = 0.04;
+        const auto gap_fill_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
+            narrow_gaps, root / "narrow_component_gaps", gap_fill);
+        require(gap_fill_stats.filled_intercomponent_gaps == 2,
+                "two narrow component gaps must be filled independently");
+
+        // A large empty region is not a narrow gap and must survive the same
+        // per-gap budget.
+        const auto large_gap = root / "large_component_gap.obj";
+        std::ostringstream large_gap_obj;
+        next_vertex = 1;
+        appendBoxObj(large_gap_obj, next_vertex, 0, 0, 0, 1, 1, 1);
+        appendBoxObj(large_gap_obj, next_vertex, 3, 0, 0, 4, 1, 1);
+        writeText(large_gap, large_gap_obj.str());
+        const auto large_gap_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
+            large_gap, root / "large_component_gap", gap_fill);
+        require(large_gap_stats.filled_intercomponent_gaps == 0,
+                "a component gap beyond the per-gap budget must be preserved");
 
         std::cout << "primitive mesh staged-pipeline tests passed\n";
         return 0;

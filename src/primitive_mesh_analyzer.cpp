@@ -6312,6 +6312,467 @@ double maximumFilledSurfaceDistance(
         sample_spacing, maximum_distance).maximum_distance;
 }
 
+std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
+    const Mesh& filled_surface_mesh,
+    std::vector<OutputPrimitive> primitives,
+    const double tolerance,
+    const double maximum_error_distance,
+    const double error_sample_spacing,
+    std::size_t& merged_group_count,
+    std::vector<BoxFit>& accepted_boxes,
+    const std::filesystem::path& profile_path)
+{
+    merged_group_count = 0;
+    if (primitives.size() < 2) return primitives;
+    const auto started = std::chrono::steady_clock::now();
+    struct Record
+    {
+        std::size_t primitive = 0;
+        Bounds bounds;
+        Vec3 center = Vec3::Zero();
+        std::size_t triangles = 0;
+    };
+    std::vector<Record> records;
+    records.reserve(primitives.size());
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+    {
+        const PrimitiveMesh mesh = triangulatePrimitive(
+            primitives[index].primitive);
+        Bounds bounds;
+        for (const Vec3& vertex : mesh.vertices)
+        {
+            bounds.lower = bounds.lower.cwiseMin(vertex);
+            bounds.upper = bounds.upper.cwiseMax(vertex);
+        }
+        records.push_back({index, bounds, (bounds.lower + bounds.upper) * 0.5,
+                           mesh.faces.size()});
+    }
+    std::vector<std::size_t> order(records.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::uint64_t next_enclosure_group = 1;
+    for (const OutputPrimitive& primitive : primitives)
+        next_enclosure_group = std::max(
+            next_enclosure_group, primitive.enclosure_group + 1);
+
+    struct Profile
+    {
+        std::size_t nodes = 0;
+        std::size_t box_candidates = 0;
+        std::size_t accepted_boxes = 0;
+        std::size_t distance_samples = 0;
+        double distance_seconds = 0.0;
+    } profile;
+    const auto writeProfile = [&](const bool complete)
+    {
+        std::ofstream stream(profile_path);
+        stream << std::setprecision(17)
+               << "{\"complete\":" << (complete ? "true" : "false")
+               << ",\"input_primitives\":" << primitives.size()
+               << ",\"hierarchy_nodes\":" << profile.nodes
+               << ",\"box_candidates\":" << profile.box_candidates
+               << ",\"accepted_boxes\":" << profile.accepted_boxes
+               << ",\"distance_seconds\":" << profile.distance_seconds
+               << ",\"total_seconds\":" << std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count()
+               << "}\n";
+    };
+    writeProfile(false);
+
+    const auto solve = [&](auto&& self, const std::size_t begin,
+                           const std::size_t end)
+        -> std::vector<OutputPrimitive>
+    {
+        ++profile.nodes;
+        const std::size_t count = end - begin;
+        if (count == 1)
+            return {primitives[records[order[begin]].primitive]};
+
+        std::size_t original_triangles = 0;
+        Bounds group_bounds;
+        Bounds center_bounds;
+        for (std::size_t offset = begin; offset < end; ++offset)
+        {
+            const Record& record = records[order[offset]];
+            group_bounds.lower = group_bounds.lower.cwiseMin(record.bounds.lower);
+            group_bounds.upper = group_bounds.upper.cwiseMax(record.bounds.upper);
+            center_bounds.lower = center_bounds.lower.cwiseMin(record.center);
+            center_bounds.upper = center_bounds.upper.cwiseMax(record.center);
+            original_triangles += record.triangles;
+        }
+
+        if (original_triangles > 12 && count >= 4)
+        {
+            Mesh fitting_mesh;
+            std::vector<std::uint32_t> fitting_vertices;
+            std::vector<std::uint32_t> responsibility;
+            for (std::size_t offset = begin; offset < end; ++offset)
+            {
+                const OutputPrimitive& item =
+                    primitives[records[order[offset]].primitive];
+                const PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
+                for (const Vec3& vertex : mesh.vertices)
+                {
+                    fitting_vertices.push_back(static_cast<std::uint32_t>(
+                        fitting_mesh.vertices.size()));
+                    fitting_mesh.vertices.push_back(vertex);
+                }
+                responsibility.insert(responsibility.end(),
+                                      item.source_faces.begin(),
+                                      item.source_faces.end());
+            }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            const BoxFit box = fitBox(fitting_mesh, fitting_vertices);
+            const Vec3 extent = box.half_size * 2.0;
+            if (extent.x() > tolerance && extent.y() > tolerance &&
+                extent.z() > tolerance)
+            {
+                std::vector<OutputPrimitive> candidate;
+                appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
+                                    next_enclosure_group);
+                ++profile.box_candidates;
+                const auto distance_started = std::chrono::steady_clock::now();
+                const double error = maximumFilledSurfaceDistance(
+                    filled_surface_mesh, candidate, error_sample_spacing,
+                    maximum_error_distance + tolerance);
+                profile.distance_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - distance_started).count();
+                if (error <= maximum_error_distance + tolerance)
+                {
+                    ++next_enclosure_group;
+                    ++profile.accepted_boxes;
+                    ++merged_group_count;
+                    accepted_boxes.push_back(box);
+                    return candidate;
+                }
+            }
+        }
+
+        const Vec3 center_extent = center_bounds.upper - center_bounds.lower;
+        int axis = 0;
+        if (center_extent.y() > center_extent.x()) axis = 1;
+        if (center_extent.z() > center_extent[axis]) axis = 2;
+        const std::size_t middle = begin + count / 2;
+        std::nth_element(order.begin() + begin, order.begin() + middle,
+                         order.begin() + end,
+            [&](const std::size_t first, const std::size_t second)
+            {
+                return records[first].center[axis] < records[second].center[axis];
+            });
+        auto left = self(self, begin, middle);
+        auto right = self(self, middle, end);
+        left.insert(left.end(), std::make_move_iterator(right.begin()),
+                    std::make_move_iterator(right.end()));
+        return left;
+    };
+
+    auto result = solve(solve, 0, order.size());
+    writeProfile(true);
+    return result;
+}
+
+std::vector<OutputPrimitive> fillCertifiedIntercomponentGaps(
+    const Mesh& mesh,
+    std::vector<OutputPrimitive> primitives,
+    const double model_volume,
+    const double maximum_gap_volume_ratio,
+    const double tolerance,
+    std::size_t& filled_gap_count,
+    std::vector<BoxFit>& certified_volumes,
+    const std::filesystem::path& profile_path)
+{
+    filled_gap_count = 0;
+    if (mesh.faces.empty() || maximum_gap_volume_ratio <= 0.0)
+        return primitives;
+    std::vector<std::uint32_t> all_vertices(mesh.vertices.size());
+    std::iota(all_vertices.begin(), all_vertices.end(), 0);
+    const BoxFit model_box = fitBox(mesh, all_vertices);
+    const Mat3 frame = model_box.axes;
+
+    struct ComponentBox
+    {
+        Bounds local;
+        BoxFit world;
+        std::vector<std::uint32_t> faces;
+    };
+    std::vector<ComponentBox> components;
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edge_faces;
+    edge_faces.reserve(mesh.faces.size() * 3);
+    for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+    {
+        const Face& face = mesh.faces[face_id];
+        for (int edge = 0; edge < 3; ++edge)
+            edge_faces[edgeKey(face[edge], face[(edge + 1) % 3])]
+                .push_back(face_id);
+    }
+    std::vector<std::vector<std::uint32_t>> manifold_neighbors(mesh.faces.size());
+    for (const auto& [edge, incident] : edge_faces)
+    {
+        (void)edge;
+        if (incident.size() != 2) continue;
+        manifold_neighbors[incident[0]].push_back(incident[1]);
+        manifold_neighbors[incident[1]].push_back(incident[0]);
+    }
+    std::vector<std::uint8_t> visited(mesh.faces.size(), 0);
+    std::vector<std::vector<std::uint32_t>> manifold_components;
+    for (std::uint32_t seed = 0; seed < mesh.faces.size(); ++seed)
+    {
+        if (visited[seed]) continue;
+        manifold_components.emplace_back();
+        std::queue<std::uint32_t> queue;
+        queue.push(seed);
+        visited[seed] = 1;
+        while (!queue.empty())
+        {
+            const auto face = queue.front();
+            queue.pop();
+            manifold_components.back().push_back(face);
+            for (const auto neighbor : manifold_neighbors[face])
+                if (!visited[neighbor])
+                {
+                    visited[neighbor] = 1;
+                    queue.push(neighbor);
+                }
+        }
+    }
+    for (auto faces : manifold_components)
+    {
+        if (faces.size() < 12) continue;
+        std::unordered_map<std::uint64_t, std::uint32_t> edge_counts;
+        for (const auto face_id : faces)
+        {
+            const Face& face = mesh.faces[face_id];
+            for (int edge = 0; edge < 3; ++edge)
+                ++edge_counts[edgeKey(face[edge], face[(edge + 1) % 3])];
+        }
+        if (std::any_of(edge_counts.begin(), edge_counts.end(),
+            [](const auto& edge) { return edge.second != 2; }))
+            continue;
+        const auto vertex_ids = uniqueVertices(mesh, faces);
+        Bounds local;
+        for (const auto vertex_id : vertex_ids)
+        {
+            const Vec3 point = frame.transposeMultiply(mesh.vertices[vertex_id]);
+            local.lower = local.lower.cwiseMin(point);
+            local.upper = local.upper.cwiseMax(point);
+        }
+        const Vec3 extent = local.upper - local.lower;
+        const double volume = extent.cwiseMax(Vec3::Zero()).prod();
+        if (volume <= std::max(model_volume * 1.0e-4,
+                               tolerance * tolerance * tolerance))
+            continue;
+        const double minimum_extent = std::min({extent.x(), extent.y(), extent.z()});
+        if (minimum_extent <= tolerance) continue;
+        double maximum_inward = 0.0;
+        for (const auto vertex_id : vertex_ids)
+        {
+            const Vec3 point = frame.transposeMultiply(mesh.vertices[vertex_id]);
+            maximum_inward = std::max(maximum_inward, std::min({
+                point.x() - local.lower.x(), local.upper.x() - point.x(),
+                point.y() - local.lower.y(), local.upper.y() - point.y(),
+                point.z() - local.lower.z(), local.upper.z() - point.z()}));
+        }
+        if (maximum_inward > 0.1 * minimum_extent + tolerance) continue;
+        BoxFit box;
+        box.axes = frame;
+        box.center = frame * ((local.lower + local.upper) * 0.5);
+        box.half_size = extent * 0.5;
+        box.volume = volume;
+        components.push_back({local, box, std::move(faces)});
+        certified_volumes.push_back(box);
+    }
+    if (components.size() < 2) return primitives;
+
+    std::vector<BoxFit> bridges;
+    std::set<std::array<std::int64_t, 6>> bridge_keys;
+    const double quantization = 1.0 / std::max(tolerance * 16.0, 1.0e-9);
+    for (int separation_axis = 0; separation_axis < 3; ++separation_axis)
+    {
+        std::vector<std::size_t> order(components.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](const auto first,
+                                                  const auto second)
+        {
+            return components[first].local.lower[separation_axis] <
+                   components[second].local.lower[separation_axis];
+        });
+        const int first_tangent = (separation_axis + 1) % 3;
+        const int second_tangent = (separation_axis + 2) % 3;
+        for (std::size_t position = 0; position < order.size(); ++position)
+            for (std::size_t next = position + 1;
+                 next < std::min(order.size(), position + 9); ++next)
+            {
+                const Bounds& first = components[order[position]].local;
+                const Bounds& second = components[order[next]].local;
+                const double gap = second.lower[separation_axis] -
+                                   first.upper[separation_axis];
+                if (gap <= tolerance) continue;
+                const double first_extent_a =
+                    first.upper[first_tangent] - first.lower[first_tangent];
+                const double second_extent_a =
+                    second.upper[first_tangent] - second.lower[first_tangent];
+                const double first_extent_b =
+                    first.upper[second_tangent] - first.lower[second_tangent];
+                const double second_extent_b =
+                    second.upper[second_tangent] - second.lower[second_tangent];
+                if (std::max(first_extent_a, second_extent_a) >
+                        1.25 * std::min(first_extent_a, second_extent_a) ||
+                    std::max(first_extent_b, second_extent_b) >
+                        1.25 * std::min(first_extent_b, second_extent_b))
+                    continue;
+                const double lower_a = std::max(
+                    first.lower[first_tangent], second.lower[first_tangent]);
+                const double upper_a = std::min(
+                    first.upper[first_tangent], second.upper[first_tangent]);
+                const double lower_b = std::max(
+                    first.lower[second_tangent], second.lower[second_tangent]);
+                const double upper_b = std::min(
+                    first.upper[second_tangent], second.upper[second_tangent]);
+                const double overlap_a = upper_a - lower_a;
+                const double overlap_b = upper_b - lower_b;
+                if (overlap_a < 0.8 * std::min(first_extent_a, second_extent_a) ||
+                    overlap_b < 0.8 * std::min(first_extent_b, second_extent_b))
+                    continue;
+                const double gap_volume = gap * overlap_a * overlap_b;
+                if (gap_volume / std::max(model_volume, 1.0e-30) >
+                    maximum_gap_volume_ratio)
+                    continue;
+                Vec3 lower = Vec3::Zero();
+                Vec3 upper = Vec3::Zero();
+                lower[separation_axis] = first.upper[separation_axis];
+                upper[separation_axis] = second.lower[separation_axis];
+                lower[first_tangent] = lower_a;
+                upper[first_tangent] = upper_a;
+                lower[second_tangent] = lower_b;
+                upper[second_tangent] = upper_b;
+                const std::array<std::int64_t, 6> key{{
+                    static_cast<std::int64_t>(std::llround(lower.x() * quantization)),
+                    static_cast<std::int64_t>(std::llround(lower.y() * quantization)),
+                    static_cast<std::int64_t>(std::llround(lower.z() * quantization)),
+                    static_cast<std::int64_t>(std::llround(upper.x() * quantization)),
+                    static_cast<std::int64_t>(std::llround(upper.y() * quantization)),
+                    static_cast<std::int64_t>(std::llround(upper.z() * quantization))}};
+                if (!bridge_keys.insert(key).second) continue;
+                BoxFit bridge;
+                bridge.axes = frame;
+                bridge.center = frame * ((lower + upper) * 0.5);
+                bridge.half_size = (upper - lower) * 0.5;
+                bridge.volume = gap_volume;
+                bridges.push_back(bridge);
+            }
+    }
+    if (bridges.empty()) return primitives;
+
+    // Several independently matched component pairs can describe the same
+    // filled space at different cross-section widths. Keep the maximal bridge
+    // whenever another candidate is completely contained in it. This is a
+    // geometric canonicalization, not a model-specific count rule, and avoids
+    // exporting coincident internal bridge faces.
+    const std::size_t raw_bridge_count = bridges.size();
+    std::vector<Bounds> bridge_bounds(bridges.size());
+    for (std::size_t index = 0; index < bridges.size(); ++index)
+    {
+        const Vec3 center = frame.transposeMultiply(bridges[index].center);
+        bridge_bounds[index] = {
+            center - bridges[index].half_size,
+            center + bridges[index].half_size};
+    }
+    std::vector<std::uint8_t> redundant_bridge(bridges.size(), 0);
+    for (std::size_t candidate = 0; candidate < bridges.size(); ++candidate)
+        for (std::size_t container = 0; container < bridges.size(); ++container)
+        {
+            if (candidate == container) continue;
+            bool contained = true;
+            bool strictly_smaller = false;
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                contained &= bridge_bounds[candidate].lower[axis] >=
+                                 bridge_bounds[container].lower[axis] - tolerance &&
+                             bridge_bounds[candidate].upper[axis] <=
+                                 bridge_bounds[container].upper[axis] + tolerance;
+                strictly_smaller |= bridge_bounds[candidate].lower[axis] >
+                                        bridge_bounds[container].lower[axis] + tolerance ||
+                                    bridge_bounds[candidate].upper[axis] <
+                                        bridge_bounds[container].upper[axis] - tolerance;
+            }
+            if (contained && strictly_smaller)
+            {
+                redundant_bridge[candidate] = 1;
+                break;
+            }
+        }
+    std::vector<BoxFit> canonical_bridges;
+    canonical_bridges.reserve(bridges.size());
+    for (std::size_t index = 0; index < bridges.size(); ++index)
+        if (!redundant_bridge[index])
+            canonical_bridges.push_back(bridges[index]);
+    bridges = std::move(canonical_bridges);
+
+    {
+        std::ofstream profile(profile_path);
+        profile << std::setprecision(17)
+                << "{\"certified_components\":" << components.size()
+                << ",\"raw_bridge_candidates\":" << raw_bridge_count
+                << ",\"canonical_bridges\":" << bridges.size()
+                << ",\"components\":[";
+        for (std::size_t index = 0; index < components.size(); ++index)
+        {
+            if (index) profile << ',';
+            const Bounds& bounds = components[index].local;
+            profile << "{\"lower\":[" << bounds.lower.x() << ','
+                    << bounds.lower.y() << ',' << bounds.lower.z()
+                    << "],\"upper\":[" << bounds.upper.x() << ','
+                    << bounds.upper.y() << ',' << bounds.upper.z() << "]}";
+        }
+        profile << "],\"bridges\":[";
+        for (std::size_t index = 0; index < bridges.size(); ++index)
+        {
+            if (index) profile << ',';
+            const BoxFit& bridge = bridges[index];
+            const Vec3 center = frame.transposeMultiply(bridge.center);
+            const Vec3 lower = center - bridge.half_size;
+            const Vec3 upper = center + bridge.half_size;
+            profile << "{\"lower\":[" << lower.x() << ',' << lower.y() << ','
+                    << lower.z() << "],\"upper\":[" << upper.x() << ','
+                    << upper.y() << ',' << upper.z()
+                    << "],\"volume_ratio\":"
+                    << bridge.volume / std::max(model_volume, 1.0e-30) << '}';
+        }
+        profile << "]}\n";
+    }
+
+    std::uint64_t next_group = 1;
+    for (const OutputPrimitive& primitive : primitives)
+        next_group = std::max(next_group, primitive.enclosure_group + 1);
+    const std::size_t first_bridge_primitive = primitives.size();
+    for (const BoxFit& bridge : bridges)
+    {
+        appendBoxRectangles(primitives, bridge, {}, -1, 0.0, next_group++);
+        certified_volumes.push_back(bridge);
+    }
+    std::size_t removed = 0;
+    std::vector<std::uint32_t> absorbed_faces;
+    primitives = clipPlanarOcclusionByClosedVolumes(
+        std::move(primitives), certified_volumes, {}, tolerance, removed,
+        &absorbed_faces, false);
+    if (!absorbed_faces.empty())
+    {
+        for (OutputPrimitive& primitive : primitives)
+            if (primitive.enclosure_group >= next_group - bridges.size())
+            {
+                primitive.source_faces.insert(
+                    primitive.source_faces.end(), absorbed_faces.begin(),
+                    absorbed_faces.end());
+                break;
+            }
+    }
+    (void)first_bridge_primitive;
+    filled_gap_count = bridges.size();
+    return primitives;
+}
+
 void writeOpenErrorVisualization(
     const std::filesystem::path& path,
     const FinalOpenErrorAudit& audit)
@@ -10166,6 +10627,8 @@ void writeMetadata(const std::filesystem::path& directory,
           << ",\"filled_planar_holes\":" << stats.filled_planar_holes
           << ",\"filled_cavity_volume_ratio\":" << stats.filled_cavity_volume_ratio
           << ",\"filled_boundary_voids\":" << stats.filled_boundary_voids
+          << ",\"filled_intercomponent_gaps\":"
+          << stats.filled_intercomponent_gaps
           << ",\"filled_boundary_void_area\":" << stats.filled_boundary_void_area
           << ",\"removed_contained_primitives\":" << stats.removed_contained_primitives
           << ",\"removed_sealed_void_wall_primitives\":"
@@ -10179,6 +10642,8 @@ void writeMetadata(const std::filesystem::path& directory,
           << stats.recognized_protrusion_box_shells
           << ",\"merged_local_planar_primitives\":"
           << stats.merged_local_planar_primitives
+          << ",\"merged_spatial_primitive_groups\":"
+          << stats.merged_spatial_primitive_groups
           << ",\"canonicalized_coplanar_groups\":"
           << stats.canonicalized_coplanar_groups
           << ",\"removed_coplanar_redundant_primitives\":"
@@ -10504,6 +10969,12 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             std::make_move_iterator(classified.begin()),
             std::make_move_iterator(classified.end()));
     }
+    output = fillCertifiedIntercomponentGaps(
+        mesh, std::move(output), model_volume,
+        effective_options.maximum_cavity_added_volume_ratio,
+        std::max(diagonal * 1.0e-9, 1.0e-10),
+        stats.filled_intercomponent_gaps, certified_closed_volumes,
+        output_directory / "intercomponent_gap_profile.json");
     markStage("region_classification");
 
     // Phase 1 reference: make every accepted hole/cavity decision explicit.
@@ -10574,6 +11045,14 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     promoteToSemanticPrimitives(phase2_recognized_surfaces);
     markStage("exact_surface_union");
 
+    output = mergeSpatialPrimitiveGroups(
+        filled_surface_mesh, std::move(output),
+        std::max(diagonal * 1.0e-9, 1.0e-10),
+        maximum_open_error_distance,
+        std::max(diagonal / 192.0, 1.0e-30),
+        stats.merged_spatial_primitive_groups,
+        certified_closed_volumes,
+        output_directory / "spatial_group_merge_profile.json");
     output = mergeLocalCoplanarPrimitives(
         filled_surface_mesh, std::move(output),
         std::max(diagonal * 1.0e-9, 1.0e-10),

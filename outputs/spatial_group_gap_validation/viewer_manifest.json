@@ -1,0 +1,16 @@
+{
+  "algorithm": "StagedSurfacePrimitivePipeline-spatial-groups-intercomponent-gaps",
+  "complete": true,
+  "note": "Current real-data validation for unrestricted spatial group merging and per-gap component filling.",
+  "model_count": 2,
+  "models": [
+    {
+      "id": 2,
+      "metadata": "../model2_gap_manifold_components/model.json"
+    },
+    {
+      "id": 3,
+      "metadata": "../model3_spatial_group_gap_validation/model.json"
+    }
+  ]
+}

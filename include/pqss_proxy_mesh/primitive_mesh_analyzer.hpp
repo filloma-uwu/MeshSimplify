@@ -37,7 +37,7 @@ struct PrimitiveMeshAnalysisOptions
     // depth and must never be selected as the production proxy by default.
     bool enable_volume_evaluated_envelope = false;
     // Per-cavity conservative prism volume, normalized by the model AABB.
-    double maximum_cavity_added_volume_ratio = 0.04;
+    double maximum_cavity_added_volume_ratio = 0.08;
     // Total volume introduced when several disconnected components are replaced
     // by one shared box envelope, normalized by the model AABB.
     double maximum_group_box_added_volume_ratio = 0.05;
@@ -87,6 +87,7 @@ struct PrimitiveMeshAnalysisStats
     std::size_t filled_planar_holes = 0;
     double filled_cavity_volume_ratio = 0.0;
     std::size_t filled_boundary_voids = 0;
+    std::size_t filled_intercomponent_gaps = 0;
     double filled_boundary_void_area = 0.0;
     std::size_t removed_contained_primitives = 0;
     std::size_t removed_sealed_void_wall_primitives = 0;
@@ -95,6 +96,7 @@ struct PrimitiveMeshAnalysisStats
     std::size_t recognized_closed_box_shells = 0;
     std::size_t recognized_protrusion_box_shells = 0;
     std::size_t merged_local_planar_primitives = 0;
+    std::size_t merged_spatial_primitive_groups = 0;
     std::size_t canonicalized_coplanar_groups = 0;
     std::size_t removed_coplanar_redundant_primitives = 0;
     double removed_coplanar_overlap_area = 0.0;

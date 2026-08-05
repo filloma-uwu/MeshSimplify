@@ -43,18 +43,22 @@ configured circumferential segment count.
    domains as cylindrical or conical bands and verify their side normals.
 4. Evaluate every inner boundary independently. Its conservative loop area
    times model depth is divided by the whole-model AABB volume. Small holes may
-   close; a large body cavity remains.
+   close; a large body cavity remains. Repeated closed components with matching
+   cross sections are analyzed in the same model frame; each gap is assigned
+   its own volume ratio and may be bridged without consuming a global budget.
 5. Merge every adjacent patch that has the same certified analytic surface;
    clipped patches retain their parameter-domain boundary, while a certified
    original complete surface may be restored.
-6. Remove exact overlap and certified internal surfaces. Then repeatedly test
-   adjacent primitive merges and accept the lowest-error admissible merge.
-   Acceptance requires conservative source coverage and a sampled directed
-   simplified-to-hole-filled distance no greater than
+6. Remove exact overlap and certified internal surfaces. Build a spatial
+   hierarchy over all recognized surface patches, independent of their surface
+   type. At each hierarchy node, test whether one tight conservative box shell
+   can replace the complete descendant group. Accept the coarsest admissible
+   node; otherwise recurse to its children. A fixed-point local surface merge
+   then handles remaining coplanar neighbors. Every approximate replacement
+   must pass the sampled directed simplified-to-hole-filled distance limit
    `maximum_open_error_distance`. Hole filling itself is not charged to this
-   error because phase 1 is the distance reference.
-   Accepted merges update adjacency and candidate errors; iteration stops only
-   when no candidate remains. PQSS workload is not part of this decision.
+   error because phase 1 is the distance reference. PQSS workload and a target
+   primitive count are not part of the geometry decision.
 7. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
@@ -79,6 +83,10 @@ Each analyzed model directory contains:
 - `proxy.obj`: phase 4, the ordinary triangulated collision input;
 - `regions.obj`: source triangles grouped by final responsibility;
 - `model.json`: type counts, triangle counts, fill diagnostics, and timing.
+- `intercomponent_gap_profile.json`: accepted per-gap bridge bounds and volume
+  ratios when repeated closed components contain fillable spaces;
+- `spatial_group_merge_profile.json`: spatial hierarchy candidate and accepted
+  box counts plus distance-evaluation time.
 
 The maximum and mean simplification errors in `model.json` and the viewer are
 directed from phase 3/4 to phase 1. Strict conservative coverage is still
