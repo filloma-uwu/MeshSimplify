@@ -53,8 +53,12 @@ configured circumferential segment count.
    hierarchy over all recognized surface patches, independent of their surface
    type. At each hierarchy node, test whether one tight conservative box shell
    can replace the complete descendant group. Accept the coarsest admissible
-   node; otherwise recurse to its children. A fixed-point local surface merge
-   then handles remaining coplanar neighbors. Every approximate replacement
+   node; otherwise recurse to its children. After every pass, primitives fully
+   enclosed by an accepted replacement transfer their source responsibility to
+   that enclosure and are deleted. The hierarchy is rebuilt and evaluated
+   again until neither a merge nor an enclosed-primitive deletion occurs. A
+   fixed-point local surface merge then handles remaining coplanar neighbors.
+   Every approximate replacement
    must pass the sampled directed simplified-to-hole-filled distance limit
    `maximum_open_error_distance`. Hole filling itself is not charged to this
    error because phase 1 is the distance reference. PQSS workload and a target
@@ -87,6 +91,10 @@ Each analyzed model directory contains:
   ratios when repeated closed components contain fillable spaces;
 - `spatial_group_merge_profile.json`: spatial hierarchy candidate and accepted
   box counts plus distance-evaluation time.
+- `spatial_group_fixed_point_profile.json`: number of rebuild passes, total
+  accepted groups, and primitives deleted after becoming enclosed.
+- `coverage_audit_pre_repair.json`: exported workload before conservative
+  fallback repair and the exact source-face IDs that required local repair.
 
 The maximum and mean simplification errors in `model.json` and the viewer are
 directed from phase 3/4 to phase 1. Strict conservative coverage is still

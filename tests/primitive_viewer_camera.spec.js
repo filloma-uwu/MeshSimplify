@@ -172,6 +172,11 @@ test('open-error mode preserves the camera and locates the maximum-distance pair
 
 test('maximum-error regeneration reloads the proxy without resetting the camera', async ({ page }) => {
   test.setTimeout(180_000);
+  let regenerationRequest = null;
+  page.on('request', request => {
+    if (request.url().endsWith('/api/regenerate'))
+      regenerationRequest = request.postDataJSON();
+  });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(
     'http://127.0.0.1:8094/viewer/primitive_analysis.html' +
@@ -196,4 +201,6 @@ test('maximum-error regeneration reloads the proxy without resetting the camera'
   expectVectorUnchanged(regenerated.cameraTarget, initial.cameraTarget);
   expect(regenerated.maximumErrorDistance).toBeLessThanOrEqual(80 + 1e-8);
   expect(regenerated.maximumErrorInput).toBe(80);
+  expect(regenerationRequest.manifest).toBe(
+    '/outputs/model3_max_error_workload_only/viewer_manifest.json');
 });

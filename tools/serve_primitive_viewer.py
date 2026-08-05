@@ -9,7 +9,7 @@ import subprocess
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parent.parent
@@ -60,7 +60,17 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("maximum_error must be finite and non-negative")
 
             server = self.server
-            manifest_data = json.loads(server.manifest_path.read_text(encoding="utf-8"))
+            requested_manifest = request.get("manifest")
+            if requested_manifest is None:
+                manifest_path = server.manifest_path
+            else:
+                manifest_url_path = unquote(
+                    urlsplit(str(requested_manifest)).path).lstrip("/")
+                manifest_path = (PROJECT_DIRECTORY / manifest_url_path).resolve()
+                manifest_path.relative_to(PROJECT_DIRECTORY)
+                if not manifest_path.is_file():
+                    raise ValueError(f"manifest does not exist: {manifest_url_path}")
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
             model = next(
                 (item for item in manifest_data.get("models", [])
                  if str(item.get("id")) == model_id),
@@ -68,7 +78,7 @@ class Handler(SimpleHTTPRequestHandler):
             )
             if model is None:
                 raise ValueError(f"model {model_id} is not present in the served manifest")
-            metadata_path = (server.manifest_path.parent / model["metadata"]).resolve()
+            metadata_path = (manifest_path.parent / model["metadata"]).resolve()
             metadata_path.relative_to(PROJECT_DIRECTORY)
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             source_path = (metadata_path.parent / metadata["source"]).resolve()
@@ -115,7 +125,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR can let a stale viewer keep receiving requests
+    # after a new process is launched on the same port. Fail fast instead.
+    allow_reuse_address = False
 
     def __init__(self, address: tuple[str, int], handler: type[Handler],
                  manifest_path: Path, executable: Path) -> None:

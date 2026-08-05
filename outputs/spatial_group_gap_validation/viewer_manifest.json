@@ -6,11 +6,11 @@
   "models": [
     {
       "id": 2,
-      "metadata": "../model2_gap_manifold_components/model.json"
+      "metadata": "../model2_merge_containment_fixed_point/model.json"
     },
     {
       "id": 3,
-      "metadata": "../model3_spatial_group_gap_validation/model.json"
+      "metadata": "../model3_merge_containment_fixed_point/model.json"
     }
   ]
 }

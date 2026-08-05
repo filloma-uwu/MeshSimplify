@@ -6400,7 +6400,11 @@ std::vector<OutputPrimitive> mergeSpatialPrimitiveGroups(
             original_triangles += record.triangles;
         }
 
-        if (original_triangles > 12 && count >= 4)
+        // Small adjacent structures are often exactly the ones that should be
+        // absorbed into a simple enclosure. Do not require an arbitrary
+        // minimum primitive count; the replacement still has to reduce the
+        // triangulated workload and pass the directed-error limit.
+        if (original_triangles > 12)
         {
             Mesh fitting_mesh;
             std::vector<std::uint32_t> fitting_vertices;
@@ -11045,14 +11049,49 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     promoteToSemanticPrimitives(phase2_recognized_surfaces);
     markStage("exact_surface_union");
 
-    output = mergeSpatialPrimitiveGroups(
-        filled_surface_mesh, std::move(output),
-        std::max(diagonal * 1.0e-9, 1.0e-10),
-        maximum_open_error_distance,
-        std::max(diagonal / 192.0, 1.0e-30),
-        stats.merged_spatial_primitive_groups,
-        certified_closed_volumes,
-        output_directory / "spatial_group_merge_profile.json");
+    const double merge_tolerance =
+        std::max(diagonal * 1.0e-9, 1.0e-10);
+    const double merge_sample_spacing =
+        std::max(diagonal / 192.0, 1.0e-30);
+    std::size_t spatial_merge_passes = 0;
+    std::size_t spatially_enclosed_primitives = 0;
+    constexpr std::size_t maximum_spatial_merge_passes = 8;
+    for (; spatial_merge_passes < maximum_spatial_merge_passes;
+         ++spatial_merge_passes)
+    {
+        std::size_t pass_merges = 0;
+        const std::filesystem::path pass_profile = spatial_merge_passes == 0
+            ? output_directory / "spatial_group_merge_profile.json"
+            : output_directory /
+                ("spatial_group_merge_profile_pass_" +
+                 std::to_string(spatial_merge_passes + 1) + ".json");
+        output = mergeSpatialPrimitiveGroups(
+            filled_surface_mesh, std::move(output), merge_tolerance,
+            maximum_open_error_distance, merge_sample_spacing,
+            pass_merges, certified_closed_volumes, pass_profile);
+        stats.merged_spatial_primitive_groups += pass_merges;
+
+        std::size_t pass_removed = 0;
+        output = removePrimitivesInsideEnclosureGroups(
+            mesh, std::move(output), merge_tolerance, pass_removed);
+        spatially_enclosed_primitives += pass_removed;
+        if (pass_merges == 0 && pass_removed == 0)
+        {
+            ++spatial_merge_passes;
+            break;
+        }
+    }
+    stats.removed_contained_primitives += spatially_enclosed_primitives;
+    {
+        std::ofstream profile(
+            output_directory / "spatial_group_fixed_point_profile.json");
+        profile << "{\"passes\":" << spatial_merge_passes
+                << ",\"accepted_groups\":"
+                << stats.merged_spatial_primitive_groups
+                << ",\"removed_enclosed_primitives\":"
+                << spatially_enclosed_primitives
+                << ",\"output_primitives\":" << output.size() << "}\n";
+    }
     output = mergeLocalCoplanarPrimitives(
         filled_surface_mesh, std::move(output),
         std::max(diagonal * 1.0e-9, 1.0e-10),
@@ -11060,6 +11099,19 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         std::max(diagonal / 192.0, 1.0e-30),
         stats.merged_local_planar_primitives,
         output_directory / "surface_merge_profile.json");
+    std::size_t locally_enclosed_primitives = 0;
+    output = removePrimitivesInsideEnclosureGroups(
+        mesh, std::move(output), merge_tolerance,
+        locally_enclosed_primitives);
+    stats.removed_contained_primitives += locally_enclosed_primitives;
+
+    // Preserve the complete pre-canonicalization result. Items carrying an
+    // enclosure_group provide immutable convex-volume certificates after
+    // coplanar rewriting; ordinary items preserve the source-face
+    // responsibility map. This snapshot already includes every responsibility
+    // transferred from primitives removed inside an enclosure above.
+    const std::vector<OutputPrimitive> coverage_certificate_primitives = output;
+
     CoplanarCanonicalizationStats post_merge_coplanar_stats;
     output = canonicalizeCoplanarPrimitiveUnion(
         mesh, std::move(output), std::max(diagonal * 1.0e-9, 1.0e-10),
@@ -11143,7 +11195,29 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double final_tolerance = std::max(
         diagonal * 1.0e-9, 1.0e-10);
     FinalCoverageAudit coverage = auditFinalConservativeCoverage(
-        mesh, output, final_tolerance, &output, nullptr, &excluded_faces);
+        mesh, output, final_tolerance, &coverage_certificate_primitives,
+        &certified_closed_extrusions, &excluded_faces);
+    {
+        std::ofstream profile(output_directory /
+                              "coverage_audit_pre_repair.json");
+        profile << "{\"output_primitives\":" << output.size()
+                << ",\"output_triangles\":"
+                << triangulatedFaceCount(output)
+                << ",\"unassigned_source_faces\":"
+                << coverage.unassigned_source_faces
+                << ",\"failed_source_faces\":"
+                << coverage.failed_source_faces
+                << ",\"repair_face_count\":"
+                << coverage.failed_face_ids.size()
+                << ",\"repair_face_ids\":[";
+        for (std::size_t index = 0;
+             index < coverage.failed_face_ids.size(); ++index)
+        {
+            if (index != 0) profile << ',';
+            profile << coverage.failed_face_ids[index];
+        }
+        profile << "]}\n";
+    }
     if (!coverage.failed_face_ids.empty())
     {
         for (const auto face_id : coverage.failed_face_ids)
@@ -11158,7 +11232,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         }
         promoteToSemanticPrimitives(output);
         coverage = auditFinalConservativeCoverage(
-            mesh, output, final_tolerance, &output, nullptr, &excluded_faces);
+            mesh, output, final_tolerance, &coverage_certificate_primitives,
+            &certified_closed_extrusions, &excluded_faces);
     }
     stats.coverage_assigned_source_faces = coverage.assigned_source_faces;
     stats.coverage_enclosure_source_faces = coverage.enclosure_source_faces;
