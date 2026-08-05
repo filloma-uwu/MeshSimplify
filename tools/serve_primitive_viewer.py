@@ -131,7 +131,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/surface_primitives_v190_uniform_final/viewer_manifest.json"),
+        default=Path("outputs/surface_primitives_four_stage_f47bb48/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",
