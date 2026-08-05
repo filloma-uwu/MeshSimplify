@@ -54,18 +54,35 @@ configured circumferential segment count.
 5. Merge every adjacent patch that has the same certified analytic surface;
    clipped patches retain their parameter-domain boundary, while a certified
    original complete surface may be restored.
-6. Remove exact overlap and certified internal surfaces. Stage 3 is a
-   surface-candidate search only: a planar, circular, cylindrical, or conical
-   patch may merge only into another supported surface patch. A fitted box,
-   cylinder solid, frustum solid, or the boundary of such a fitted volume is not
-   an eligible simplification candidate. Volume certificates may prove that an
-   existing surface is occluded, but cannot create replacement geometry.
-   Every approximate surface replacement must pass the sampled directed
-   simplified-to-hole-filled distance limit `maximum_open_error_distance`.
-   Hole filling itself is not charged because phase 1 is the distance reference.
-   PQSS workload and a target primitive count are not part of the geometry
-   decision. Source faces still failing the final conservative audit remain exact
-   surface triangles; repair never introduces a fitted solid.
+6. Build the stage-3 adjacency graph from both source-responsibility edges and
+   the actual boundaries of the current stage-2 patches. Boundary contact is
+   tested between line segments, so T junctions, partially overlapping edges,
+   and an endpoint lying inside another edge do not disappear merely because
+   the two OBJ patches lack an identical vertex. For every adjacent pair, fit
+   supported surface replacements from the union of their unique
+   responsibility vertices. Both the exact enclosing hull and a minimum-area
+   enclosing rectangle are surface candidates. There is no normal-angle,
+   primitive-count, support-depth, or per-merge triangle-reduction error gate:
+   after conservative coverage is checked, the measured user-directed error
+   limit alone decides whether the candidate is accepted. Failed candidates
+   are cached by the two endpoint versions. After an accepted merge, only the
+   changed patch and its neighbors are re-enqueued. Iteration stops at a fixed
+   point, and a final audit throws if any acceptable adjacent candidate
+   remains.
+
+   Stage 3 creates surface candidates only. It never creates a fitted box,
+   cylinder solid, frustum solid, or the boundary of such a fitted volume.
+   Candidate distance is certified first with the 1-Lipschitz property of
+   point-to-mesh distance; an unresolved certificate falls back to the full
+   deterministic surface sampler. Hole filling itself is not charged because
+   phase 1 is the distance reference. PQSS workload and a target primitive
+   count are not part of the geometry decision.
+
+   Coverage auditing retains the pre-canonicalization owner of every source
+   face. This is necessary because coplanar union may rewrite the final
+   `source_faces` map even though the conservative surface union is unchanged.
+   Source faces still failing that independent audit remain exact surface
+   triangles; repair never introduces a fitted solid.
 7. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
@@ -111,7 +128,7 @@ exact duplicate triangles, containment, error limits, timings, and peak memory:
 
 ```powershell
 python tools/audit_staged_surface_outputs.py `
-  outputs/surface_primitives_stage3_complete_v4/viewer_manifest.json
+  outputs/surface_adjacent_fixed_point_full_v4/viewer_manifest.json
 ```
 
 The output root contains `viewer_manifest.json`. Group names use matching IDs:

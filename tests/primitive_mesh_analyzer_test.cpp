@@ -152,8 +152,8 @@ int main()
                     cylinder_stats.proxy_triangles == 48,
                 "a complete cylinder side must remain one certified surface");
 
-        // Three disconnected coplanar rectangles need two accepted merges.
-        // The filled gaps are 0.1 wide, so the directed maximum is 0.05.
+        // Error tolerance does not create adjacency. Three disconnected
+        // coplanar rectangles remain independent stage-3 surfaces.
         const auto gaps = root / "coplanar_gaps.obj";
         writeText(gaps,
             "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
@@ -167,11 +167,11 @@ int main()
         const auto loose_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
             gaps, root / "gaps_loose", loose);
         require(loose_stats.containment_validation_passed,
-                "merged coplanar proxy must remain conservative");
-        require(loose_stats.primitive_count == 1 &&
-                    loose_stats.proxy_triangles == 2 &&
-                    loose_stats.merged_local_planar_primitives == 2,
-                "Hausdorff-compliant merging must iterate to a fixed point");
+                "disconnected coplanar proxy must remain conservative");
+        require(loose_stats.primitive_count == 3 &&
+                    loose_stats.proxy_triangles == 6 &&
+                    loose_stats.merged_local_planar_primitives == 0,
+                "maximum error must not turn separated surfaces into neighbors");
         require(loose_stats.open_max_distance <= 0.051 + 1.0e-9,
                 "accepted fixed-point merge must respect the user limit");
 
@@ -203,9 +203,41 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
-                    group_loose_stats.primitive_count > 6 &&
-                    group_loose_stats.merged_spatial_primitive_groups == 0,
-                "a loose error must not create a fitted solid candidate");
+                    group_loose_stats.primitive_count > 0 &&
+                    group_loose_stats.merged_spatial_primitive_groups == 0 &&
+                    group_loose_stats.merged_local_planar_primitives > 0,
+                "a loose error may merge adjacent surface faces but must not create a solid candidate");
+        require(readText(root / "spatial_group_loose" /
+                         "surface_merge_profile.json").find(
+                    "\"remaining_acceptable_candidates\":0") !=
+                    std::string::npos,
+                "adjacent surface merging must terminate at a verified fixed point");
+        require(readText(root / "spatial_group_loose" /
+                         "coverage_audit_pre_repair.json").find(
+                    "\"repair_face_count\":0") != std::string::npos,
+                "pre-canonicalization responsibility certificates must avoid safety repair");
+
+        // Geometric adjacency is edge-to-edge, not vertex-to-vertex. The
+        // vertical rectangle starts in the interior of the horizontal
+        // rectangle's boundary edge, so the pair forms a T junction without a
+        // shared OBJ vertex. A loose error limit must still give this adjacent
+        // pair a stage-3 merge attempt.
+        const auto t_junction = root / "surface_t_junction.obj";
+        writeText(t_junction,
+            "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 0 1 0\n"
+            "v 1 1 0\nv 1 2 0\nv 1 2 1\nv 1 1 1\n"
+            "f 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\n");
+        const auto t_junction_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                t_junction, root / "surface_t_junction", group_loose);
+        require(t_junction_stats.containment_validation_passed &&
+                    t_junction_stats.primitive_count == 1,
+                "a boundary-segment T junction must be treated as adjacent");
+        require(readText(root / "surface_t_junction" /
+                         "surface_merge_profile.json").find(
+                    "\"segment_contact_adjacencies\":1") !=
+                    std::string::npos,
+                "T-junction adjacency must come from segment contact");
 
         auto group_strict = group_loose;
         group_strict.maximum_open_error_distance = 0.0;
