@@ -1,0 +1,17 @@
+# File produced by CypWeld (https://www.fscut.com/)
+# (assimp v 1.0.0.0.0.0.0.0.0)
+# Vertices4
+# Faces2
+g mesh
+# 4 vertex positions
+v  -500000 -500000 -4201
+v  -500000 500000 -4201
+v  500000 -500000 -4201
+v  500000 500000 -4201
+# 4 vertex normals
+vn  0 0 1
+vn  0 0 1
+vn  0 0 1
+vn  0 0 1
+f  3//3 2//2 1//1 
+f  4//4 2//2 3//3 

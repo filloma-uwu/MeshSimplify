@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PQSS Proxy Inspector</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111315;
+      --panel: rgba(24, 27, 30, 0.96);
+      --line: #343a40;
+      --muted: #9ba3aa;
+      --text: #f2f4f5;
+      --original: #55a7e8;
+      --proxy: #f0a43b;
+      --good: #61c48b;
+      --danger: #e26d6d;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      letter-spacing: 0;
+    }
+    button, select, input { font: inherit; letter-spacing: 0; }
+    #viewport { position: fixed; inset: 0; }
+    #viewport canvas { display: block; width: 100%; height: 100%; }
+    #brand {
+      position: fixed;
+      top: 18px;
+      left: 22px;
+      z-index: 5;
+      pointer-events: none;
+    }
+    #brand strong { display: block; font-size: 16px; font-weight: 650; }
+    #brand span { color: var(--muted); font-size: 11px; }
+    #panel {
+      position: fixed;
+      z-index: 10;
+      top: 16px;
+      right: 16px;
+      width: 330px;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.32);
+    }
+    .panel-section { padding: 13px 14px; border-bottom: 1px solid var(--line); }
+    .panel-section:last-child { border-bottom: 0; }
+    .section-title {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    .model-row { display: grid; grid-template-columns: 32px 1fr 32px; gap: 7px; }
+    button, select {
+      min-height: 32px;
+      color: var(--text);
+      background: #202428;
+      border: 1px solid #3b4248;
+      border-radius: 4px;
+    }
+    button { cursor: pointer; }
+    button:hover { background: #292e33; border-color: #59636c; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--original);
+      outline-offset: 1px;
+    }
+    .icon-button { width: 32px; padding: 0; font-size: 20px; line-height: 1; }
+    select { width: 100%; padding: 0 9px; }
+    .segmented { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; }
+    .segmented button { padding: 0 5px; font-size: 12px; }
+    .segmented button.active {
+      color: #111315;
+      background: #d8dde1;
+      border-color: #d8dde1;
+      font-weight: 650;
+    }
+    .control-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; }
+    .control-row label { color: #c9ced2; }
+    .control-row input[type="range"] { width: 136px; accent-color: var(--proxy); }
+    .check { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+    .check input { accent-color: var(--original); }
+    .stats { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    .stats th, .stats td { padding: 5px 0; border-bottom: 1px solid #2d3236; text-align: right; }
+    .stats tr:last-child th, .stats tr:last-child td { border-bottom: 0; }
+    .stats th:first-child { text-align: left; color: var(--muted); font-weight: 500; }
+    .stats .original { color: var(--original); }
+    .stats .proxy { color: var(--proxy); }
+    #methods { color: #c8ced3; line-height: 1.5; overflow-wrap: anywhere; }
+    #status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--good);
+      font-weight: 600;
+    }
+    #status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    #status.fail { color: var(--danger); }
+    #labels {
+      position: fixed;
+      inset: 18px 360px auto 170px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      z-index: 4;
+      pointer-events: none;
+      text-align: center;
+      font-weight: 650;
+    }
+    #labels span { text-shadow: 0 1px 5px #000; }
+    #labelOriginal { color: var(--original); }
+    #labelProxy { color: var(--proxy); }
+    #loading {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: grid;
+      place-items: center;
+      background: rgba(17, 19, 21, 0.68);
+      color: #dfe4e7;
+      font-size: 14px;
+      pointer-events: none;
+    }
+    #loading.hidden { display: none; }
+    #error { color: var(--danger); line-height: 1.5; }
+    .toolbar { display: flex; gap: 6px; }
+    .toolbar button { width: 36px; padding: 0; font-size: 17px; }
+    @media (max-width: 720px) {
+      #brand { top: 12px; left: 14px; }
+      #brand span { display: none; }
+      #panel {
+        top: auto;
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        width: auto;
+        max-height: 45vh;
+      }
+      #labels { inset: 52px 8px auto 8px; }
+      .panel-section { padding: 10px 12px; }
+    }
+  </style>
+  <script type="importmap">
+    { "imports": { "three": "./lib/three.module.js" } }
+  </script>
+</head>
+<body>
+  <div id="viewport"></div>
+  <div id="brand"><strong>PQSS Proxy Inspector</strong><span>ConservativeOuter · Optimized BVH</span></div>
+  <div id="labels"><span id="labelOriginal">原始模型</span><span id="labelProxy">简化模型</span></div>
+  <aside id="panel">
+    <section class="panel-section">
+      <div class="section-title">模型</div>
+      <div class="model-row">
+        <button id="previous" class="icon-button" title="上一个模型" aria-label="上一个模型">‹</button>
+        <select id="modelSelect" aria-label="模型编号"></select>
+        <button id="next" class="icon-button" title="下一个模型" aria-label="下一个模型">›</button>
+      </div>
+    </section>
+    <section class="panel-section">
+      <div class="section-title">视图</div>
+      <div class="segmented" id="modeControl">
+        <button data-mode="split" class="active">并排</button>
+        <button data-mode="overlay">叠加</button>
+        <button data-mode="original">原始</button>
+        <button data-mode="proxy">简化</button>
+      </div>
+      <div class="control-row">
+        <label for="opacity">叠加透明度</label>
+        <input id="opacity" type="range" min="0.08" max="0.85" value="0.34" step="0.01">
+      </div>
+      <div class="control-row">
+        <label class="check"><input id="wireframe" type="checkbox"> 线框</label>
+        <div class="toolbar">
+          <button id="axes" title="显示坐标轴" aria-label="显示坐标轴">⊥</button>
+          <button id="fit" title="居中显示" aria-label="居中显示">⌖</button>
+        </div>
+      </div>
+    </section>
+    <section class="panel-section">
+      <div class="section-title">模型数据</div>
+      <table class="stats">
+        <thead><tr><th></th><th class="original">原始</th><th class="proxy">简化</th></tr></thead>
+        <tbody>
+          <tr><th>输入三角形</th><td id="sourceFaces">-</td><td id="proxyFaces">-</td></tr>
+          <tr><th>PQSS 三角形</th><td id="originalBuilt">-</td><td id="proxyBuilt">-</td></tr>
+          <tr><th>BV 节点</th><td id="originalBv">-</td><td id="proxyBv">-</td></tr>
+          <tr><th>最大深度</th><td id="originalDepth">-</td><td id="proxyDepth">-</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <section class="panel-section">
+      <div class="section-title">代理构成</div>
+      <div id="methods">-</div>
+      <div class="control-row"><span>面数缩减</span><strong id="reduction">-</strong></div>
+      <div class="control-row"><span id="status">深度通过</span><span id="depthLimit">≤ 8</span></div>
+    </section>
+    <section class="panel-section" id="errorSection" hidden><div id="error"></div></section>
+  </aside>
+  <div id="loading">正在加载模型…</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from './lib/OrbitControls.js';
+
+    const viewport = document.getElementById('viewport');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111315);
+    const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.01, 1e9);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    viewport.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.zoomToCursor = true;
+    controls.screenSpacePanning = true;
+
+    scene.add(new THREE.HemisphereLight(0xdfefff, 0x2b2420, 2.1));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.8);
+    keyLight.position.set(1, 1.4, 1.7);
+    scene.add(keyLight);
+    const rimLight = new THREE.DirectionalLight(0x7bbcff, 1.2);
+    rimLight.position.set(-1.4, 0.3, -1);
+    scene.add(rimLight);
+
+    const content = new THREE.Group();
+    const originalRoot = new THREE.Group();
+    const proxyRoot = new THREE.Group();
+    content.add(originalRoot, proxyRoot);
+    scene.add(content);
+    const axesHelper = new THREE.AxesHelper(1);
+    axesHelper.visible = false;
+    scene.add(axesHelper);
+
+    const originalMaterial = new THREE.MeshStandardMaterial({
+      color: 0x55a7e8, roughness: 0.58, metalness: 0.08, side: THREE.DoubleSide, flatShading: true
+    });
+    const proxyMaterial = new THREE.MeshStandardMaterial({
+      color: 0xf0a43b, roughness: 0.52, metalness: 0.1, side: THREE.DoubleSide, flatShading: true
+    });
+
+    const state = { metadata: null, index: 0, mode: 'split', diameter: 1, center: new THREE.Vector3() };
+    const geometryCache = new Map();
+
+    function parseObj(text) {
+      const vertices = [];
+      const indices = [];
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const fields = line.split(/\s+/);
+        if (fields[0] === 'v' && fields.length >= 4) {
+          vertices.push(Number(fields[1]), Number(fields[2]), Number(fields[3]));
+        } else if (fields[0] === 'f' && fields.length >= 4) {
+          const polygon = fields.slice(1).map(token => {
+            const value = Number(token.split('/')[0]);
+            return value > 0 ? value - 1 : vertices.length / 3 + value;
+          });
+          for (let index = 1; index + 1 < polygon.length; index++) {
+            indices.push(polygon[0], polygon[index], polygon[index + 1]);
+          }
+        }
+      }
+      if (!vertices.length || !indices.length) throw new Error('OBJ 中没有可显示的三角形');
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+      geometry.setIndex(indices);
+      geometry.computeBoundingBox();
+      geometry.computeBoundingSphere();
+      return geometry;
+    }
+
+    async function loadGeometry(url) {
+      if (!geometryCache.has(url)) {
+        geometryCache.set(url, fetch(url, { cache: 'no-store' }).then(response => {
+          if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+          return response.text();
+        }).then(parseObj));
+      }
+      return geometryCache.get(url);
+    }
+
+    function replaceMesh(root, geometry, material) {
+      root.clear();
+      const mesh = new THREE.Mesh(geometry, material);
+      root.add(mesh);
+    }
+
+    function visibleBounds() {
+      content.updateMatrixWorld(true);
+      const box = new THREE.Box3();
+      if (originalRoot.visible) box.expandByObject(originalRoot);
+      if (proxyRoot.visible) box.expandByObject(proxyRoot);
+      return box;
+    }
+
+    function fitView() {
+      const box = visibleBounds();
+      if (box.isEmpty()) return;
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const distance = sphere.radius / Math.sin(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 1.22;
+      controls.target.copy(sphere.center);
+      camera.position.copy(sphere.center).addScaledVector(new THREE.Vector3(1, 0.72, 1).normalize(), distance);
+      camera.near = Math.max(distance / 10000, 1e-5);
+      camera.far = Math.max(distance * 100, 100);
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+
+    function applyMode(shouldFit = false) {
+      const separation = state.diameter * 1.25;
+      const centered = state.center.clone().multiplyScalar(-1);
+      originalRoot.visible = state.mode !== 'proxy';
+      proxyRoot.visible = state.mode !== 'original';
+      originalRoot.position.copy(centered);
+      proxyRoot.position.copy(centered);
+      if (state.mode === 'split') {
+        originalRoot.position.x -= separation * 0.5;
+        proxyRoot.position.x += separation * 0.5;
+      }
+
+      const overlay = state.mode === 'overlay';
+      const opacity = Number(document.getElementById('opacity').value);
+      const wireframe = document.getElementById('wireframe').checked;
+      originalMaterial.transparent = overlay;
+      originalMaterial.opacity = overlay ? opacity : 1;
+      originalMaterial.depthWrite = !overlay;
+      originalMaterial.wireframe = wireframe || overlay;
+      proxyMaterial.transparent = overlay;
+      proxyMaterial.opacity = overlay ? 0.78 : 1;
+      proxyMaterial.depthWrite = !overlay;
+      proxyMaterial.wireframe = wireframe;
+      originalMaterial.needsUpdate = true;
+      proxyMaterial.needsUpdate = true;
+
+      const labels = document.getElementById('labels');
+      labels.style.display = state.mode === 'split' ? 'grid' : 'none';
+      document.querySelectorAll('#modeControl button').forEach(button => {
+        button.classList.toggle('active', button.dataset.mode === state.mode);
+      });
+      if (shouldFit) fitView();
+    }
+
+    const integer = value => Number(value).toLocaleString('zh-CN');
+    function showStats(model) {
+      const generation = model.generation;
+      const bvh = model.bvh;
+      document.getElementById('sourceFaces').textContent = integer(generation.source_faces);
+      document.getElementById('proxyFaces').textContent = integer(generation.proxy_faces);
+      document.getElementById('originalBuilt').textContent = integer(bvh.original_built_triangles);
+      document.getElementById('proxyBuilt').textContent = integer(bvh.proxy_built_triangles);
+      document.getElementById('originalBv').textContent = integer(bvh.original_bv_count);
+      document.getElementById('proxyBv').textContent = integer(bvh.proxy_bv_count);
+      document.getElementById('originalDepth').textContent = integer(bvh.original_max_depth);
+      document.getElementById('proxyDepth').textContent = integer(bvh.proxy_max_depth);
+      document.getElementById('reduction').textContent =
+        `${((1 - generation.proxy_faces / generation.source_faces) * 100).toFixed(2)}%`;
+      const names = { exact_passthrough: '原样保留', obb: 'OBB', prism_4: '四棱柱', prism_6: '六棱柱', prism_8: '八棱柱', local_hull: '局部凸包' };
+      document.getElementById('methods').textContent = Object.entries(generation.methods)
+        .map(([name, count]) => `${names[name] || name} × ${count}`).join(' · ');
+      const passed = Number(bvh.proxy_max_depth) <= state.metadata.requestedMaxDepth;
+      const status = document.getElementById('status');
+      status.textContent = passed ? '深度通过' : '深度超限';
+      status.classList.toggle('fail', !passed);
+      document.getElementById('depthLimit').textContent =
+        `${bvh.proxy_max_depth} / ${state.metadata.requestedMaxDepth}`;
+    }
+
+    function showError(message = '') {
+      const section = document.getElementById('errorSection');
+      section.hidden = !message;
+      document.getElementById('error').textContent = message;
+    }
+
+    async function loadModel(index) {
+      state.index = (index + state.metadata.models.length) % state.metadata.models.length;
+      const model = state.metadata.models[state.index];
+      document.getElementById('modelSelect').value = String(model.id);
+      document.getElementById('loading').classList.remove('hidden');
+      showError();
+      try {
+        const [originalGeometry, proxyGeometry] = await Promise.all([
+          loadGeometry(model.originalUrl), loadGeometry(model.proxyUrl)
+        ]);
+        replaceMesh(originalRoot, originalGeometry, originalMaterial);
+        replaceMesh(proxyRoot, proxyGeometry, proxyMaterial);
+        const box = originalGeometry.boundingBox;
+        state.center = box.getCenter(new THREE.Vector3());
+        state.diameter = Math.max(box.getSize(new THREE.Vector3()).length(), 1e-6);
+        axesHelper.scale.setScalar(state.diameter * 0.18);
+        axesHelper.position.set(0, 0, 0);
+        showStats(model);
+        applyMode(true);
+        const query = new URL(location.href);
+        query.searchParams.set('model', String(model.id));
+        history.replaceState(null, '', query);
+      } catch (error) {
+        showError(error.message);
+      } finally {
+        document.getElementById('loading').classList.add('hidden');
+      }
+    }
+
+    document.getElementById('previous').addEventListener('click', () => loadModel(state.index - 1));
+    document.getElementById('next').addEventListener('click', () => loadModel(state.index + 1));
+    document.getElementById('modelSelect').addEventListener('change', event => {
+      const index = state.metadata.models.findIndex(model => model.id === Number(event.target.value));
+      if (index >= 0) loadModel(index);
+    });
+    document.getElementById('modeControl').addEventListener('click', event => {
+      if (!event.target.dataset.mode) return;
+      state.mode = event.target.dataset.mode;
+      applyMode(true);
+    });
+    document.getElementById('opacity').addEventListener('input', () => applyMode());
+    document.getElementById('wireframe').addEventListener('change', () => applyMode());
+    document.getElementById('fit').addEventListener('click', fitView);
+    document.getElementById('axes').addEventListener('click', event => {
+      axesHelper.visible = !axesHelper.visible;
+      event.currentTarget.classList.toggle('active', axesHelper.visible);
+    });
+    addEventListener('keydown', event => {
+      if (event.key === 'ArrowLeft') loadModel(state.index - 1);
+      if (event.key === 'ArrowRight') loadModel(state.index + 1);
+    });
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    animate();
+
+    function pixelSample() {
+      const gl = renderer.getContext();
+      const width = gl.drawingBufferWidth;
+      const height = gl.drawingBufferHeight;
+      const pixels = new Uint8Array(width * height * 4);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      const colors = new Set();
+      let sampled = 0;
+      for (let y = 0; y < height; y += 6) {
+        for (let x = 0; x < width; x += 6) {
+          const offset = (y * width + x) * 4;
+          colors.add(`${pixels[offset] >> 3},${pixels[offset + 1] >> 3},${pixels[offset + 2] >> 3}`);
+          sampled++;
+        }
+      }
+      return { uniqueColors: colors.size, samples: sampled };
+    }
+    window.__viewerPixelSample = pixelSample;
+
+    window.__viewerDiagnostics = () => ({
+      model: state.metadata?.models[state.index]?.id ?? null,
+      mode: state.mode,
+      originalVisible: originalRoot.visible,
+      proxyVisible: proxyRoot.visible,
+      renderTriangles: renderer.info.render.triangles,
+      drawCalls: renderer.info.render.calls,
+      canvas: [renderer.domElement.width, renderer.domElement.height],
+      cameraDistance: camera.position.distanceTo(controls.target)
+    });
+
+    try {
+      const response = await fetch('/api/models', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`模型元数据加载失败：HTTP ${response.status}`);
+      state.metadata = await response.json();
+      const select = document.getElementById('modelSelect');
+      for (const model of state.metadata.models) {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = `${model.id}.obj`;
+        select.appendChild(option);
+      }
+      const requested = Number(new URLSearchParams(location.search).get('model'));
+      const initial = Math.max(0, state.metadata.models.findIndex(model => model.id === requested));
+      await loadModel(initial);
+    } catch (error) {
+      showError(error.message);
+      document.getElementById('loading').classList.add('hidden');
+    }
+  </script>
+</body>
+</html>

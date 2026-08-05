@@ -1,0 +1,21 @@
+/build/
+/out/
+/.cache/
+.vs/
+.vscode/
+*.user
+__pycache__/
+*.pyc
+node_modules/
+
+# Generated analysis and benchmark artifacts
+/outputs/
+/build-profile/
+/test-results/
+/viewer/screenshots/
+/reports/profiles/
+/*.log
+/stage*.obj
+
+# Local real-scene query corpus (127 MB, reproducible from PQSS assets)
+/test_data/real_scene/official_simplified_scope/collision_pairs.txt

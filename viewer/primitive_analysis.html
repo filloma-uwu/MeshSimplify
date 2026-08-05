@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PQSS 代理 Mesh</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #121518;
+      --panel: rgba(24, 28, 32, 0.96);
+      --line: #3a4248;
+      --muted: #a8b0b6;
+      --text: #f4f6f7;
+      --accent: #49b894;
+      --warning: #f0b45a;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, select, input { font: inherit; }
+    button, select {
+      min-height: 32px;
+      color: var(--text);
+      background: #272d31;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+    }
+    button { cursor: pointer; padding: 5px 10px; }
+    button:hover { border-color: #6d787f; background: #30373c; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+    button:disabled { opacity: 0.38; cursor: default; }
+    #viewport { position: fixed; inset: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #topbar {
+      position: fixed;
+      z-index: 5;
+      top: 0;
+      left: 0;
+      right: 0;
+      min-height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(17, 20, 23, 0.95);
+      backdrop-filter: blur(8px);
+    }
+    .brand { font-size: 15px; font-weight: 700; white-space: nowrap; }
+    .model-nav { display: flex; align-items: center; gap: 6px; }
+    .icon-button {
+      width: 32px;
+      padding: 0;
+      font-size: 17px;
+      line-height: 1;
+    }
+    #modelSelect { width: 150px; padding: 4px 28px 4px 8px; }
+    .modes {
+      display: flex;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .modes button {
+      min-height: 30px;
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      white-space: nowrap;
+    }
+    .modes button:last-child { border-right: 0; }
+    .modes button.active { color: #07140f; background: var(--accent); }
+    #fitButton { margin-left: auto; }
+    #panel {
+      position: fixed;
+      z-index: 4;
+      top: 64px;
+      right: 12px;
+      width: min(300px, calc(100vw - 24px));
+      max-height: calc(100vh - 78px);
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+    }
+    .section { padding: 0 0 13px; margin: 0 0 13px; border-bottom: 1px solid var(--line); }
+    .section:last-child { padding: 0; margin: 0; border-bottom: 0; }
+    .section-title {
+      margin: 0 0 9px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .check-row { display: flex; gap: 14px; flex-wrap: wrap; }
+    label { color: var(--muted); }
+    label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
+    input[type="checkbox"] { accent-color: var(--accent); }
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .primitive-navigation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 8px; }
+    #primitiveSelect { width: 100%; min-width: 0; padding: 4px 8px; }
+    #nextPrimitiveButton { white-space: nowrap; }
+    .regenerate-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+    #maximumErrorInput {
+      width: 100%; min-width: 0; min-height: 32px; padding: 5px 8px;
+      color: var(--text); background: #202529; border: 1px solid var(--line);
+      border-radius: 4px; font-variant-numeric: tabular-nums;
+    }
+    #regenerateStatus { min-height: 18px; margin-top: 6px; color: var(--muted); }
+    .range-head { display: flex; justify-content: space-between; margin-bottom: 3px; }
+    #stats { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; }
+    #stats dt { margin: 0; color: var(--muted); }
+    #stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .valid { color: var(--accent); }
+    .invalid { color: var(--warning); }
+    #legend { display: grid; grid-template-columns: 12px 1fr auto; gap: 7px 8px; align-items: center; }
+    .swatch { width: 12px; height: 12px; border-radius: 2px; }
+    .legend-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+    #labels {
+      position: fixed;
+      z-index: 3;
+      left: 14px;
+      bottom: 12px;
+      display: none;
+      width: calc(100vw - 340px);
+      pointer-events: none;
+      color: #dce1e4;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    #labels.visible { display: flex; }
+    #labels span { width: 50%; text-align: center; }
+    #loading {
+      position: fixed;
+      z-index: 10;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: rgba(12, 14, 16, 0.78);
+      font-size: 14px;
+    }
+    #loading.hidden { display: none; }
+    #error { color: #ff9188; max-width: 560px; padding: 20px; white-space: pre-wrap; }
+    @media (max-width: 850px) {
+      #topbar { flex-wrap: wrap; padding: 7px 8px; }
+      .brand { width: calc(100% - 42px); }
+      #fitButton { position: absolute; right: 8px; top: 7px; }
+      .model-nav { width: 100%; }
+      #modelSelect { flex: 1; min-width: 0; }
+      .modes { width: 100%; overflow-x: auto; }
+      .modes button { flex: 1 0 auto; }
+      #panel {
+        top: auto;
+        bottom: 8px;
+        left: 8px;
+        right: 8px;
+        width: auto;
+        max-height: min(42vh, 340px);
+        padding: 11px;
+      }
+      #labels { left: 8px; bottom: calc(min(42vh, 340px) + 18px); width: calc(100vw - 16px); }
+    }
+  </style>
+</head>
+<body>
+  <div id="viewport"></div>
+  <header id="topbar">
+    <div class="brand">代理 Mesh</div>
+    <div class="model-nav">
+      <button id="previousButton" class="icon-button" title="上一个模型" aria-label="上一个模型">&larr;</button>
+      <select id="modelSelect" aria-label="模型"></select>
+      <button id="nextButton" class="icon-button" title="下一个模型" aria-label="下一个模型">&rarr;</button>
+    </div>
+    <div class="modes" aria-label="查看模式">
+      <button data-mode="source">原模型</button>
+      <button data-mode="primitives">图元分析</button>
+      <button data-mode="triangulated">三角化结果</button>
+      <button data-mode="overlay">叠加</button>
+      <button data-mode="error">误差位置</button>
+      <button data-mode="split" class="active">两阶段对比</button>
+    </div>
+    <button id="fitButton" title="使模型适应当前视图">适应视图</button>
+  </header>
+
+  <aside id="panel">
+    <section class="section">
+      <h2 class="section-title">图元类型</h2>
+      <div class="check-row">
+        <label class="check"><input type="checkbox" data-type="polygon" checked>多边形</label>
+        <label class="check"><input type="checkbox" data-type="disk" checked>圆盘</label>
+        <label class="check"><input type="checkbox" data-type="annulus" checked>圆环面</label>
+        <label class="check"><input type="checkbox" data-type="cylindricalband" checked>圆柱面</label>
+        <label class="check"><input type="checkbox" data-type="conicalband" checked>圆锥面</label>
+      </div>
+      <div class="primitive-navigation">
+        <select id="primitiveSelect" aria-label="选中的代理部件"><option value="all">全部代理部件</option></select>
+        <button id="nextPrimitiveButton" type="button" title="前往下一个图元">下一个图元 →</button>
+      </div>
+    </section>
+    <section class="section">
+      <div class="range-head"><label for="opacity">结果不透明度</label><output id="opacityValue">100%</output></div>
+      <input id="opacity" type="range" min="10" max="100" value="100">
+      <div class="range-head" style="margin-top:10px"><label for="otherOpacity">其他图元不透明度</label><output id="otherOpacityValue">15%</output></div>
+      <input id="otherOpacity" type="range" min="0" max="100" value="15">
+      <label class="check" style="margin-top:8px"><input id="wireframe" type="checkbox">线框</label>
+    </section>
+    <section class="section">
+      <h2 class="section-title">最大误差约束</h2>
+      <label for="maximumErrorInput">模型单位</label>
+      <div class="regenerate-row">
+        <input id="maximumErrorInput" type="number" min="0" step="any" inputmode="decimal" aria-label="最大误差">
+        <button id="regenerateButton" type="button">重新生成</button>
+      </div>
+      <div id="regenerateStatus"></div>
+    </section>
+    <section class="section">
+      <h2 class="section-title">模型统计</h2>
+      <dl id="stats"></dl>
+    </section>
+    <section id="errorSection" class="section" hidden>
+      <h2 class="section-title">开放区域误差</h2>
+      <div id="legend">
+        <span class="swatch" style="background:#ef5b43"></span><span>代理新增的开放区域</span><span></span>
+        <span class="swatch" style="background:#ffb33c"></span><span>最大误差代理点</span><span></span>
+        <span class="swatch" style="background:#43d6db"></span><span>最近原始表面点</span><span></span>
+      </div>
+      <label class="check" style="margin-top:10px"><input id="showErrorRegion" type="checkbox" checked>显示开放区域</label>
+      <button id="focusErrorButton" type="button" style="width:100%;margin-top:10px">定位最大误差</button>
+    </section>
+    <section class="section">
+      <h2 class="section-title">选中的代理部件</h2>
+      <dl id="primitiveStats"></dl>
+    </section>
+  </aside>
+
+  <div id="labels"><span>原模型</span><span>三角化结果</span></div>
+  <div id="loading"><div id="loadingText">正在加载分析结果...</div></div>
+
+  <script type="importmap">
+    { "imports": { "three": "./lib/three.module.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from './lib/three.module.js';
+    import { OrbitControls } from './lib/OrbitControls.js';
+
+    const params = new URLSearchParams(location.search);
+    const manifestUrl = new URL(params.get('manifest') || '/outputs/surface_primitives_v190_uniform_final/viewer_manifest.json', location.href);
+    const viewport = document.querySelector('#viewport');
+    const loading = document.querySelector('#loading');
+    const loadingText = document.querySelector('#loadingText');
+    const modelSelect = document.querySelector('#modelSelect');
+    const primitiveSelect = document.querySelector('#primitiveSelect');
+    const statsElement = document.querySelector('#stats');
+    const primitiveStatsElement = document.querySelector('#primitiveStats');
+    const maximumErrorInput = document.querySelector('#maximumErrorInput');
+    const regenerateButton = document.querySelector('#regenerateButton');
+    const regenerateStatus = document.querySelector('#regenerateStatus');
+    const labels = document.querySelector('#labels');
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x121518, 1);
+    viewport.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 1e12);
+    camera.up.set(0, 0, 1);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = true;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x293138, 1.45));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    keyLight.position.set(2, -3, 5);
+    scene.add(keyLight);
+
+    const roots = {
+      source: new THREE.Group(),
+      primitives: new THREE.Group(),
+      triangulated: new THREE.Group(),
+      error: new THREE.Group(),
+    };
+    Object.values(roots).forEach(root => scene.add(root));
+
+    let manifest;
+    let metadata;
+    let currentModel;
+    let mode = 'split';
+    let selectedPrimitive = 'all';
+    let fitPending = true;
+    let loadGeneration = 0;
+    let openError = null;
+    const batchedPrimitiveData = {
+      primitives: new Map(),
+      triangulated: new Map(),
+    };
+    const primitiveTypes = ['polygon', 'disk', 'annulus', 'cylindricalband', 'conicalband'];
+    const primitiveTypeNames = {
+      polygon: '平面多边形', disk: '圆盘', annulus: '圆环面',
+      cylindricalband: '圆柱面', conicalband: '圆锥面',
+    };
+    const enabledTypes = new Set(primitiveTypes);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    const palette = [
+      0x49b894, 0xe4aa55, 0x5fa8d3, 0xe46f61, 0xa48ad4, 0x8fc66b,
+      0xd47ba8, 0x5bc2c8, 0xd4cc66, 0x7897e0, 0xec8f4d, 0x70c08b,
+    ];
+
+    function colorFor(id) {
+      const base = new THREE.Color(palette[id % palette.length]);
+      const cycle = Math.floor(id / palette.length) % 3;
+      if (cycle === 1) base.offsetHSL(0.025, -0.05, -0.08);
+      if (cycle === 2) base.offsetHSL(-0.025, 0.02, 0.08);
+      return base;
+    }
+
+    function attachTriangleWireframe(mesh) {
+      const geometry = new THREE.WireframeGeometry(mesh.geometry);
+      const material = new THREE.LineBasicMaterial({
+        color: 0x172126, transparent: true, opacity: 0.82,
+        depthTest: true, depthWrite: false,
+      });
+      const wireframe = new THREE.LineSegments(geometry, material);
+      wireframe.userData.triangleWireframe = true;
+      wireframe.renderOrder = 2;
+      mesh.add(wireframe);
+    }
+
+    function addOpenErrorVisualization(data) {
+      openError = data;
+      if (!data) return;
+      const boundary = data.boundary_points || [];
+      const pair = data.maximum_pair;
+      const modelBox = new THREE.Box3();
+      modelBox.expandByObject(roots.source);
+      modelBox.expandByObject(roots.triangulated);
+      const modelScale = Math.max(modelBox.getSize(new THREE.Vector3()).length(), 1e-6);
+      if (boundary.length) {
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(boundary.flat(), 3));
+        const material = new THREE.PointsMaterial({
+          color: 0xef5b43, size: modelScale * 0.002, sizeAttenuation: true,
+          transparent: true, opacity: 0.34, depthWrite: false,
+        });
+        const points = new THREE.Points(geometry, material);
+        points.name = 'open_error_boundary';
+        points.renderOrder = 5;
+        roots.error.add(points);
+      }
+      if (!pair || !(Number(pair.distance) > 0) ||
+          !Array.isArray(pair.proxy) || !Array.isArray(pair.source)) return;
+      const positions = [...pair.proxy, ...pair.source];
+      const lineGeometry = new THREE.BufferGeometry();
+      lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      const line = new THREE.Line(lineGeometry, new THREE.LineBasicMaterial({
+        color: 0xffe26a, depthTest: false, depthWrite: false,
+      }));
+      line.name = 'maximum_error_segment';
+      line.renderOrder = 8;
+      roots.error.add(line);
+      const radius = Math.max(modelScale * 0.0015, Number(pair.distance || 0) * 0.025, 1e-7);
+      const sphereGeometry = new THREE.SphereGeometry(radius, 18, 12);
+      for (const [role, point, color] of [
+        ['maximum_proxy_point', pair.proxy, 0xffb33c],
+        ['maximum_source_point', pair.source, 0x43d6db],
+      ]) {
+        const marker = new THREE.Mesh(sphereGeometry.clone(), new THREE.MeshBasicMaterial({
+          color, depthTest: false, depthWrite: false,
+        }));
+        marker.position.fromArray(point);
+        marker.name = role;
+        marker.renderOrder = 9;
+        roots.error.add(marker);
+      }
+    }
+
+    async function fetchText(url) {
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${url}`);
+      return response.text();
+    }
+
+    async function fetchJson(url) {
+      return JSON.parse(await fetchText(url));
+    }
+
+    function identityFromGroup(name) {
+      const match = /^(?:region|primitive)_(\d+)_([a-z]+)$/.exec(name);
+      return match ? { id: Number(match[1]), type: match[2] } : { id: null, type: null };
+    }
+
+    function parseOBJ(text, role) {
+      const positions = [];
+      const groups = [];
+      let current = { name: role, indices: [] };
+      groups.push(current);
+      for (const raw of text.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        const fields = line.split(/\s+/);
+        if (fields[0] === 'v' && fields.length >= 4) {
+          positions.push(Number(fields[1]), Number(fields[2]), Number(fields[3]));
+        } else if ((fields[0] === 'g' || fields[0] === 'o') && fields[1]) {
+          if (current.indices.length === 0 && current.name === role) current.name = fields[1];
+          else {
+            current = { name: fields[1], indices: [] };
+            groups.push(current);
+          }
+        } else if (fields[0] === 'f' && fields.length >= 4) {
+          const count = positions.length / 3;
+          const polygon = fields.slice(1).map(token => {
+            const rawIndex = Number(token.split('/')[0]);
+            return rawIndex > 0 ? rawIndex - 1 : count + rawIndex;
+          });
+          const triangles = triangulateObjFace(polygon, positions);
+          triangles.forEach(triangle => current.indices.push(...triangle));
+        }
+      }
+      const populated = groups.filter(group => group.indices.length);
+      if ((role === 'primitives' || role === 'triangulated') && populated.length > 2000) {
+        batchedPrimitiveData[role].clear();
+        const buckets = new Map();
+        for (const group of populated) {
+          const identity = identityFromGroup(group.name);
+          const key = identity.type || 'unknown';
+          if (!buckets.has(key)) buckets.set(key, { positions: [], colors: [], primitiveIds: [] });
+          const bucket = buckets.get(key);
+          const color = colorFor(identity.id || 0);
+          const primitivePositions = [];
+          for (const sourceIndex of group.indices) {
+            const triangleVertex = [
+              positions[3 * sourceIndex], positions[3 * sourceIndex + 1], positions[3 * sourceIndex + 2],
+            ];
+            bucket.positions.push(...triangleVertex);
+            bucket.colors.push(color.r, color.g, color.b);
+            bucket.primitiveIds.push(identity.id ?? -1);
+            primitivePositions.push(...triangleVertex);
+          }
+          if (identity.id !== null) batchedPrimitiveData[role].set(identity.id, {
+            type: identity.type, positions: primitivePositions,
+          });
+        }
+        return [...buckets.entries()].map(([type, bucket]) => {
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.Float32BufferAttribute(bucket.positions, 3));
+          geometry.setAttribute('color', new THREE.Float32BufferAttribute(bucket.colors, 3));
+          geometry.setAttribute('primitiveId', new THREE.Float32BufferAttribute(bucket.primitiveIds, 1));
+          geometry.computeVertexNormals();
+          geometry.computeBoundingBox();
+          geometry.computeBoundingSphere();
+          const material = new THREE.MeshStandardMaterial({
+            vertexColors: true, roughness: 0.66, metalness: 0.04,
+            transparent: role === 'primitives',
+            opacity: role === 'primitives' ? 0.65 : 1,
+            depthWrite: role !== 'primitives', side: THREE.DoubleSide,
+          });
+          const mesh = new THREE.Mesh(geometry, material);
+          if (role === 'triangulated') attachTriangleWireframe(mesh);
+          mesh.name = `batched_${type}`;
+          mesh.userData = {
+            role, primitiveId: null, primitiveType: type, batched: true,
+          };
+          return mesh;
+        });
+      }
+      if (batchedPrimitiveData[role]) batchedPrimitiveData[role].clear();
+      return populated.map(group => {
+        const remap = new Map();
+        const localPositions = [];
+        const localIndices = [];
+        for (const sourceIndex of group.indices) {
+          let localIndex = remap.get(sourceIndex);
+          if (localIndex === undefined) {
+            localIndex = remap.size;
+            remap.set(sourceIndex, localIndex);
+            localPositions.push(
+              positions[3 * sourceIndex],
+              positions[3 * sourceIndex + 1],
+              positions[3 * sourceIndex + 2],
+            );
+          }
+          localIndices.push(localIndex);
+        }
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(localPositions, 3));
+        geometry.setIndex(localIndices);
+        geometry.computeVertexNormals();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+        const identity = identityFromGroup(group.name);
+        let material;
+        if (role === 'source') {
+          material = new THREE.MeshStandardMaterial({ color: 0xb7bec2, roughness: 0.78, metalness: 0.02, side: THREE.DoubleSide });
+        } else {
+          material = new THREE.MeshStandardMaterial({
+            color: colorFor(identity.id || 0),
+            roughness: 0.66,
+            metalness: 0.04,
+          transparent: role === 'primitives',
+          opacity: role === 'primitives' ? 0.65 : 1,
+          depthWrite: role !== 'primitives',
+            side: THREE.DoubleSide,
+          });
+        }
+        const mesh = new THREE.Mesh(geometry, material);
+        if (role === 'triangulated') {
+          attachTriangleWireframe(mesh);
+        }
+        mesh.name = group.name;
+        mesh.userData = { role, primitiveId: identity.id, primitiveType: identity.type };
+        return mesh;
+      });
+    }
+
+    function triangulateObjFace(polygon, positions) {
+      if (polygon.length === 3) return [[polygon[0], polygon[1], polygon[2]]];
+      const point = index => new THREE.Vector3(
+        positions[3 * index], positions[3 * index + 1], positions[3 * index + 2],
+      );
+      const normal = new THREE.Vector3();
+      for (let index = 0; index < polygon.length; index++) {
+        const current = point(polygon[index]);
+        const next = point(polygon[(index + 1) % polygon.length]);
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+      }
+      const droppedAxis = Math.abs(normal.x) >= Math.abs(normal.y) && Math.abs(normal.x) >= Math.abs(normal.z)
+        ? 0 : (Math.abs(normal.y) >= Math.abs(normal.z) ? 1 : 2);
+      const projected = polygon.map(index => {
+        const p = point(index);
+        return droppedAxis === 0 ? [p.y, p.z] : (droppedAxis === 1 ? [p.x, p.z] : [p.x, p.y]);
+      });
+      const cross = (a, b, c) => (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+      const signedArea = projected.reduce((sum, p, index) => {
+        const q = projected[(index + 1) % projected.length];
+        return sum + p[0] * q[1] - q[0] * p[1];
+      }, 0);
+      const inside = (p, a, b, c) => {
+        const first = cross(a, b, p), second = cross(b, c, p), third = cross(c, a, p);
+        return (first >= -1e-12 && second >= -1e-12 && third >= -1e-12)
+          || (first <= 1e-12 && second <= 1e-12 && third <= 1e-12);
+      };
+      const remaining = polygon.map((_, index) => index);
+      const result = [];
+      while (remaining.length > 3) {
+        let clipped = false;
+        for (let offset = 0; offset < remaining.length; offset++) {
+          const previous = remaining[(offset + remaining.length - 1) % remaining.length];
+          const current = remaining[offset];
+          const next = remaining[(offset + 1) % remaining.length];
+          const turn = cross(projected[previous], projected[current], projected[next]);
+          if ((signedArea > 0 && turn <= 1e-12) || (signedArea < 0 && turn >= -1e-12)) continue;
+          if (remaining.some(candidate => candidate !== previous && candidate !== current
+            && candidate !== next && inside(projected[candidate], projected[previous],
+              projected[current], projected[next]))) continue;
+          result.push([polygon[previous], polygon[current], polygon[next]]);
+          remaining.splice(offset, 1);
+          clipped = true;
+          break;
+        }
+        if (!clipped) throw new Error('图元 OBJ 包含无法三角化的多边形');
+      }
+      result.push(remaining.map(index => polygon[index]));
+      return result;
+    }
+
+    function disposeRoot(root) {
+      for (const child of [...root.children]) {
+        root.remove(child);
+        child.traverse(object => {
+          object.geometry?.dispose();
+          object.material?.dispose();
+        });
+      }
+      root.position.set(0, 0, 0);
+    }
+
+    function addMeshes(root, meshes) { meshes.forEach(mesh => root.add(mesh)); }
+
+    function removeSelectionOverlays(root) {
+      for (const child of [...root.children]) {
+        if (!child.userData.selectionOverlay) continue;
+        root.remove(child);
+        child.traverse(object => {
+          object.geometry?.dispose();
+          object.material?.dispose();
+        });
+      }
+    }
+
+    function createSelectionOverlay(role, primitiveId) {
+      const data = batchedPrimitiveData[role].get(Number(primitiveId));
+      if (!data) return null;
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.positions, 3));
+      geometry.computeVertexNormals();
+      geometry.computeBoundingBox();
+      geometry.computeBoundingSphere();
+      const material = new THREE.MeshStandardMaterial({
+        color: colorFor(Number(primitiveId)), roughness: 0.66, metalness: 0.04,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.name = `selected_${primitiveId}_${data.type}`;
+      mesh.userData = {
+        role, primitiveId: Number(primitiveId), primitiveType: data.type,
+        selectionOverlay: true,
+      };
+      if (role === 'triangulated') attachTriangleWireframe(mesh);
+      return mesh;
+    }
+
+    function syncSelectionOverlays() {
+      for (const role of ['primitives', 'triangulated']) {
+        const root = roots[role];
+        removeSelectionOverlays(root);
+        if (selectedPrimitive === 'all') continue;
+        const overlay = createSelectionOverlay(role, selectedPrimitive);
+        if (overlay) root.add(overlay);
+      }
+    }
+
+    function availablePrimitiveIds() {
+      const records = metadata?.proxy_components || metadata?.primitive_records || [];
+      return new Set(records.map(record => String(record.id)));
+    }
+
+    function setPrimitiveSelection(value, { updateUi = true } = {}) {
+      const requested = String(value);
+      selectedPrimitive = requested === 'all' || availablePrimitiveIds().has(requested)
+        ? requested
+        : 'all';
+      if (updateUi) primitiveSelect.value = selectedPrimitive;
+      syncSelectionOverlays();
+      updateVisibility();
+      updatePrimitiveStats();
+      applyMaterialControls();
+    }
+
+    function resetPrimitiveSelection() {
+      selectedPrimitive = 'all';
+      primitiveSelect.value = 'all';
+      removeSelectionOverlays(roots.primitives);
+      removeSelectionOverlays(roots.triangulated);
+      updateVisibility();
+      updatePrimitiveStats();
+      applyMaterialControls();
+    }
+
+    function applyMaterialControls() {
+      const opacity = Number(document.querySelector('#opacity').value) / 100;
+      const otherOpacity = Number(document.querySelector('#otherOpacity').value) / 100;
+      const wireframe = document.querySelector('#wireframe').checked;
+      roots.primitives.children.forEach(mesh => {
+        const selected = mesh.userData.selectionOverlay || selectedPrimitive === 'all' ||
+          mesh.userData.primitiveId === Number(selectedPrimitive);
+        const meshOpacity = mesh.userData.batched && selectedPrimitive !== 'all'
+          ? otherOpacity : (selected ? opacity : otherOpacity);
+        mesh.material.opacity = meshOpacity;
+        mesh.material.transparent = meshOpacity < 1;
+        mesh.material.depthWrite = meshOpacity >= 1;
+        mesh.material.wireframe = wireframe;
+        mesh.renderOrder = selected ? 2 : 0;
+      });
+      roots.triangulated.children.forEach(mesh => {
+        const selected = mesh.userData.selectionOverlay || selectedPrimitive === 'all' ||
+          mesh.userData.primitiveId === Number(selectedPrimitive);
+        const meshOpacity = mesh.userData.batched && selectedPrimitive !== 'all'
+          ? otherOpacity : (selected ? opacity : otherOpacity);
+        const displayedOpacity = mode === 'error' ? Math.min(meshOpacity, 0.58) : meshOpacity;
+        mesh.material.opacity = displayedOpacity;
+        mesh.material.transparent = displayedOpacity < 1;
+        mesh.material.depthWrite = displayedOpacity >= 1;
+        mesh.material.wireframe = false;
+        mesh.renderOrder = selected ? 2 : 0;
+        mesh.children.forEach(child => {
+          if (!child.userData.triangleWireframe) return;
+          child.material.opacity = selected
+            ? Math.max(meshOpacity, 0.55)
+            : Math.min(meshOpacity, 0.35);
+          child.material.transparent = child.material.opacity < 1;
+        });
+      });
+      roots.source.children.forEach(mesh => {
+        mesh.material.opacity = mode === 'error' ? 0.24 : 1;
+        mesh.material.transparent = mode === 'error';
+        mesh.material.depthWrite = mode !== 'error';
+      });
+    }
+
+    function setLoading(message) {
+      loadingText.id = 'loadingText';
+      loadingText.textContent = message;
+      loading.classList.remove('hidden');
+    }
+
+    function showError(error) {
+      loadingText.id = 'error';
+      loadingText.textContent = `无法加载代理模型\n${error.message || error}`;
+      loading.classList.remove('hidden');
+    }
+
+    function visiblePrimitive(mesh) {
+      const typeAllowed = !mesh.userData.primitiveType || enabledTypes.has(mesh.userData.primitiveType);
+      if (mesh.userData.selectionOverlay)
+        return typeAllowed && selectedPrimitive !== 'all' &&
+          mesh.userData.primitiveId === Number(selectedPrimitive);
+      const selected = selectedPrimitive === 'all' ||
+        mesh.userData.primitiveId === Number(selectedPrimitive);
+      const contextVisible = selected || Number(document.querySelector('#otherOpacity').value) > 0;
+      return typeAllowed && contextVisible;
+    }
+
+    function updateVisibility() {
+      roots.source.visible = mode === 'source' || mode === 'split' || mode === 'error';
+      roots.primitives.visible = mode === 'primitives' || mode === 'overlay';
+      roots.triangulated.visible = mode === 'triangulated' || mode === 'overlay' || mode === 'split' || mode === 'error';
+      roots.error.visible = mode === 'error';
+      roots.error.children.forEach(object => {
+        object.visible = object.name !== 'open_error_boundary' ||
+          document.querySelector('#showErrorRegion').checked;
+      });
+      roots.primitives.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
+      roots.triangulated.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
+      roots.source.position.set(0, 0, 0);
+      roots.primitives.position.set(0, 0, 0);
+      roots.triangulated.position.set(0, 0, 0);
+      roots.error.position.set(0, 0, 0);
+      labels.classList.toggle('visible', mode === 'split');
+
+      if (mode === 'split') {
+        const box = new THREE.Box3().setFromObject(roots.source);
+        const size = box.getSize(new THREE.Vector3());
+        const axis = size.x >= size.y ? 'x' : 'y';
+        const gap = Math.max(size.x, size.y, size.z) * 0.18;
+        const shift = 0.5 * (size[axis] + gap);
+        roots.source.position[axis] = -shift;
+        roots.triangulated.position[axis] = shift;
+      }
+    }
+
+    function fitView() {
+      updateVisibility();
+      const box = new THREE.Box3();
+      for (const root of Object.values(roots)) if (root.visible) box.expandByObject(root);
+      if (box.isEmpty()) return;
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const radius = Math.max(size.length() * 0.5, 1e-6);
+      const direction = new THREE.Vector3(1.25, -1.55, 1.05).normalize();
+      const distance = radius / Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 1.22;
+      camera.position.copy(center).addScaledVector(direction, distance);
+      camera.near = Math.max(distance / 10000, 1e-6);
+      camera.far = Math.max(distance * 100, 1000);
+      camera.updateProjectionMatrix();
+      controls.target.copy(center);
+      controls.update();
+      fitPending = false;
+    }
+
+    function statRow(label, value, className = '', target = statsElement) {
+      const dt = document.createElement('dt');
+      dt.textContent = label;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      if (className) dd.className = className;
+      target.append(dt, dd);
+    }
+
+    function secondsValue(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${number.toFixed(3)} 秒` : '-';
+    }
+
+    function scalarValue(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return '-';
+      if (number === 0) return '0';
+      return number.toPrecision(6);
+    }
+
+    function percentValue(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${(number * 100).toPrecision(5)}%` : '-';
+    }
+
+    function updatePrimitiveStats() {
+      primitiveStatsElement.replaceChildren();
+      if (selectedPrimitive === 'all') {
+        statRow('选择', '全部代理部件', '', primitiveStatsElement);
+        return;
+      }
+      const records = metadata.proxy_components || metadata.primitive_records || [];
+      const record = records.find(item => Number(item.id) === Number(selectedPrimitive));
+      if (!record) return;
+      statRow('编号', `#${record.id}`, '', primitiveStatsElement);
+      statRow('类型', primitiveTypeNames[record.type] || record.type, '', primitiveStatsElement);
+      if (record.type === 'polygon') statRow('边界顶点', Number(record.vertex_count).toLocaleString(), '', primitiveStatsElement);
+      statRow('三角化面数', Number(record.triangulated_face_count).toLocaleString(), '', primitiveStatsElement);
+    }
+
+    function updateMetadata() {
+      const s = metadata.stats;
+      statsElement.replaceChildren();
+      statRow('原始三角形数', Number(s.source_triangles).toLocaleString());
+      statRow('图元数', Number(s.primitive_count).toLocaleString());
+      if (Number.isFinite(Number(s.proxy_triangles)))
+        statRow('三角化后三角形数', Number(s.proxy_triangles).toLocaleString());
+      statRow('耗时', secondsValue(s.timings_seconds?.total));
+      const containment = s.containment_validation;
+      if (containment) statRow('严格包围验证', containment.passed ? '通过' : '失败',
+        containment.passed ? 'valid' : 'invalid');
+      const error = s.open_region_error;
+      if (error) {
+        statRow('最大误差上限', scalarValue(error.maximum_distance_limit));
+        statRow('平均误差', scalarValue(error.mean_distance));
+        statRow('最大误差', scalarValue(error.maximum_distance));
+        statRow('误差统计耗时', secondsValue(error.seconds));
+      }
+      document.querySelector('#errorSection').hidden = !error;
+      document.querySelector('[data-mode="error"]').disabled = !error;
+      document.querySelector('#focusErrorButton').disabled =
+        !error || !(Number(error.maximum_distance) > 0);
+      if (error && Number.isFinite(Number(error.maximum_distance_limit))) {
+        maximumErrorInput.value = String(Number(error.maximum_distance_limit));
+        maximumErrorInput.dataset.defaultValue = maximumErrorInput.value;
+      }
+
+      primitiveSelect.replaceChildren(new Option('全部代理部件', 'all'));
+      const records = metadata.proxy_components || metadata.primitive_records || [];
+      const optionFragment = document.createDocumentFragment();
+      for (const record of records) {
+        optionFragment.append(new Option(
+          `#${record.id}  ${primitiveTypeNames[record.type] || record.type}`,
+          String(record.id),
+        ));
+      }
+      primitiveSelect.append(optionFragment);
+
+      document.querySelectorAll('[data-type]').forEach(input => {
+        input.closest('label').hidden = !Object.prototype.hasOwnProperty.call(s.primitive_types, input.dataset.type);
+      });
+    }
+
+    async function loadModel(modelId, options = {}) {
+      const generation = ++loadGeneration;
+      resetPrimitiveSelection();
+      setLoading(`正在加载模型 ${modelId}...`);
+      const requestedModel = manifest.models.find(
+        model => Number(model.id) === Number(modelId));
+      if (!requestedModel) throw new Error(`清单中不存在模型 ${modelId}`);
+      const metadataUrl = new URL(
+        options.metadata || requestedModel.metadata, manifestUrl);
+      const loadedMetadata = await fetchJson(metadataUrl);
+      const [sourceText, primitiveText, triangulatedText, errorData] = await Promise.all([
+        fetchText(new URL(loadedMetadata.source, metadataUrl)),
+        fetchText(new URL(
+          loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
+        fetchText(new URL(
+          loadedMetadata.triangulated_proxy || loadedMetadata.proxy, metadataUrl)),
+        loadedMetadata.open_error_visualization
+          ? fetchJson(new URL(loadedMetadata.open_error_visualization, metadataUrl))
+          : Promise.resolve(null),
+      ]);
+      if (generation !== loadGeneration) return;
+      currentModel = requestedModel;
+      metadata = loadedMetadata;
+      Object.values(roots).forEach(disposeRoot);
+      addMeshes(roots.source, parseOBJ(sourceText, 'source'));
+      addMeshes(roots.primitives, parseOBJ(primitiveText, 'primitives'));
+      addMeshes(roots.triangulated, parseOBJ(triangulatedText, 'triangulated'));
+      addOpenErrorVisualization(errorData);
+      modelSelect.value = String(modelId);
+      params.set('model', modelId);
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+      updateMetadata();
+      setPrimitiveSelection('all');
+      if (!options.preserveCamera) {
+        fitPending = true;
+        fitView();
+      }
+      loading.classList.add('hidden');
+      updateNavigation();
+    }
+
+    function updateNavigation() {
+      const index = manifest.models.findIndex(model => Number(model.id) === Number(currentModel.id));
+      document.querySelector('#previousButton').disabled = index <= 0;
+      document.querySelector('#nextButton').disabled = index >= manifest.models.length - 1;
+    }
+
+    function selectModel(modelId) {
+      return loadModel(modelId);
+    }
+
+    function adjacentModel(offset) {
+      const index = manifest.models.findIndex(model => Number(model.id) === Number(currentModel.id));
+      const next = manifest.models[index + offset];
+      if (next) selectModel(next.id).catch(showError);
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      document.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
+      updateVisibility();
+      applyMaterialControls();
+    }
+
+    async function regenerateWithMaximumError() {
+      const maximumError = Number(maximumErrorInput.value);
+      if (!Number.isFinite(maximumError) || maximumError < 0) {
+        regenerateStatus.textContent = '请输入非负有限数值';
+        maximumErrorInput.focus();
+        return;
+      }
+      regenerateButton.disabled = true;
+      regenerateStatus.textContent = '正在重新生成...';
+      setLoading(`正在按最大误差 ${maximumError} 重新生成模型 ${currentModel.id}...`);
+      try {
+        const response = await fetch('/api/regenerate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_id: currentModel.id, maximum_error: maximumError }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `${response.status} ${response.statusText}`);
+        await loadModel(currentModel.id, { metadata: result.metadata, preserveCamera: true });
+        regenerateStatus.textContent = `已按最大误差 ${maximumError} 生成`;
+      } catch (error) {
+        loading.classList.add('hidden');
+        regenerateStatus.textContent = `生成失败：${error.message || error}`;
+      } finally {
+        regenerateButton.disabled = false;
+      }
+    }
+
+    function focusMaximumError() {
+      const pair = openError?.maximum_pair;
+      if (!pair || !(Number(pair.distance) > 0) ||
+          !Array.isArray(pair.proxy) || !Array.isArray(pair.source)) return;
+      const proxy = new THREE.Vector3().fromArray(pair.proxy);
+      const source = new THREE.Vector3().fromArray(pair.source);
+      const center = proxy.clone().add(source).multiplyScalar(0.5);
+      const modelBox = new THREE.Box3().expandByObject(roots.source).expandByObject(roots.triangulated);
+      const modelScale = Math.max(modelBox.getSize(new THREE.Vector3()).length(), 1e-6);
+      const radius = Math.max(proxy.distanceTo(source) * 2.0, modelScale * 0.025);
+      const direction = camera.position.clone().sub(controls.target).normalize();
+      camera.position.copy(center).addScaledVector(direction, radius * 2.4);
+      controls.target.copy(center);
+      camera.near = Math.max(radius / 1000, 1e-7);
+      camera.far = Math.max(radius * 1000, modelScale * 20);
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+
+    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode)));
+    document.querySelector('#fitButton').addEventListener('click', fitView);
+    document.querySelector('#focusErrorButton').addEventListener('click', focusMaximumError);
+    regenerateButton.addEventListener('click', regenerateWithMaximumError);
+    maximumErrorInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') regenerateWithMaximumError();
+    });
+    document.querySelector('#showErrorRegion').addEventListener('change', updateVisibility);
+    document.querySelector('#previousButton').addEventListener('click', () => adjacentModel(-1));
+    document.querySelector('#nextButton').addEventListener('click', () => adjacentModel(1));
+    modelSelect.addEventListener('change', () => selectModel(Number(modelSelect.value)).catch(showError));
+    primitiveSelect.addEventListener('change', () => {
+      setPrimitiveSelection(primitiveSelect.value);
+    });
+    document.querySelector('#nextPrimitiveButton').addEventListener('click', () => {
+      if (primitiveSelect.options.length <= 1) return;
+      const nextIndex = primitiveSelect.selectedIndex < 1 ||
+        primitiveSelect.selectedIndex + 1 >= primitiveSelect.options.length
+        ? 1
+        : primitiveSelect.selectedIndex + 1;
+      primitiveSelect.selectedIndex = nextIndex;
+      setPrimitiveSelection(primitiveSelect.value);
+    });
+    document.querySelectorAll('[data-type]').forEach(input => input.addEventListener('change', () => {
+      if (input.checked) enabledTypes.add(input.dataset.type); else enabledTypes.delete(input.dataset.type);
+      updateVisibility();
+    }));
+    document.querySelector('#opacity').addEventListener('input', event => {
+      document.querySelector('#opacityValue').value = `${event.target.value}%`;
+      applyMaterialControls();
+    });
+    document.querySelector('#otherOpacity').addEventListener('input', event => {
+      document.querySelector('#otherOpacityValue').value = `${event.target.value}%`;
+      updateVisibility();
+      applyMaterialControls();
+    });
+    document.querySelector('#wireframe').addEventListener('change', applyMaterialControls);
+
+    renderer.domElement.addEventListener('dblclick', event => {
+      const selectableRoot = roots.primitives.visible ? roots.primitives : roots.triangulated;
+      if (!selectableRoot.visible) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(selectableRoot.children.filter(mesh => mesh.visible), false)[0];
+      let primitiveId = hit?.object.userData.primitiveId;
+      if (hit?.object.userData.batched) {
+        const attribute = hit.object.geometry.getAttribute('primitiveId');
+        const vertex = hit.face?.a ?? (Number.isInteger(hit.faceIndex) ? hit.faceIndex * 3 : -1);
+        if (attribute && vertex >= 0) primitiveId = Math.round(attribute.getX(vertex));
+      }
+      if (hit && primitiveId !== null && primitiveId !== undefined && primitiveId >= 0) {
+        setPrimitiveSelection(String(primitiveId));
+      }
+    });
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    animate();
+
+    window.__primitiveViewerDiagnostics = () => ({
+      model: currentModel ? Number(currentModel.id) : null,
+      mode,
+      sourceMeshes: roots.source.children.length,
+      primitiveMeshes: roots.primitives.children.length,
+      triangulatedMeshes: roots.triangulated.children.length,
+      visiblePrimitives: roots.primitives.children.filter(mesh => mesh.visible).reduce(
+        (sum, mesh) => sum + (mesh.userData.batched
+          ? Number(metadata?.stats?.primitive_types?.[mesh.userData.primitiveType] || 0) : 1), 0),
+      sourceVisible: roots.source.visible,
+      primitivesVisible: roots.primitives.visible,
+      triangulatedVisible: roots.triangulated.visible,
+      errorVisible: roots.error.visible,
+      errorBoundaryPoints: openError?.boundary_points?.length || 0,
+      maximumErrorDistance: Number(openError?.maximum_pair?.distance || 0),
+      maximumErrorLimit: Number(metadata?.stats?.open_region_error?.maximum_distance_limit),
+      maximumErrorInput: Number(maximumErrorInput.value),
+      regenerateStatus: regenerateStatus.textContent,
+      maximumErrorSegmentCount: roots.error.children.filter(
+        object => object.name === 'maximum_error_segment').length,
+      errorBoundaryVisible: roots.error.children.find(
+        object => object.name === 'open_error_boundary')?.visible ?? false,
+      primitiveCount: metadata?.stats?.primitive_count || 0,
+      primitiveTypeCounts: metadata?.stats?.primitive_types || {},
+      selectedPrimitive,
+      enabledTypes: [...enabledTypes],
+      cameraDistance: camera.position.distanceTo(controls.target),
+      cameraPosition: camera.position.toArray(),
+      cameraTarget: controls.target.toArray(),
+      drawCalls: renderer.info.render.calls,
+      triangles: renderer.info.render.triangles,
+      primitiveOpacity: roots.primitives.children[0]?.material.opacity ?? null,
+      triangulatedOpacity: roots.triangulated.children.find(
+        mesh => !mesh.userData.selectionOverlay)?.material.opacity ?? null,
+      allBaseMaterialsOpaque: [...roots.primitives.children, ...roots.triangulated.children]
+        .filter(mesh => !mesh.userData.selectionOverlay)
+        .every(mesh => Math.abs(mesh.material.opacity - 1) < 1e-8),
+      primitiveOptionCount: primitiveSelect.options.length - 1,
+      selectionOverlayCount: [...roots.primitives.children, ...roots.triangulated.children]
+        .filter(mesh => mesh.userData.selectionOverlay).length,
+      selectedBaseMeshCount: [...roots.primitives.children, ...roots.triangulated.children]
+        .filter(mesh => !mesh.userData.selectionOverlay &&
+          mesh.userData.primitiveId === Number(selectedPrimitive)).length,
+      selectedBaseMaterialsOpaque: [...roots.primitives.children, ...roots.triangulated.children]
+        .filter(mesh => !mesh.userData.selectionOverlay &&
+          mesh.userData.primitiveId === Number(selectedPrimitive))
+        .every(mesh => Math.abs(mesh.material.opacity - 1) < 1e-8),
+      nonSelectedBaseMaterialsFaded: [...roots.primitives.children, ...roots.triangulated.children]
+        .filter(mesh => !mesh.userData.selectionOverlay &&
+          mesh.userData.primitiveId !== Number(selectedPrimitive))
+        .every(mesh => Math.abs(mesh.material.opacity - 0.15) < 1e-8),
+      primitiveWireframe: roots.primitives.children[0]?.material.wireframe ?? null,
+      manifestModelCount: manifest?.models?.length || 0,
+      manifestComplete: manifest?.complete ?? null,
+      loading: !loading.classList.contains('hidden'),
+    });
+    window.__primitiveViewerPixelSample = () => {
+      renderer.render(scene, camera);
+      const gl = renderer.getContext();
+      const width = renderer.domElement.width;
+      const height = renderer.domElement.height;
+      const pixels = new Uint8Array(4 * width * height);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      const counts = new Map();
+      for (let y = 0; y < height; y += 4) {
+        for (let x = 0; x < width; x += 4) {
+          const index = 4 * (y * width + x);
+          const key = `${pixels[index]},${pixels[index + 1]},${pixels[index + 2]}`;
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+      }
+      const sampledPixels = [...counts.values()].reduce((sum, count) => sum + count, 0);
+      const backgroundPixels = Math.max(...counts.values());
+      return { uniqueColors: counts.size, nonBackground: sampledPixels - backgroundPixels };
+    };
+
+    (async () => {
+      try {
+        manifest = await fetchJson(manifestUrl);
+        manifest.models.sort((a, b) => Number(a.id) - Number(b.id));
+        for (const model of manifest.models) modelSelect.add(new Option(`模型 ${model.id}`, String(model.id)));
+        const requested = Number(params.get('model'));
+        const initial = manifest.models.some(model => Number(model.id) === requested) ? requested : manifest.models[0].id;
+        await selectModel(initial);
+      } catch (error) {
+        console.error(error);
+        showError(error);
+      }
+    })();
+  </script>
+</body>
+</html>

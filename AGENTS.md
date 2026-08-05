@@ -1,0 +1,52 @@
+# PQSSProxyMesh Algorithm Rules
+
+These rules are mandatory for every simplification change in this repository.
+
+1. Never branch on a model ID, file name, known test-scene role, or hand-picked
+   coordinate. A fix must be expressed as a geometry rule and run unchanged on
+   every input OBJ.
+2. Input is the original arbitrary OBJ triangle soup. Do not substitute the
+   official simplified mesh and do not require watertight, manifold, consistently
+   wound, or self-intersection-free input.
+3. False positives are allowed; false negatives are not. A source triangle may
+   be removed only when a geometry certificate proves that the retained proxy
+   union still covers its responsibility.
+4. Primitive analysis emits surface primitives: planar polygons, disks, annuli,
+   cylindrical bands, and conical bands. A box is six polygons, not a separate
+   output primitive. A distinct triangulation stage converts all surface
+   primitives to the ordinary triangle OBJ consumed by PQSS; an n-vertex simple
+   polygon must produce exactly n-2 triangles without Steiner vertices.
+5. All approximation error is global: planar added error is divided by the whole
+   model surface area and volumetric added error by the model-scale volume. Never
+   normalize a merge by only the participating local pieces.
+6. Geometrically coplanar output patches must be unioned before triangulation.
+   Internal edges and overlapping coplanar faces must not survive merely because
+   the source OBJ uses different vertex indices or disconnected topology.
+7. Never delete a proxy because it merely looks internal or unimportant. Delete
+   it only after union-coverage certification; record the reason in statistics.
+8. Offline generation must not use scene poses or collision-query outcomes.
+   Candidate quality targets PQSS Optimized static workload surrogates; held-out
+   query BV tests and triangle tests are acceptance measurements only.
+9. BVH depth and primitive count are diagnostics, not primary objectives. Prefer
+   lower expected BV tests and triangle tests while preserving conservative
+   coverage.
+10. Every algorithm change must add a model-independent regression, run the full
+    test suite, regenerate every evaluated model with identical options, and
+    update one non-mixed visualization manifest. Do not compare outputs produced
+    by different algorithm versions as if they were one uniform result.
+11. Primitive IDs and triangulation diagonals are not semantic identities and
+    may change after a planar union. Validate covered regions, overlap area,
+    conservative source coverage, and query workload instead of preserving a
+    screenshot's numeric primitive ID.
+12. Geometry-specific recognizers may only propose certified candidates. They
+    must never greedily consume faces, mutate shared responsibility, or choose
+    the final result in a family-specific pass. Exact fallback, planar, curved,
+    convex, and enclosing candidates must compete in one model-level search.
+13. A result is not eligible for the current viewer or collision benchmark
+    because one named model looks correct. The same binary and identical
+    options must pass the complete selected-model batch. Any output with
+    per-face fallback at industrial scale (hundreds or thousands of isolated
+    triangle primitives) is an optimizer failure, not a valid fine result.
+14. A watertight mesh may be built as an offline occupancy/error reference, but
+    it is never a required input property or a final-output property. The final
+    conservative OBJ must remain certified directly against source triangles.
