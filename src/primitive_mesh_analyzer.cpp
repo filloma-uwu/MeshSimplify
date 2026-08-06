@@ -6809,6 +6809,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     profile.input_primitives = primitives.size();
     merged_group_count = 0;
     if (primitives.size() < 2) return primitives;
+    // Candidate certification and the final audit use different deterministic
+    // surface samples. Keep a small internal margin so a candidate that lands
+    // exactly on the user limit cannot exceed it only because the final pass
+    // happens to sample a more adverse point. The public/final limit is not
+    // changed.
+    const double candidate_error_limit = maximum_error_distance * 0.99;
 
     std::vector<Group> groups;
     groups.reserve(primitives.size());
@@ -6990,7 +6996,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         const FilledSurfaceDistanceCertificate certificate =
             certifyFilledSurfaceDistance(
                 distance_reference, candidate,
-                maximum_error_distance + tolerance);
+                candidate_error_limit + tolerance);
         profile.distance_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - distance_started).count();
         profile.certificate_samples += certificate.samples;
@@ -7001,8 +7007,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             const auto fine_started = std::chrono::steady_clock::now();
             accepted = maximumFilledSurfaceDistance(
                 distance_reference, candidate, error_sample_spacing,
-                maximum_error_distance + tolerance) <=
-                maximum_error_distance + tolerance;
+                candidate_error_limit + tolerance) <=
+                candidate_error_limit + tolerance;
             profile.distance_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - fine_started).count();
         }
