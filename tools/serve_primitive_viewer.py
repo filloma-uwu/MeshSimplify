@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/restored_envelope_viewer_v3/viewer_manifest.json"),
+        default=Path("outputs/adjacent_closed_envelope_full_v3/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",
