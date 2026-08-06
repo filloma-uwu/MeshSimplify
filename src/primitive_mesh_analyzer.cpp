@@ -1237,6 +1237,10 @@ struct RecognizedProtrusion
     bool has_support_plane = false;
     Vec3 support_plane_point = Vec3::Zero();
     Vec3 support_outward = Vec3::Zero();
+    // Diagnostics used to validate the scale gate for this generic
+    // recognizer; they are geometry-derived and do not affect semantics.
+    double footprint_ratio = 0.0;
+    double group_depth = 0.0;
 };
 
 double boxShellAddedArea(const Mesh& mesh,
@@ -1392,6 +1396,33 @@ std::vector<RecognizedProtrusion> recognizeSupportProtrusions(
         const Mat3 frame = orthonormalFrame(support.outward);
         const Bounds2 support_projection = projectedBounds(
             mesh, clusters[support.support], support.origin, frame);
+        // Record how much of the whole-model silhouette the support occupies.
+        // Measuring this in the support plane makes the diagnostic invariant
+        // to translation and to the choice of world axes.
+        Bounds2 model_projection;
+        for (const Vec3& vertex : mesh.vertices)
+        {
+            const Vec3 local = frame.transposeMultiply(vertex - support.origin);
+            model_projection.lower = model_projection.lower.cwiseMin(
+                {local.x(), local.y()});
+            model_projection.upper = model_projection.upper.cwiseMax(
+                {local.x(), local.y()});
+        }
+        const double support_width = std::max(
+            support_projection.upper.x() - support_projection.lower.x(), 0.0);
+        const double support_height = std::max(
+            support_projection.upper.y() - support_projection.lower.y(), 0.0);
+        const double model_width = std::max(
+            model_projection.upper.x() - model_projection.lower.x(), 0.0);
+        const double model_height = std::max(
+            model_projection.upper.y() - model_projection.lower.y(), 0.0);
+        const double footprint_ratio = support_width * support_height /
+            std::max(model_width * model_height, dimensional_tolerance * dimensional_tolerance);
+        // The footprint/depth values are retained for diagnostics and for a
+        // later caller-selected policy.  Do not reject here: the final
+        // directed-distance and coverage certificates are the authoritative
+        // acceptance gate, and this recognizer must still discover small
+        // protrusions whose support plane happens to be broad in projection.
         std::vector<bool> expanded(clusters.size(), false);
         std::queue<std::uint32_t> expansion_queue;
         for (std::uint32_t id = 0; id < clusters.size(); ++id)
@@ -1503,6 +1534,10 @@ std::vector<RecognizedProtrusion> recognizeSupportProtrusions(
                 options.protrusion_max_inward_relative * model_diagonal);
             if (group_maximum - group_minimum > maximum_group_depth) continue;
             BoxFit box = fitBox(mesh, uniqueVertices(mesh, faces));
+            const Vec3 box_extent = box.half_size * 2.0;
+            if (std::max({box_extent.x(), box_extent.y(), box_extent.z()}) >
+                options.protrusion_max_extent_relative * model_diagonal)
+                continue;
             int covered_axis = 0;
             for (int axis = 1; axis < 3; ++axis)
                 if (std::abs(box.axes.col(axis).dot(support.outward)) >
@@ -1528,7 +1563,8 @@ std::vector<RecognizedProtrusion> recognizeSupportProtrusions(
                 mesh.faces[clusters[support.support].front()];
             result.push_back(
                 {box, std::move(faces), group, covered_axis, covered_sign,
-                 true, mesh.vertices[support_face[0]], support.outward});
+                 true, mesh.vertices[support_face[0]], support.outward,
+                 footprint_ratio, group_maximum - group_minimum});
             for (const auto cluster_id : group) claimed_clusters[cluster_id] = true;
         }
     }
@@ -11208,6 +11244,19 @@ std::vector<OutputPrimitive> mergeSupportProtrusionSurfaceSets(
            << ",\"contact_removed_area\":"
            << profile.contact_removed_area
            << ",\"distance_seconds\":" << profile.distance_seconds
+           << ",\"accepted_geometry\":[";
+    for (std::size_t index = 0; index < accepted_protrusions.size(); ++index)
+    {
+        if (index != 0) stream << ',';
+        const auto& item = accepted_protrusions[index];
+        stream << "{\"footprint_ratio\":" << item.footprint_ratio
+               << ",\"group_depth\":" << item.group_depth
+               << ",\"box_extent\":["
+               << item.box.half_size.x() * 2.0 << ','
+               << item.box.half_size.y() * 2.0 << ','
+               << item.box.half_size.z() * 2.0 << "]}";
+    }
+    stream << "]"
            << ",\"output_primitives\":" << result.size()
            << ",\"total_seconds\":" << std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count()

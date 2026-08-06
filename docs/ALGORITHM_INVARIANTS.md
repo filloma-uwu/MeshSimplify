@@ -47,7 +47,12 @@ are topologically protected from the later Hausdorff merge, because filling
 them has zero directed surface error but would recreate query-only internal
 geometry.  A support polygon with several contacts is partitioned into local
 strips rather than triangulated across all holes, avoiding long triangles whose
-RSS bounds span distant attachments.
+RSS bounds span distant attachments.  This replacement is restricted to a
+genuinely local attachment: the fitted shell's longest edge must not exceed 18%
+of the whole-model AABB diagonal.  Directed distance alone is insufficient for
+this recognizer because a large, slightly irregular body can still lie within a
+loose user error limit while producing exactly the oversized box surfaces the
+surface-only pipeline is meant to avoid.
 
 Two tempting shortcuts are explicitly invalid:
 

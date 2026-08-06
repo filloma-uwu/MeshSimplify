@@ -61,6 +61,63 @@ void appendBoxObj(std::ostringstream& obj, std::size_t& next_vertex,
     next_vertex += 8;
 }
 
+void appendQuadGridObj(
+    std::ostringstream& obj, std::size_t& next_vertex,
+    const std::array<double, 3>& origin,
+    const std::array<double, 3>& first,
+    const std::array<double, 3>& second,
+    const std::size_t subdivisions)
+{
+    const auto point = [&](const double first_parameter,
+                           const double second_parameter)
+    {
+        std::array<double, 3> result{};
+        for (int axis = 0; axis < 3; ++axis)
+            result[axis] = origin[axis] +
+                first_parameter * first[axis] +
+                second_parameter * second[axis];
+        return result;
+    };
+    for (std::size_t row = 0; row < subdivisions; ++row)
+        for (std::size_t column = 0; column < subdivisions; ++column)
+        {
+            const double u0 = static_cast<double>(column) / subdivisions;
+            const double u1 = static_cast<double>(column + 1) / subdivisions;
+            const double v0 = static_cast<double>(row) / subdivisions;
+            const double v1 = static_cast<double>(row + 1) / subdivisions;
+            const std::array corners{
+                point(u0, v0), point(u1, v0),
+                point(u1, v1), point(u0, v1)};
+            const std::size_t base = next_vertex;
+            for (const auto& vertex : corners)
+                obj << "v " << vertex[0] << ' ' << vertex[1] << ' '
+                    << vertex[2] << '\n';
+            obj << "f " << base << ' ' << base + 1 << ' ' << base + 2 << '\n'
+                << "f " << base << ' ' << base + 2 << ' ' << base + 3 << '\n';
+            next_vertex += 4;
+        }
+}
+
+void appendSubdividedBoxObj(
+    std::ostringstream& obj, std::size_t& next_vertex,
+    const double x0, const double y0, const double z0,
+    const double x1, const double y1, const double z1,
+    const std::size_t subdivisions)
+{
+    appendQuadGridObj(obj, next_vertex, {x0, y0, z0},
+                      {0, y1 - y0, 0}, {x1 - x0, 0, 0}, subdivisions);
+    appendQuadGridObj(obj, next_vertex, {x0, y0, z1},
+                      {x1 - x0, 0, 0}, {0, y1 - y0, 0}, subdivisions);
+    appendQuadGridObj(obj, next_vertex, {x0, y0, z0},
+                      {x1 - x0, 0, 0}, {0, 0, z1 - z0}, subdivisions);
+    appendQuadGridObj(obj, next_vertex, {x0, y1, z0},
+                      {0, 0, z1 - z0}, {x1 - x0, 0, 0}, subdivisions);
+    appendQuadGridObj(obj, next_vertex, {x0, y0, z0},
+                      {0, 0, z1 - z0}, {0, y1 - y0, 0}, subdivisions);
+    appendQuadGridObj(obj, next_vertex, {x1, y0, z0},
+                      {0, y1 - y0, 0}, {0, 0, z1 - z0}, subdivisions);
+}
+
 void appendCylinderBandObj(std::ostringstream& obj, std::size_t& next_vertex,
                            const std::size_t segments,
                            const double radius, const double height)
@@ -360,11 +417,33 @@ int main()
                     group_strict_stats.primitive_count > 6,
                 "exact error must also preserve the surface-only candidate set");
 
+        // A long, thin attachment can have low added area and low directed
+        // distance while still spanning a substantial fraction of the model.
+        // It must not become one oversized support-box shell.
+        const auto nonlocal_attachment = root / "nonlocal_attachment.obj";
+        std::ostringstream nonlocal_attachment_obj;
+        std::size_t next_vertex = 1;
+        appendBoxObj(nonlocal_attachment_obj, next_vertex,
+                     0, 0, 0, 100, 100, 1);
+        appendSubdividedBoxObj(nonlocal_attachment_obj, next_vertex,
+                               35, 49.5, 1.1, 65, 50.5, 2.1, 2);
+        writeText(nonlocal_attachment, nonlocal_attachment_obj.str());
+        auto local_attachment_policy = exact;
+        local_attachment_policy.maximum_open_error_distance = 100.0;
+        local_attachment_policy.maximum_cavity_added_volume_ratio = 0.0;
+        const auto local_attachment_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                nonlocal_attachment, root / "nonlocal_attachment_limited",
+                local_attachment_policy);
+        require(local_attachment_stats.containment_validation_passed &&
+                    local_attachment_stats.merged_spatial_primitive_groups == 0,
+                "a nonlocal attachment must not become a support box shell");
+
         // Three equal closed components contain two independent narrow gaps.
         // Each gap is assessed against the model volume on its own.
         const auto narrow_gaps = root / "narrow_component_gaps.obj";
         std::ostringstream narrow_gap_obj;
-        std::size_t next_vertex = 1;
+        next_vertex = 1;
         appendBoxObj(narrow_gap_obj, next_vertex, 0.0, 0, 0, 1.0, 1, 1);
         appendBoxObj(narrow_gap_obj, next_vertex, 1.1, 0, 0, 2.1, 1, 1);
         appendBoxObj(narrow_gap_obj, next_vertex, 2.2, 0, 0, 3.2, 1, 1);

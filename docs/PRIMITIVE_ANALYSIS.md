@@ -100,7 +100,10 @@ configured circumferential segment count.
    supporting polygon. These hidden support owners remain audit-only coverage
    certificates and are never exported to PQSS. Contact cutouts cannot be
    refilled by the error merge, and multi-contact supports are decomposed into
-   local strips to avoid long, BVH-unfriendly triangles.
+   local strips to avoid long, BVH-unfriendly triangles. The candidate remains
+   local by construction: its longest fitted edge is limited to 18% of the
+   whole-model AABB diagonal. Larger candidates stay in the ordinary polygon or
+   certified round-surface path instead of becoming a box-shaped shell.
    Final volume-occlusion certificates are rebuilt only from explicit
    `enclosure_group` shells. Ungrouped planar patches are not speculatively
    combined into extrusions; doing so is quadratic on large CAD soups and can

@@ -56,6 +56,10 @@ struct PrimitiveMeshAnalysisOptions
     double protrusion_max_area_excess_ratio = 0.03;
     double protrusion_cluster_gap_relative = 0.01;
     double protrusion_max_inward_relative = 0.02;
+    // No fitted support shell may span a substantial fraction of the model's
+    // diagonal.  This prevents a large, slightly irregular body from being
+    // replaced by a box while retaining genuinely local attached pieces.
+    double protrusion_max_extent_relative = 0.18;
     // Collapse a certified thin shell onto its outward support plane while
     // preserving the exact projected polygon union.
     double shallow_parallel_merge_depth_relative = 0.005;
