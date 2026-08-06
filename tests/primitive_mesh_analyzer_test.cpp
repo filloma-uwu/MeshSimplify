@@ -1,6 +1,7 @@
 #include "pqss_proxy_mesh/primitive_mesh_analyzer.hpp"
 
 #include <cmath>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -85,6 +87,55 @@ void appendCylinderBandObj(std::ostringstream& obj, std::size_t& next_vertex,
             << "f " << lower << ' ' << next_upper << ' ' << upper << '\n';
     }
     next_vertex += 2 * segments;
+}
+
+bool hasLargeFaceOnX(const std::filesystem::path& path, const double x)
+{
+    std::ifstream stream(path);
+    std::vector<std::array<double, 3>> vertices;
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        std::istringstream fields(line);
+        std::string tag;
+        fields >> tag;
+        if (tag == "v")
+        {
+            std::array<double, 3> vertex{};
+            fields >> vertex[0] >> vertex[1] >> vertex[2];
+            vertices.push_back(vertex);
+            continue;
+        }
+        if (tag != "f") continue;
+        std::vector<std::size_t> face;
+        std::string token;
+        while (fields >> token)
+            face.push_back(static_cast<std::size_t>(
+                std::stoull(token.substr(0, token.find('/'))) - 1));
+        if (face.size() < 3) continue;
+        double lower_y = 1.0e30;
+        double upper_y = -1.0e30;
+        double lower_z = 1.0e30;
+        double upper_z = -1.0e30;
+        bool on_plane = true;
+        for (const auto index : face)
+        {
+            if (index >= vertices.size() ||
+                std::abs(vertices[index][0] - x) > 1.0e-8)
+            {
+                on_plane = false;
+                break;
+            }
+            lower_y = std::min(lower_y, vertices[index][1]);
+            upper_y = std::max(upper_y, vertices[index][1]);
+            lower_z = std::min(lower_z, vertices[index][2]);
+            upper_z = std::max(upper_z, vertices[index][2]);
+        }
+        if (on_plane && upper_y - lower_y > 0.9 &&
+            upper_z - lower_z > 0.9)
+            return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -286,6 +337,30 @@ int main()
             large_gap, root / "large_component_gap", gap_fill);
         require(large_gap_stats.filled_intercomponent_gaps == 0,
                 "a component gap beyond the per-gap budget must be preserved");
+
+        // Thin outer plates can make their cavity-facing walls look like
+        // redundant parallel skins.  The open channel between them is much
+        // larger than the fill budget, so both inner walls must survive.
+        const auto open_channel = root / "open_channel.obj";
+        std::ostringstream open_channel_obj;
+        next_vertex = 1;
+        appendBoxObj(open_channel_obj, next_vertex,
+                     0.0, 0.0, 0.0, 0.02, 1.0, 1.0);
+        appendBoxObj(open_channel_obj, next_vertex,
+                     0.98, 0.0, 0.0, 1.0, 1.0, 1.0);
+        appendBoxObj(open_channel_obj, next_vertex,
+                     0.02, 0.0, 0.0, 0.98, 1.0, 0.02);
+        writeText(open_channel, open_channel_obj.str());
+        auto preserve_channel = exact;
+        preserve_channel.maximum_cavity_added_volume_ratio = 0.08;
+        const auto channel_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
+            open_channel, root / "open_channel", preserve_channel);
+        require(channel_stats.containment_validation_passed &&
+                    hasLargeFaceOnX(
+                        root / "open_channel" / "primitives.obj", 0.02) &&
+                    hasLargeFaceOnX(
+                        root / "open_channel" / "primitives.obj", 0.98),
+                "over-budget open-channel inner walls must not be occluded");
 
         std::cout << "primitive mesh staged-pipeline tests passed\n";
         return 0;

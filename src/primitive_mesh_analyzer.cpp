@@ -6793,6 +6793,83 @@ std::vector<OutputPrimitive> clipAdjacentFaceTrianglesAtOcclusionPlanes(
     return result;
 }
 
+std::size_t protectLargeOpposingCavityWalls(
+    std::vector<OutputPrimitive>& primitives,
+    const double cavity_volume_limit,
+    const double model_diagonal,
+    const double tolerance)
+{
+    if (!std::isfinite(cavity_volume_limit)) return 0;
+    struct Wall
+    {
+        std::size_t primitive = 0;
+        Vec3 normal = Vec3::Zero();
+        double distance = 0.0;
+        Bounds2 projection;
+    };
+    std::vector<Wall> walls;
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+    {
+        OutputPrimitive& item = primitives[index];
+        if (item.primitive.kind != Kind::Polygon ||
+            item.primitive.polygon.size() < 3)
+            continue;
+        const double area = primitiveSurfaceArea(item.primitive, tolerance);
+        if (area * model_diagonal <= cavity_volume_limit + tolerance)
+            continue;
+        Vec3 normal;
+        if (!planarNormal(item.primitive, tolerance, normal)) continue;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            if (std::abs(normal[axis]) <= 1.0e-12) continue;
+            if (normal[axis] < 0.0) normal = -normal;
+            break;
+        }
+        const Mat3 frame = orthonormalFrame(normal);
+        Bounds2 projection;
+        for (const Vec3& vertex : item.primitive.polygon)
+        {
+            projection.lower = projection.lower.cwiseMin({
+                vertex.dot(frame.col(1)), vertex.dot(frame.col(2))});
+            projection.upper = projection.upper.cwiseMax({
+                vertex.dot(frame.col(1)), vertex.dot(frame.col(2))});
+        }
+        walls.push_back({index, normal,
+                         normal.dot(item.primitive.polygon.front()),
+                         projection});
+    }
+
+    std::vector<bool> protected_wall(primitives.size(), false);
+    for (std::size_t first = 0; first < walls.size(); ++first)
+        for (std::size_t second = first + 1; second < walls.size(); ++second)
+        {
+            const Wall& a = walls[first];
+            const Wall& b = walls[second];
+            if (a.normal.dot(b.normal) < 1.0 - 1.0e-8) continue;
+            const double separation = std::abs(a.distance - b.distance);
+            if (separation <= tolerance) continue;
+            const Vec2 overlap =
+                a.projection.upper.cwiseMin(b.projection.upper) -
+                a.projection.lower.cwiseMax(b.projection.lower);
+            if (overlap.x() <= tolerance || overlap.y() <= tolerance)
+                continue;
+            if (overlap.prod() * separation <=
+                cavity_volume_limit + tolerance)
+                continue;
+            protected_wall[a.primitive] = true;
+            protected_wall[b.primitive] = true;
+        }
+
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+        if (protected_wall[index])
+        {
+            primitives[index].preserves_cavity_opening = true;
+            ++count;
+        }
+    return count;
+}
+
 std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
     std::vector<OutputPrimitive> primitives,
     const Vec3& model_center,
@@ -7233,6 +7310,7 @@ std::vector<std::uint32_t> removeContainedPrimitives(
     std::vector<std::uint32_t> excluded;
     for (std::size_t candidate = 0; candidate < primitives.size(); ++candidate)
     {
+        if (primitives[candidate].preserves_cavity_opening) continue;
         const Vec3 candidate_extent = bounds[candidate].upper - bounds[candidate].lower;
         for (std::size_t coverer = 0; coverer < primitives.size(); ++coverer)
         {
@@ -7485,7 +7563,9 @@ std::vector<OutputPrimitive> removePrimitivesInsideEnclosureGroups(
     }
     for (std::size_t candidate = 0; candidate < primitives.size(); ++candidate)
     {
-        if (removed[candidate]) continue;
+        if (removed[candidate] ||
+            primitives[candidate].preserves_cavity_opening)
+            continue;
         for (const Enclosure& enclosure : enclosures)
         {
             if (removed_groups.contains(enclosure.group)) continue;
@@ -11387,6 +11467,53 @@ std::vector<OutputPrimitive> reopenRestoredCavityVolumes(
             continue;
         }
         const Vec3 origin = planarPoint(item.primitive);
+
+        // The two end walls of an over-budget cavity are part of the opening,
+        // even when they survived the structural pass and therefore were not
+        // emitted through restored_cavity_output. Mark them here so later
+        // parallel/volume occlusion cannot mistake an exposed cavity wall for
+        // a redundant inner skin hidden by the corresponding exterior wall.
+        bool bounds_restored_cavity = false;
+        for (const auto& cavity : cleanup.restored_cavities)
+        {
+            const Vec3 separation = cavity.frame.col(0);
+            if (std::abs(normal.dot(separation)) < 1.0 - 1.0e-8)
+                continue;
+            const double coordinate = origin.dot(separation);
+            if (std::abs(coordinate - cavity.lower.x()) > tolerance * 16.0 &&
+                std::abs(coordinate - cavity.upper.x()) > tolerance * 16.0)
+                continue;
+
+            Bounds2 projected;
+            const PrimitiveMesh planar_mesh =
+                triangulatePrimitive(item.primitive);
+            for (const Vec3& vertex : planar_mesh.vertices)
+            {
+                projected.lower = projected.lower.cwiseMin({
+                    vertex.dot(cavity.frame.col(1)),
+                    vertex.dot(cavity.frame.col(2))});
+                projected.upper = projected.upper.cwiseMax({
+                    vertex.dot(cavity.frame.col(1)),
+                    vertex.dot(cavity.frame.col(2))});
+            }
+            const Vec2 overlap =
+                projected.upper.cwiseMin(
+                    Vec2(cavity.upper.y(), cavity.upper.z())) -
+                projected.lower.cwiseMax(
+                    Vec2(cavity.lower.y(), cavity.lower.z()));
+            if (overlap.x() > tolerance && overlap.y() > tolerance)
+            {
+                bounds_restored_cavity = true;
+                break;
+            }
+        }
+        if (bounds_restored_cavity)
+        {
+            item.preserves_cavity_opening = true;
+            result.push_back(std::move(item));
+            continue;
+        }
+
         const Mat3 basis = orthonormalFrame(normal);
         Mat3 frame;
         frame.col(0) = static_cast<Vec3>(basis.col(1));
@@ -13251,7 +13378,8 @@ std::vector<OutputPrimitive> clipPlanarOcclusionByClosedVolumes(
     result.reserve(primitives.size());
     for (auto& candidate : primitives)
     {
-        if (candidate.primitive.kind != Kind::Polygon ||
+        if (candidate.preserves_cavity_opening ||
+            candidate.primitive.kind != Kind::Polygon ||
             candidate.primitive.polygon.size() < 3)
         {
             result.push_back(std::move(candidate));
@@ -14356,6 +14484,17 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // surface can prove coverage of its own source faces; transferring those
     // faces to an arbitrary surviving enclosure face does not imply that the
     // survivor's finite polygon covers the same projection.
+    const std::size_t protected_cavity_walls =
+        protectLargeOpposingCavityWalls(
+            output,
+            effective_options.maximum_cavity_added_volume_ratio * model_volume,
+            diagonal, merge_tolerance);
+    {
+        std::ofstream profile(
+            output_directory / "cavity_wall_protection_profile.json");
+        profile << "{\"protected_primitives\":"
+                << protected_cavity_walls << "}\n";
+    }
     std::vector<OutputPrimitive> coverage_certificate_primitives = output;
     coverage_certificate_primitives.insert(
         coverage_certificate_primitives.end(),
