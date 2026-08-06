@@ -89,7 +89,14 @@ configured circumferential segment count.
    `source_faces` map even though the conservative surface union is unchanged.
    Source faces still failing that independent audit remain exact surface
    triangles; repair never introduces a fitted solid.
-7. Canonicalize the final outer surface and triangulate each semantic patch.
+7. Remove composite-proxy interfaces from the actual collision shell. Accepted
+   support protrusions emit only their exposed five faces; the side faces stop
+   at the support plane, and their contact footprints are subtracted from the
+   supporting polygon. These hidden support owners remain audit-only coverage
+   certificates and are never exported to PQSS. Contact cutouts cannot be
+   refilled by the error merge, and multi-contact supports are decomposed into
+   local strips to avoid long, BVH-unfriendly triangles.
+8. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
 Falcidieno, and Spagnuolo (2006), *Hierarchical Mesh Segmentation Based on

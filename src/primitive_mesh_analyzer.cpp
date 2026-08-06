@@ -969,6 +969,48 @@ std::vector<std::vector<std::uint32_t>> coplanarClusters(
     std::vector<std::unordered_set<std::uint32_t>>& cluster_neighbors,
     const std::vector<bool>* included_faces = nullptr)
 {
+    // CAD OBJ exporters frequently duplicate a vertex for every face even when
+    // the coordinates are identical.  Building topology from raw OBJ indices
+    // then turns one geometric plate or box shell into thousands of disconnected
+    // islands and prevents both coplanar union and protrusion recognition.  Weld
+    // coordinates only for topology construction; the source mesh itself stays
+    // unchanged, so responsibility and exported geometry retain their original
+    // indices and precision.
+    struct WeldKey
+    {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        std::int64_t z = 0;
+        bool operator==(const WeldKey&) const = default;
+    };
+    struct WeldKeyHash
+    {
+        std::size_t operator()(const WeldKey& key) const noexcept
+        {
+            std::size_t seed = std::hash<std::int64_t>{}(key.x);
+            seed ^= std::hash<std::int64_t>{}(key.y) +
+                    0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            seed ^= std::hash<std::int64_t>{}(key.z) +
+                    0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    const double weld_tolerance = std::max(tolerance, 1.0e-12);
+    std::unordered_map<WeldKey, std::uint32_t, WeldKeyHash> welded_ids;
+    welded_ids.reserve(mesh.vertices.size());
+    std::vector<std::uint32_t> welded_vertex(mesh.vertices.size());
+    std::uint32_t next_welded_id = 0;
+    for (std::size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex)
+    {
+        const Vec3& point = mesh.vertices[vertex];
+        const WeldKey key{
+            static_cast<std::int64_t>(std::llround(point.x() / weld_tolerance)),
+            static_cast<std::int64_t>(std::llround(point.y() / weld_tolerance)),
+            static_cast<std::int64_t>(std::llround(point.z() / weld_tolerance))};
+        const auto [found, inserted] = welded_ids.emplace(key, next_welded_id);
+        welded_vertex[vertex] = found->second;
+        if (inserted) ++next_welded_id;
+    }
     std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edge_faces;
     edge_faces.reserve(mesh.faces.size() * 3);
     std::vector<Vec3> normals(mesh.faces.size());
@@ -977,7 +1019,9 @@ std::vector<std::vector<std::uint32_t>> coplanarClusters(
         if (included_faces && !(*included_faces)[id]) continue;
         const Face& face = mesh.faces[id];
         for (int edge = 0; edge < 3; ++edge)
-            edge_faces[edgeKey(face[edge], face[(edge + 1) % 3])].push_back(id);
+            edge_faces[edgeKey(
+                welded_vertex[face[edge]],
+                welded_vertex[face[(edge + 1) % 3]])].push_back(id);
         normals[id] = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
                           .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]])
                           .normalized();
@@ -1095,6 +1139,12 @@ struct RecognizedProtrusion
     std::vector<std::uint32_t> clusters;
     int covered_face_axis = -1;
     double covered_face_sign = 0.0;
+    // Support protrusions are open five-face shells.  The fitted box can extend
+    // behind the finite support surface even when its covered face is omitted,
+    // so the four adjacent faces must be clipped to this exact plane.
+    bool has_support_plane = false;
+    Vec3 support_plane_point = Vec3::Zero();
+    Vec3 support_outward = Vec3::Zero();
 };
 
 double boxShellAddedArea(const Mesh& mesh,
@@ -1382,8 +1432,11 @@ std::vector<RecognizedProtrusion> recognizeSupportProtrusions(
                 minimum_candidate_area_excess_ratio = std::min(
                     minimum_candidate_area_excess_ratio, area_excess);
             if (area_excess > options.protrusion_max_area_excess_ratio) continue;
+            const Face& support_face =
+                mesh.faces[clusters[support.support].front()];
             result.push_back(
-                {box, std::move(faces), group, covered_axis, covered_sign});
+                {box, std::move(faces), group, covered_axis, covered_sign,
+                 true, mesh.vertices[support_face[0]], support.outward});
             for (const auto cluster_id : group) claimed_clusters[cluster_id] = true;
         }
     }
@@ -3381,6 +3434,11 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
     const std::vector<OutputPrimitive>& output,
     double maximum_distance);
 
+Vec3 closestPointOnTriangle(const Vec3& point,
+                            const Vec3& first,
+                            const Vec3& second,
+                            const Vec3& third);
+
 std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
     const Mesh& responsibility_mesh,
     const Mesh& distance_reference,
@@ -3405,6 +3463,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         Primitive surface;
         std::size_t triangles = 0;
         double error = 0.0;
+        std::vector<std::size_t> absorbed_neighbors;
     };
     struct Candidate
     {
@@ -3426,8 +3485,12 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         std::size_t containment_rejections = 0;
         std::size_t connectivity_rejections = 0;
         std::size_t error_rejections = 0;
+        std::size_t workload_rejections = 0;
+        std::size_t protected_cutout_rejections = 0;
         std::size_t unsupported_rejections = 0;
         std::size_t accepted_merges = 0;
+        std::size_t absorbed_neighbors = 0;
+        std::size_t stale_neighbors_removed = 0;
         std::size_t accepted_triangle_increases = 0;
         std::size_t remaining_acceptable_candidates = 0;
         std::size_t certified_distance_accepts = 0;
@@ -3831,59 +3894,132 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         faces.erase(std::unique(faces.begin(), faces.end()), faces.end());
         return faces;
     };
+    const double connection_tolerance = boundary_cell * 2.0;
+    const double connection_tolerance_squared =
+        connection_tolerance * connection_tolerance;
+    const auto surfacesTouch = [&](const Primitive& first_primitive,
+                                   const PrimitiveMesh& first_surface,
+                                   const Primitive& second_primitive,
+                                   const PrimitiveMesh& second_surface)
+    {
+        for (const Vec3& vertex : first_surface.vertices)
+            if (containsPointCached(
+                    second_primitive, second_surface,
+                    vertex, connection_tolerance))
+                return true;
+        for (const Vec3& vertex : second_surface.vertices)
+            if (containsPointCached(
+                    first_primitive, first_surface,
+                    vertex, connection_tolerance))
+                return true;
+        for (const Face& first_face : first_surface.faces)
+            for (int first_edge = 0; first_edge < 3; ++first_edge)
+            {
+                const Vec3& first_begin =
+                    first_surface.vertices[first_face[first_edge]];
+                const Vec3& first_end = first_surface.vertices[
+                    first_face[(first_edge + 1) % 3]];
+                for (const Face& second_face : second_surface.faces)
+                    for (int second_edge = 0; second_edge < 3; ++second_edge)
+                    {
+                        const Vec3& second_begin = second_surface.vertices[
+                            second_face[second_edge]];
+                        const Vec3& second_end = second_surface.vertices[
+                            second_face[(second_edge + 1) % 3]];
+                        if (segmentDistanceSquared(
+                                first_begin, first_end,
+                                second_begin, second_end) <=
+                            connection_tolerance_squared)
+                            return true;
+                    }
+            }
+        const auto segmentTouchesTriangle = [&](const Vec3& begin,
+                                                const Vec3& end,
+                                                const Vec3& first,
+                                                const Vec3& second,
+                                                const Vec3& third)
+        {
+            const Vec3 area_normal =
+                (second - first).cross(third - first);
+            const double area_length = area_normal.norm();
+            if (area_length <= tolerance) return false;
+            const Vec3 normal = area_normal / area_length;
+            const double begin_distance = (begin - first).dot(normal);
+            const double end_distance = (end - first).dot(normal);
+            if ((begin_distance > connection_tolerance &&
+                 end_distance > connection_tolerance) ||
+                (begin_distance < -connection_tolerance &&
+                 end_distance < -connection_tolerance))
+                return false;
+            const double denominator = begin_distance - end_distance;
+            if (std::abs(denominator) <= tolerance) return false;
+            const double parameter = begin_distance / denominator;
+            if (parameter < -1.0e-10 || parameter > 1.0 + 1.0e-10)
+                return false;
+            const Vec3 intersection = begin + (end - begin) *
+                std::clamp(parameter, 0.0, 1.0);
+            return (closestPointOnTriangle(
+                intersection, first, second, third) - intersection).norm() <=
+                connection_tolerance;
+        };
+        // Vertex and edge-to-edge tests miss the common case where an edge of
+        // one finite patch crosses the interior of a triangle in the other.
+        // Test both edge/triangle directions so adjacency reconstruction uses
+        // actual surface contact instead of only coincident boundaries.
+        for (const Face& first_face : first_surface.faces)
+            for (int first_edge = 0; first_edge < 3; ++first_edge)
+            {
+                const Vec3& begin =
+                    first_surface.vertices[first_face[first_edge]];
+                const Vec3& end = first_surface.vertices[
+                    first_face[(first_edge + 1) % 3]];
+                for (const Face& second_face : second_surface.faces)
+                    if (segmentTouchesTriangle(
+                            begin, end,
+                            second_surface.vertices[second_face[0]],
+                            second_surface.vertices[second_face[1]],
+                            second_surface.vertices[second_face[2]]))
+                        return true;
+            }
+        for (const Face& second_face : second_surface.faces)
+            for (int second_edge = 0; second_edge < 3; ++second_edge)
+            {
+                const Vec3& begin =
+                    second_surface.vertices[second_face[second_edge]];
+                const Vec3& end = second_surface.vertices[
+                    second_face[(second_edge + 1) % 3]];
+                for (const Face& first_face : first_surface.faces)
+                    if (segmentTouchesTriangle(
+                            begin, end,
+                            first_surface.vertices[first_face[0]],
+                            first_surface.vertices[first_face[1]],
+                            first_surface.vertices[first_face[2]]))
+                        return true;
+            }
+        return false;
+    };
     const auto fitPair = [&](const std::size_t first,
                              const std::size_t second) -> std::optional<Fit>
     {
         ++profile.fit_attempts;
+        // These fragments surround a support/contact footprint removed from
+        // the actual query shell.  A directed-distance test alone would regard
+        // filling that footprint as zero error because the original support
+        // plane exists there, but doing so recreates an internal face beneath
+        // the protrusion and increases BVH overlap.  Preserve the Boolean
+        // cutout through the subsequent fixed-point merge.
+        if (items[first].output.preserves_cavity_opening ||
+            items[second].output.preserves_cavity_opening)
+        {
+            ++profile.protected_cutout_rejections;
+            return std::nullopt;
+        }
         std::array<PrimitiveMesh, 2> current_surfaces{
             triangulatePrimitive(items[first].output.primitive),
             triangulatePrimitive(items[second].output.primitive)};
-        const double connection_tolerance = boundary_cell * 2.0;
-        const double connection_tolerance_squared =
-            connection_tolerance * connection_tolerance;
-        const auto surfacesTouch = [&](const Primitive& first_primitive,
-                                       const PrimitiveMesh& first_surface,
-                                       const Primitive& second_primitive,
-                                       const PrimitiveMesh& second_surface)
-        {
-            for (const Vec3& vertex : first_surface.vertices)
-                if (containsPointCached(
-                        second_primitive, second_surface,
-                        vertex, connection_tolerance))
-                    return true;
-            for (const Vec3& vertex : second_surface.vertices)
-                if (containsPointCached(
-                        first_primitive, first_surface,
-                        vertex, connection_tolerance))
-                    return true;
-            for (const Face& first_face : first_surface.faces)
-                for (int first_edge = 0; first_edge < 3; ++first_edge)
-                {
-                    const Vec3& first_begin =
-                        first_surface.vertices[first_face[first_edge]];
-                    const Vec3& first_end = first_surface.vertices[
-                        first_face[(first_edge + 1) % 3]];
-                    for (const Face& second_face : second_surface.faces)
-                        for (int second_edge = 0; second_edge < 3;
-                             ++second_edge)
-                        {
-                            const Vec3& second_begin =
-                                second_surface.vertices[
-                                    second_face[second_edge]];
-                            const Vec3& second_end =
-                                second_surface.vertices[
-                                    second_face[(second_edge + 1) % 3]];
-                            if (segmentDistanceSquared(
-                                    first_begin, first_end,
-                                    second_begin, second_end) <=
-                                connection_tolerance_squared)
-                                return true;
-                        }
-                }
-            return false;
-        };
         struct ExternalNeighborSurface
         {
+            std::size_t id = 0;
             PrimitiveMesh surface;
         };
         std::vector<ExternalNeighborSurface> external_neighbors;
@@ -3905,7 +4041,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                     items[second].output.primitive, current_surfaces[1],
                     items[neighbor].output.primitive, neighbor_surface))
                 continue;
-            external_neighbors.push_back({std::move(neighbor_surface)});
+            external_neighbors.push_back({neighbor, std::move(neighbor_surface)});
         }
         const auto first_normal = representativeNormal(
             items[first].output, current_surfaces[0]);
@@ -4003,6 +4139,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             Primitive surface;
             std::size_t triangles = 0;
             double estimated_error = 0.0;
+            std::vector<std::size_t> absorbed_neighbors;
         };
         std::vector<GeometricCandidate> geometric_candidates;
         for (Vec3 normal : unique_directions)
@@ -4037,7 +4174,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 continue;
             }
             std::vector<Vec3> candidate_points = points;
-            bool preserves_connections = true;
             for (const auto& neighbor : external_neighbors)
             {
                 std::vector<Vec3> intersections;
@@ -4082,19 +4218,9 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                         }
                     }
                 }
-                if (intersections.empty())
-                {
-                    preserves_connections = false;
-                    break;
-                }
                 candidate_points.insert(
                     candidate_points.end(),
                     intersections.begin(), intersections.end());
-            }
-            if (!preserves_connections)
-            {
-                ++profile.connectivity_rejections;
-                continue;
             }
             const Mat3 basis = orthonormalFrame(normal);
             Mat3 frame;
@@ -4176,9 +4302,93 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                     ++profile.containment_rejections;
                     continue;
                 }
+                // Replacing an adjacent pair must not leave an exposed seam.
+                // A former neighbor is valid after the replacement when the
+                // new finite surface still touches it.  The only exception is
+                // a same-facing patch that lies completely behind, and whose
+                // entire projection is covered by, the new outward support
+                // surface.  Such a patch has become internal and is absorbed
+                // immediately, together with its responsibility triangles.
+                // Requiring an intersection with every historical neighbor was
+                // too strong, while blindly inheriting every old graph edge
+                // preserved adjacencies that no longer existed geometrically.
+                std::vector<std::size_t> absorbed_neighbors;
+                std::unordered_set<std::size_t> visited_neighbors;
+                std::queue<std::size_t> neighbor_queue;
+                for (const auto& neighbor : external_neighbors)
+                    neighbor_queue.push(neighbor.id);
+                double absorbed_error = maximum_removed_surface_distance;
+                bool preserves_connections = true;
+                while (!neighbor_queue.empty())
+                {
+                    const std::size_t neighbor_id = neighbor_queue.front();
+                    neighbor_queue.pop();
+                    if (!visited_neighbors.insert(neighbor_id).second ||
+                        !items[neighbor_id].active || neighbor_id == first ||
+                        neighbor_id == second)
+                        continue;
+                    const PrimitiveMesh neighbor_surface = triangulatePrimitive(
+                        items[neighbor_id].output.primitive);
+                    if (surfacesTouch(
+                            surface, candidate_surface,
+                            items[neighbor_id].output.primitive,
+                            neighbor_surface))
+                        continue;
+
+                    const auto neighbor_normal = representativeNormal(
+                        items[neighbor_id].output, neighbor_surface);
+                    bool occluded = neighbor_normal &&
+                        candidate_normal.dot(*neighbor_normal) >=
+                            1.0 - 1.0e-8;
+                    double neighbor_depth = 0.0;
+                    if (occluded)
+                        for (const Vec3& vertex : neighbor_surface.vertices)
+                        {
+                            const double signed_distance =
+                                (vertex - candidate_point).dot(candidate_normal);
+                            neighbor_depth = std::max(
+                                neighbor_depth, -signed_distance);
+                            if (signed_distance > connection_tolerance ||
+                                neighbor_depth >
+                                    maximum_open_error_distance + tolerance ||
+                                !containsPointCached(
+                                    surface, candidate_surface,
+                                    vertex - candidate_normal * signed_distance,
+                                    connection_tolerance))
+                            {
+                                occluded = false;
+                                break;
+                            }
+                        }
+                    if (!occluded)
+                    {
+                        preserves_connections = false;
+                        break;
+                    }
+                    absorbed_error = std::max(absorbed_error, neighbor_depth);
+                    absorbed_neighbors.push_back(neighbor_id);
+                    for (const auto next : items[neighbor_id].neighbors)
+                        neighbor_queue.push(next);
+                }
+                if (!preserves_connections)
+                {
+                    ++profile.connectivity_rejections;
+                    continue;
+                }
+                std::size_t replaced_triangles =
+                    current_surfaces[0].faces.size() +
+                    current_surfaces[1].faces.size();
+                for (const auto absorbed : absorbed_neighbors)
+                    replaced_triangles += triangulatePrimitive(
+                        items[absorbed].output.primitive).faces.size();
+                if (boundary.size() - 2 > replaced_triangles)
+                {
+                    ++profile.workload_rejections;
+                    continue;
+                }
                 geometric_candidates.push_back({
                     std::move(surface), boundary.size() - 2,
-                    maximum_removed_surface_distance});
+                    absorbed_error, std::move(absorbed_neighbors)});
             }
         }
         std::sort(geometric_candidates.begin(), geometric_candidates.end(),
@@ -4213,7 +4423,8 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             {
                 ++profile.certified_distance_accepts;
                 return Fit{std::move(candidate.surface), candidate.triangles,
-                           candidate.estimated_error};
+                           candidate.estimated_error,
+                           std::move(candidate.absorbed_neighbors)};
             }
             ++profile.fine_distance_evaluations;
             const auto fine_distance_started = std::chrono::steady_clock::now();
@@ -4230,7 +4441,8 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 continue;
             }
             return Fit{std::move(candidate.surface), candidate.triangles,
-                       candidate.estimated_error};
+                       candidate.estimated_error,
+                       std::move(candidate.absorbed_neighbors)};
         }
         if (geometric_candidates.empty())
             ++profile.unsupported_rejections;
@@ -4298,61 +4510,107 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             continue;
         const auto fit = evaluate(candidate.first, candidate.second);
         if (!fit) continue;
-        const std::size_t replaced_triangles =
+        std::size_t replaced_triangles =
             triangulatePrimitive(items[candidate.first].output.primitive).faces.size() +
             triangulatePrimitive(items[candidate.second].output.primitive).faces.size();
+        for (const auto absorbed : fit->absorbed_neighbors)
+            if (absorbed != candidate.first && absorbed != candidate.second &&
+                items[absorbed].active)
+                replaced_triangles += triangulatePrimitive(
+                    items[absorbed].output.primitive).faces.size();
+        if (fit->triangles > replaced_triangles)
+        {
+            ++profile.workload_rejections;
+            continue;
+        }
+        std::vector<std::size_t> consumed{
+            candidate.first, candidate.second};
+        consumed.insert(consumed.end(), fit->absorbed_neighbors.begin(),
+                        fit->absorbed_neighbors.end());
+        std::sort(consumed.begin(), consumed.end());
+        consumed.erase(std::unique(consumed.begin(), consumed.end()),
+                       consumed.end());
         OutputPrimitive replacement;
         replacement.primitive = fit->surface;
-        replacement.source_faces = responsibilityFaces(
-            candidate.first, candidate.second);
-        replacement.shallow_shell_coalesced =
-            items[candidate.first].output.shallow_shell_coalesced ||
-            items[candidate.second].output.shallow_shell_coalesced;
-        replacement.preserves_cavity_opening =
-            items[candidate.first].output.preserves_cavity_opening ||
-            items[candidate.second].output.preserves_cavity_opening;
+        std::uint64_t common_enclosure =
+            items[candidate.first].output.enclosure_group;
+        bool common_enclosure_valid = true;
+        std::vector<std::uint32_t> merged_source_vertices;
+        for (const auto index : consumed)
+        {
+            replacement.source_faces.insert(
+                replacement.source_faces.end(),
+                items[index].output.source_faces.begin(),
+                items[index].output.source_faces.end());
+            merged_source_vertices.insert(
+                merged_source_vertices.end(),
+                items[index].source_vertices.begin(),
+                items[index].source_vertices.end());
+            replacement.shallow_shell_coalesced |=
+                items[index].output.shallow_shell_coalesced;
+            replacement.preserves_cavity_opening |=
+                items[index].output.preserves_cavity_opening;
+            common_enclosure_valid &=
+                items[index].output.enclosure_group == common_enclosure;
+        }
+        std::sort(replacement.source_faces.begin(),
+                  replacement.source_faces.end());
+        replacement.source_faces.erase(
+            std::unique(replacement.source_faces.begin(),
+                        replacement.source_faces.end()),
+            replacement.source_faces.end());
         replacement.enclosure_group =
-            items[candidate.first].output.enclosure_group ==
-                    items[candidate.second].output.enclosure_group
-                ? items[candidate.first].output.enclosure_group : 0;
-        std::vector<std::uint32_t> merged_source_vertices =
-            std::move(items[candidate.first].source_vertices);
-        merged_source_vertices.insert(
-            merged_source_vertices.end(),
-            items[candidate.second].source_vertices.begin(),
-            items[candidate.second].source_vertices.end());
+            common_enclosure_valid ? common_enclosure : 0;
         std::sort(merged_source_vertices.begin(), merged_source_vertices.end());
         merged_source_vertices.erase(
             std::unique(merged_source_vertices.begin(),
                         merged_source_vertices.end()),
             merged_source_vertices.end());
+        std::vector<std::size_t> affected;
+        for (const auto index : consumed)
+            affected.insert(affected.end(), items[index].neighbors.begin(),
+                            items[index].neighbors.end());
+        std::sort(affected.begin(), affected.end());
+        affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
         items[candidate.first].output = std::move(replacement);
         items[candidate.first].source_vertices =
             std::move(merged_source_vertices);
         ++items[candidate.first].version;
-        items[candidate.second].active = false;
-        std::vector<std::uint32_t>().swap(
-            items[candidate.second].source_vertices);
-        ++items[candidate.second].version;
-        std::vector<std::size_t> affected(
-            items[candidate.first].neighbors.begin(),
-            items[candidate.first].neighbors.end());
-        affected.insert(affected.end(), items[candidate.second].neighbors.begin(),
-                        items[candidate.second].neighbors.end());
-        std::sort(affected.begin(), affected.end());
-        affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+        for (const auto index : consumed)
+        {
+            if (index == candidate.first) continue;
+            items[index].active = false;
+            std::vector<std::uint32_t>().swap(items[index].source_vertices);
+            ++items[index].version;
+        }
         items[candidate.first].neighbors.clear();
+        const PrimitiveMesh replacement_surface = triangulatePrimitive(
+            items[candidate.first].output.primitive);
         for (const auto neighbor : affected)
         {
-            if (neighbor == candidate.first || neighbor == candidate.second ||
-                !items[neighbor].active) continue;
-            items[neighbor].neighbors.erase(candidate.second);
-            items[neighbor].neighbors.insert(candidate.first);
-            items[candidate.first].neighbors.insert(neighbor);
+            for (const auto index : consumed)
+                items[neighbor].neighbors.erase(index);
+            if (std::binary_search(consumed.begin(), consumed.end(), neighbor) ||
+                !items[neighbor].active)
+                continue;
+            const PrimitiveMesh neighbor_surface = triangulatePrimitive(
+                items[neighbor].output.primitive);
+            if (surfacesTouch(
+                    items[candidate.first].output.primitive,
+                    replacement_surface,
+                    items[neighbor].output.primitive, neighbor_surface))
+            {
+                items[neighbor].neighbors.insert(candidate.first);
+                items[candidate.first].neighbors.insert(neighbor);
+            }
+            else
+                ++profile.stale_neighbors_removed;
         }
-        items[candidate.second].neighbors.clear();
-        ++merged_count;
+        for (const auto index : consumed)
+            if (index != candidate.first) items[index].neighbors.clear();
+        merged_count += consumed.size() - 1;
         ++profile.accepted_merges;
+        profile.absorbed_neighbors += consumed.size() - 2;
         if (fit->triangles > replaced_triangles)
             ++profile.accepted_triangle_increases;
         for (const auto neighbor : items[candidate.first].neighbors)
@@ -4400,8 +4658,14 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         << ",\"connectivity_rejections\":"
         << profile.connectivity_rejections
         << ",\"error_rejections\":" << profile.error_rejections
+        << ",\"workload_rejections\":" << profile.workload_rejections
+        << ",\"protected_cutout_rejections\":"
+        << profile.protected_cutout_rejections
         << ",\"unsupported_rejections\":" << profile.unsupported_rejections
         << ",\"accepted_merges\":" << profile.accepted_merges
+        << ",\"absorbed_neighbors\":" << profile.absorbed_neighbors
+        << ",\"stale_neighbors_removed\":"
+        << profile.stale_neighbors_removed
         << ",\"accepted_triangle_increases\":"
         << profile.accepted_triangle_increases
         << ",\"remaining_acceptable_candidates\":"
@@ -5217,6 +5481,22 @@ std::vector<OutputPrimitive> canonicalizeCoplanarPrimitiveUnion(
                 [](const auto& path) { return !Clipper2Lib::IsPositive(path); });
             if (has_holes)
             {
+                // A clean support-contact partition is deliberately split into
+                // local polygons so PQSS receives compact leaf triangles.  Its
+                // union has holes by construction; globally retriangulating the
+                // union would recreate long triangles spanning between distant
+                // contacts.  With no measured overlap there is nothing for the
+                // canonicalizer to remove, so preserve the local partition.
+                if (preserves_cavity_opening &&
+                    overlap_area <= tolerance * tolerance)
+                {
+                    for (const std::size_t index : group)
+                    {
+                        consumed[index] = true;
+                        result.push_back(std::move(primitives[index]));
+                    }
+                    continue;
+                }
                 // A polygon-with-hole is represented as a set of non-overlapping
                 // triangular Polygon primitives. This preserves the hole and
                 // removes overlap without introducing a polygon-with-hole type.
@@ -5691,6 +5971,320 @@ void appendBoxRectangles(std::vector<OutputPrimitive>& output,
             output.push_back(std::move(item));
         }
     }
+}
+
+struct SupportClippedBoxStats
+{
+    std::size_t clipped_faces = 0;
+    std::size_t discarded_faces = 0;
+    double maximum_removed_penetration = 0.0;
+};
+
+void appendSupportClippedBoxSurfaces(
+    std::vector<OutputPrimitive>& output,
+    const RecognizedProtrusion& candidate,
+    const double tolerance,
+    SupportClippedBoxStats& stats)
+{
+    std::vector<OutputPrimitive> box_surfaces;
+    appendBoxRectangles(
+        box_surfaces, candidate.box, candidate.faces,
+        candidate.covered_face_axis, candidate.covered_face_sign, 0);
+    if (!candidate.has_support_plane)
+    {
+        output.insert(output.end(),
+                      std::make_move_iterator(box_surfaces.begin()),
+                      std::make_move_iterator(box_surfaces.end()));
+        return;
+    }
+
+    const Vec3 outward = candidate.support_outward.normalized();
+    const auto signedDistance = [&](const Vec3& point)
+    {
+        return (point - candidate.support_plane_point).dot(outward);
+    };
+    const auto clipToOutsideHalfspace = [&](const std::vector<Vec3>& boundary)
+    {
+        std::vector<Vec3> clipped;
+        if (boundary.empty()) return clipped;
+        for (std::size_t index = 0; index < boundary.size(); ++index)
+        {
+            const Vec3& first = boundary[index];
+            const Vec3& second = boundary[(index + 1) % boundary.size()];
+            const double first_distance = signedDistance(first);
+            const double second_distance = signedDistance(second);
+            const bool first_inside = first_distance >= -tolerance;
+            const bool second_inside = second_distance >= -tolerance;
+            stats.maximum_removed_penetration = std::max(
+                stats.maximum_removed_penetration,
+                std::max(-first_distance, 0.0));
+            if (first_inside) clipped.push_back(first);
+            if (first_inside == second_inside) continue;
+            const double denominator = first_distance - second_distance;
+            if (std::abs(denominator) <= 1.0e-30) continue;
+            const double parameter = std::clamp(
+                first_distance / denominator, 0.0, 1.0);
+            clipped.push_back(first + (second - first) * parameter);
+        }
+        std::vector<Vec3> cleaned;
+        cleaned.reserve(clipped.size());
+        for (const Vec3& point : clipped)
+            if (cleaned.empty() ||
+                (point - cleaned.back()).norm() > tolerance)
+                cleaned.push_back(point);
+        if (cleaned.size() > 1 &&
+            (cleaned.front() - cleaned.back()).norm() <= tolerance)
+            cleaned.pop_back();
+        bool changed = true;
+        while (changed && cleaned.size() >= 3)
+        {
+            changed = false;
+            for (std::size_t index = 0; index < cleaned.size(); ++index)
+            {
+                const Vec3 first = cleaned[index] -
+                    cleaned[(index + cleaned.size() - 1) % cleaned.size()];
+                const Vec3 second = cleaned[(index + 1) % cleaned.size()] -
+                    cleaned[index];
+                const double scale = std::max(first.norm() * second.norm(),
+                                              1.0e-30);
+                if (first.cross(second).norm() > tolerance * scale)
+                    continue;
+                cleaned.erase(cleaned.begin() + index);
+                changed = true;
+                break;
+            }
+        }
+        return cleaned;
+    };
+
+    for (OutputPrimitive& surface : box_surfaces)
+    {
+        const PrimitiveMesh rectangle = triangulatePrimitive(surface.primitive);
+        const std::vector<Vec3> boundary{
+            rectangle.vertices[0], rectangle.vertices[2],
+            rectangle.vertices[3], rectangle.vertices[1]};
+        const bool penetrates = std::any_of(
+            boundary.begin(), boundary.end(), [&](const Vec3& point)
+            { return signedDistance(point) < -tolerance; });
+        if (!penetrates)
+        {
+            output.push_back(std::move(surface));
+            continue;
+        }
+        std::vector<Vec3> clipped = clipToOutsideHalfspace(boundary);
+        if (clipped.size() < 3)
+        {
+            ++stats.discarded_faces;
+            continue;
+        }
+        surface.primitive = Primitive{};
+        surface.primitive.kind = Kind::Polygon;
+        surface.primitive.polygon = std::move(clipped);
+        output.push_back(std::move(surface));
+        ++stats.clipped_faces;
+    }
+}
+
+std::vector<Vec2> boxPlaneCrossSection(const BoxFit& box,
+                                       const Vec3& origin,
+                                       const Mat3& frame,
+                                       double tolerance,
+                                       bool& occupies_negative_side,
+                                       bool& occupies_positive_side);
+
+struct SupportContactClipStats
+{
+    std::size_t clipped_primitives = 0;
+    std::size_t removed_primitives = 0;
+    std::size_t output_fragments = 0;
+    double removed_area = 0.0;
+};
+
+std::vector<OutputPrimitive> clipSupportContactOcclusion(
+    std::vector<OutputPrimitive> primitives,
+    const std::vector<RecognizedProtrusion>& protrusions,
+    const double tolerance,
+    std::vector<OutputPrimitive>& coverage_certificates,
+    SupportContactClipStats& stats)
+{
+    constexpr int clipper_precision = 8;
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size());
+    for (OutputPrimitive& candidate : primitives)
+    {
+        if (candidate.primitive.kind != Kind::Polygon ||
+            candidate.primitive.polygon.size() < 3)
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        Vec3 normal;
+        if (!planarNormal(candidate.primitive, tolerance, normal))
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        const Vec3 origin = candidate.primitive.polygon.front();
+        const Mat3 basis = orthonormalFrame(normal);
+        Mat3 frame;
+        frame.col(0) = basis.col(1);
+        frame.col(1) = basis.col(2);
+        frame.col(2) = normal;
+        Clipper2Lib::PathD candidate_path;
+        for (const Vec3& vertex : candidate.primitive.polygon)
+        {
+            const Vec3 local = frame.transposeMultiply(vertex - origin);
+            candidate_path.emplace_back(local.x(), local.y());
+        }
+        if (Clipper2Lib::Area(candidate_path) < 0.0)
+            std::reverse(candidate_path.begin(), candidate_path.end());
+
+        Clipper2Lib::PathsD contact_paths;
+        for (const RecognizedProtrusion& protrusion : protrusions)
+        {
+            if (!protrusion.has_support_plane ||
+                std::abs(normal.dot(protrusion.support_outward)) <
+                    1.0 - 1.0e-8 ||
+                std::abs((origin - protrusion.support_plane_point).dot(
+                    protrusion.support_outward)) > tolerance * 16.0)
+                continue;
+            bool occupies_negative_side = false;
+            bool occupies_positive_side = false;
+            std::vector<Vec2> section = boxPlaneCrossSection(
+                protrusion.box, origin, frame, tolerance * 8.0,
+                occupies_negative_side, occupies_positive_side);
+            if (section.size() < 3) continue;
+            Clipper2Lib::PathD path;
+            path.reserve(section.size());
+            for (const Vec2& point : section)
+                path.emplace_back(point.x(), point.y());
+            if (Clipper2Lib::Area(path) < 0.0)
+                std::reverse(path.begin(), path.end());
+            contact_paths.push_back(std::move(path));
+        }
+        if (contact_paths.empty())
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        const auto contacts = Clipper2Lib::Union(
+            contact_paths, Clipper2Lib::FillRule::NonZero,
+            clipper_precision);
+        const auto remaining = Clipper2Lib::Difference(
+            Clipper2Lib::PathsD{candidate_path}, contacts,
+            Clipper2Lib::FillRule::NonZero, clipper_precision);
+        const double removed_area = std::max(
+            std::abs(Clipper2Lib::Area(candidate_path)) -
+                std::abs(Clipper2Lib::Area(remaining)),
+            0.0);
+        if (removed_area <= tolerance * tolerance)
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+
+        // The uncut owner remains an audit-only certificate.  It is never
+        // exported or inserted into the PQSS BVH; the query geometry contains
+        // only the visible support fragments around the contact footprint.
+        coverage_certificates.push_back(candidate);
+        stats.removed_area += removed_area;
+        ++stats.clipped_primitives;
+        if (remaining.empty())
+        {
+            ++stats.removed_primitives;
+            continue;
+        }
+
+        Clipper2Lib::PathsD output_paths = remaining;
+        if (std::any_of(remaining.begin(), remaining.end(),
+            [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
+        {
+            // Do not triangulate one large polygon around every contact hole.
+            // Constrained triangulation tends to connect a hole corner to a
+            // distant outer corner, producing long triangles with large RSS
+            // bounds.  Slice at every contact-vertex ordinate instead.  Within
+            // one open strip a contact crosses the strip boundary, so the
+            // remaining pieces are local simple polygons rather than a polygon
+            // with holes.
+            double lower_x = std::numeric_limits<double>::infinity();
+            double upper_x = -std::numeric_limits<double>::infinity();
+            double lower_y = std::numeric_limits<double>::infinity();
+            double upper_y = -std::numeric_limits<double>::infinity();
+            for (const auto& point : candidate_path)
+            {
+                lower_x = std::min(lower_x, point.x);
+                upper_x = std::max(upper_x, point.x);
+                lower_y = std::min(lower_y, point.y);
+                upper_y = std::max(upper_y, point.y);
+            }
+            std::vector<double> cuts{lower_y, upper_y};
+            for (const auto& path : contacts)
+                for (const auto& point : path)
+                    if (point.y > lower_y + tolerance &&
+                        point.y < upper_y - tolerance)
+                        cuts.push_back(point.y);
+            std::sort(cuts.begin(), cuts.end());
+            cuts.erase(std::unique(cuts.begin(), cuts.end(),
+                [&](const double first, const double second)
+                { return std::abs(first - second) <= tolerance; }), cuts.end());
+            output_paths.clear();
+            const double margin = std::max(
+                upper_x - lower_x, tolerance * 32.0);
+            for (std::size_t strip = 0; strip + 1 < cuts.size(); ++strip)
+            {
+                if (cuts[strip + 1] - cuts[strip] <= tolerance) continue;
+                Clipper2Lib::PathD slab{
+                    {lower_x - margin, cuts[strip]},
+                    {upper_x + margin, cuts[strip]},
+                    {upper_x + margin, cuts[strip + 1]},
+                    {lower_x - margin, cuts[strip + 1]},
+                };
+                const auto subject_piece = Clipper2Lib::Intersect(
+                    Clipper2Lib::PathsD{candidate_path},
+                    Clipper2Lib::PathsD{slab},
+                    Clipper2Lib::FillRule::NonZero, clipper_precision);
+                if (subject_piece.empty()) continue;
+                auto strip_remaining = Clipper2Lib::Difference(
+                    subject_piece, contacts, Clipper2Lib::FillRule::NonZero,
+                    clipper_precision);
+                if (std::any_of(strip_remaining.begin(), strip_remaining.end(),
+                    [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
+                {
+                    Clipper2Lib::PathsD triangles;
+                    if (Clipper2Lib::Triangulate(
+                            strip_remaining, clipper_precision, triangles,
+                            false) != Clipper2Lib::TriangulateResult::success)
+                        throw std::runtime_error(
+                            "failed to triangulate a sliced support contact subtraction");
+                    strip_remaining = std::move(triangles);
+                }
+                output_paths.insert(
+                    output_paths.end(),
+                    std::make_move_iterator(strip_remaining.begin()),
+                    std::make_move_iterator(strip_remaining.end()));
+            }
+        }
+        for (const auto& path : output_paths)
+        {
+            if (std::abs(Clipper2Lib::Area(path)) <=
+                tolerance * tolerance) continue;
+            std::vector<Vec2> boundary;
+            boundary.reserve(path.size());
+            for (const auto& point : path)
+                boundary.emplace_back(point.x, point.y);
+            boundary = simplifyPolygon(std::move(boundary), tolerance);
+            if (boundary.size() < 3 ||
+                triangulatePolygon(boundary).size() + 2 != boundary.size())
+                throw std::runtime_error(
+                    "support contact subtraction produced an invalid polygon");
+            OutputPrimitive fragment = candidate;
+            fragment.primitive = polygonPrimitive(boundary, origin, frame);
+            fragment.preserves_cavity_opening = true;
+            result.push_back(std::move(fragment));
+            ++stats.output_fragments;
+        }
+    }
+    return result;
 }
 
 std::vector<BoxFit> selectActiveBoxCertificates(
@@ -7820,6 +8414,418 @@ double maximumFilledSurfaceDistance(
     return measureFilledSurfaceDistance(
         *cache.reference, triangulateOutputPrimitives(output),
         sample_spacing, maximum_distance).maximum_distance;
+}
+
+std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
+    const Mesh& source_mesh,
+    const Mesh& filled_surface_mesh,
+    std::vector<OutputPrimitive> primitives,
+    const double tolerance,
+    const double maximum_error_distance,
+    const double error_sample_spacing,
+    std::size_t& merged_group_count,
+    std::vector<BoxFit>& accepted_boxes,
+    const std::filesystem::path& profile_path)
+{
+    merged_group_count = 0;
+    if (primitives.size() < 2) return primitives;
+    const auto started = std::chrono::steady_clock::now();
+    struct Record
+    {
+        std::size_t primitive = 0;
+        Bounds bounds;
+        Vec3 center = Vec3::Zero();
+        std::size_t triangles = 0;
+        bool polygon_surface = false;
+    };
+    std::vector<Record> records;
+    records.reserve(primitives.size());
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+    {
+        const PrimitiveMesh surface = triangulatePrimitive(
+            primitives[index].primitive);
+        Bounds bounds;
+        for (const Vec3& vertex : surface.vertices)
+        {
+            bounds.lower = bounds.lower.cwiseMin(vertex);
+            bounds.upper = bounds.upper.cwiseMax(vertex);
+        }
+        const Kind kind = primitives[index].primitive.kind;
+        records.push_back({index, bounds, (bounds.lower + bounds.upper) * 0.5,
+                           surface.faces.size(),
+                           kind == Kind::Polygon || kind == Kind::Rectangle ||
+                           kind == Kind::Triangle});
+    }
+    std::vector<std::size_t> order(records.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::uint64_t next_enclosure_group = 1;
+    for (const OutputPrimitive& primitive : primitives)
+        next_enclosure_group = std::max(
+            next_enclosure_group, primitive.enclosure_group + 1);
+
+    struct Profile
+    {
+        std::size_t nodes = 0;
+        std::size_t box_candidates = 0;
+        std::size_t analytic_rejections = 0;
+        std::size_t workload_rejections = 0;
+        std::size_t error_rejections = 0;
+        std::size_t accepted_boxes = 0;
+        std::size_t certificate_samples = 0;
+        double distance_seconds = 0.0;
+    } profile;
+    const auto writeProfile = [&](const bool complete)
+    {
+        std::ofstream stream(profile_path);
+        stream << std::setprecision(17)
+               << "{\"complete\":" << (complete ? "true" : "false")
+               << ",\"surface_candidates_only\":true"
+               << ",\"input_primitives\":" << primitives.size()
+               << ",\"hierarchy_nodes\":" << profile.nodes
+               << ",\"box_surface_set_candidates\":"
+               << profile.box_candidates
+               << ",\"analytic_rejections\":"
+               << profile.analytic_rejections
+               << ",\"workload_rejections\":"
+               << profile.workload_rejections
+               << ",\"error_rejections\":" << profile.error_rejections
+               << ",\"accepted_box_surface_sets\":"
+               << profile.accepted_boxes
+               << ",\"certificate_samples\":"
+               << profile.certificate_samples
+               << ",\"distance_seconds\":" << profile.distance_seconds
+               << ",\"total_seconds\":" << std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count()
+               << "}\n";
+    };
+    writeProfile(false);
+
+    const auto solve = [&](auto&& self, const std::size_t begin,
+                           const std::size_t end)
+        -> std::vector<OutputPrimitive>
+    {
+        ++profile.nodes;
+        const std::size_t count = end - begin;
+        if (count == 1)
+            return {primitives[records[order[begin]].primitive]};
+
+        std::size_t original_triangles = 0;
+        bool polygon_surfaces_only = true;
+        Bounds center_bounds;
+        for (std::size_t offset = begin; offset < end; ++offset)
+        {
+            const Record& record = records[order[offset]];
+            center_bounds.lower = center_bounds.lower.cwiseMin(record.center);
+            center_bounds.upper = center_bounds.upper.cwiseMax(record.center);
+            original_triangles += record.triangles;
+            polygon_surfaces_only &= record.polygon_surface;
+        }
+
+        if (!polygon_surfaces_only)
+            ++profile.analytic_rejections;
+        else if (original_triangles <= 12)
+            ++profile.workload_rejections;
+        else
+        {
+            Mesh fitting_mesh;
+            std::vector<std::uint32_t> fitting_vertices;
+            std::vector<std::uint32_t> responsibility;
+            for (std::size_t offset = begin; offset < end; ++offset)
+            {
+                const OutputPrimitive& item =
+                    primitives[records[order[offset]].primitive];
+                const PrimitiveMesh surface =
+                    triangulatePrimitive(item.primitive);
+                for (const Vec3& vertex : surface.vertices)
+                {
+                    fitting_vertices.push_back(static_cast<std::uint32_t>(
+                        fitting_mesh.vertices.size()));
+                    fitting_mesh.vertices.push_back(vertex);
+                }
+                responsibility.insert(responsibility.end(),
+                                      item.source_faces.begin(),
+                                      item.source_faces.end());
+            }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            BoxFit box = fitBox(fitting_mesh, fitting_vertices);
+            Vec3 local_lower = -box.half_size;
+            Vec3 local_upper = box.half_size;
+            for (const std::uint32_t face_id : responsibility)
+            {
+                if (face_id >= source_mesh.faces.size()) continue;
+                for (const std::uint32_t vertex_id : source_mesh.faces[face_id])
+                {
+                    if (vertex_id >= source_mesh.vertices.size()) continue;
+                    const Vec3 local = box.axes.transposeMultiply(
+                        source_mesh.vertices[vertex_id] - box.center);
+                    local_lower = local_lower.cwiseMin(local);
+                    local_upper = local_upper.cwiseMax(local);
+                }
+            }
+            const Vec3 local_center = (local_lower + local_upper) * 0.5;
+            box.center += box.axes * local_center;
+            box.half_size = (local_upper - local_lower) * 0.5;
+            box.volume = 8.0 * box.half_size.prod();
+            const Vec3 extent = box.half_size * 2.0;
+            if (extent.x() > tolerance && extent.y() > tolerance &&
+                extent.z() > tolerance)
+            {
+                std::vector<OutputPrimitive> candidate;
+                appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
+                                    next_enclosure_group);
+                ++profile.box_candidates;
+                const auto distance_started = std::chrono::steady_clock::now();
+                const FilledSurfaceDistanceCertificate certificate =
+                    certifyFilledSurfaceDistance(
+                        filled_surface_mesh, candidate,
+                        maximum_error_distance + tolerance);
+                profile.certificate_samples += certificate.samples;
+                bool accepted = certificate.certified && !certificate.exceeded;
+                if (!accepted && !certificate.exceeded)
+                    accepted = maximumFilledSurfaceDistance(
+                        filled_surface_mesh, candidate, error_sample_spacing,
+                        maximum_error_distance + tolerance) <=
+                        maximum_error_distance + tolerance;
+                profile.distance_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - distance_started).count();
+                if (accepted)
+                {
+                    ++next_enclosure_group;
+                    ++profile.accepted_boxes;
+                    ++merged_group_count;
+                    accepted_boxes.push_back(box);
+                    return candidate;
+                }
+                ++profile.error_rejections;
+            }
+        }
+
+        const Vec3 center_extent = center_bounds.upper - center_bounds.lower;
+        int axis = 0;
+        if (center_extent.y() > center_extent.x()) axis = 1;
+        if (center_extent.z() > center_extent[axis]) axis = 2;
+        const std::size_t middle = begin + count / 2;
+        std::nth_element(order.begin() + begin, order.begin() + middle,
+                         order.begin() + end,
+            [&](const std::size_t first, const std::size_t second)
+            {
+                return records[first].center[axis] < records[second].center[axis];
+            });
+        auto left = self(self, begin, middle);
+        auto right = self(self, middle, end);
+        left.insert(left.end(), std::make_move_iterator(right.begin()),
+                    std::make_move_iterator(right.end()));
+        return left;
+    };
+
+    auto result = solve(solve, 0, order.size());
+    writeProfile(true);
+    return result;
+}
+
+std::vector<OutputPrimitive> mergeSupportProtrusionSurfaceSets(
+    const Mesh& source_mesh,
+    const Mesh& filled_surface_mesh,
+    std::vector<OutputPrimitive> primitives,
+    const PrimitiveMeshAnalysisOptions& options,
+    const double model_diagonal,
+    const double model_surface_area,
+    const double tolerance,
+    const double maximum_error_distance,
+    const double error_sample_spacing,
+    std::size_t& accepted_count,
+    std::vector<OutputPrimitive>& occluded_support_certificates,
+    const std::filesystem::path& profile_path)
+{
+    const auto started = std::chrono::steady_clock::now();
+    accepted_count = 0;
+    std::vector<bool> represented_faces(source_mesh.faces.size(), false);
+    for (const OutputPrimitive& primitive : primitives)
+        for (const auto face : primitive.source_faces)
+            if (face < represented_faces.size()) represented_faces[face] = true;
+
+    std::vector<std::unordered_set<std::uint32_t>> adjacency;
+    const auto clusters = coplanarClusters(
+        source_mesh, model_diagonal * options.coplanar_relative_tolerance,
+        adjacency, &represented_faces);
+    std::vector<bool> claimed_clusters(clusters.size(), false);
+    PrimitiveMeshAnalysisOptions candidate_options = options;
+    // Candidate generation may be permissive; acceptance below is controlled
+    // solely by the user's directed-distance limit and triangle workload.
+    candidate_options.recognize_support_protrusions = true;
+    candidate_options.protrusion_max_area_excess_ratio =
+        std::numeric_limits<double>::infinity();
+    double minimum_area_excess = -1.0;
+    const auto candidates = recognizeSupportProtrusions(
+        source_mesh, clusters, adjacency, candidate_options,
+        model_diagonal, model_surface_area, claimed_clusters,
+        minimum_area_excess);
+
+    struct Profile
+    {
+        std::size_t generated = 0;
+        std::size_t overlap_rejections = 0;
+        std::size_t ownership_rejections = 0;
+        std::size_t workload_rejections = 0;
+        std::size_t error_rejections = 0;
+        std::size_t accepted = 0;
+        std::size_t consumed_primitives = 0;
+        std::size_t certificate_samples = 0;
+        std::size_t support_clipped_candidates = 0;
+        std::size_t support_clipped_faces = 0;
+        std::size_t support_discarded_faces = 0;
+        double maximum_removed_penetration = 0.0;
+        std::size_t contact_clipped_primitives = 0;
+        std::size_t contact_removed_primitives = 0;
+        std::size_t contact_output_fragments = 0;
+        double contact_removed_area = 0.0;
+        double distance_seconds = 0.0;
+    } profile;
+    profile.generated = candidates.size();
+    std::vector<bool> consumed(primitives.size(), false);
+    std::vector<bool> claimed_faces(source_mesh.faces.size(), false);
+    std::vector<OutputPrimitive> replacements;
+    std::vector<RecognizedProtrusion> accepted_protrusions;
+    for (const RecognizedProtrusion& candidate : candidates)
+    {
+        if (std::any_of(candidate.faces.begin(), candidate.faces.end(),
+            [&](const auto face)
+            { return face < claimed_faces.size() && claimed_faces[face]; }))
+        {
+            ++profile.overlap_rejections;
+            continue;
+        }
+        std::unordered_set<std::uint32_t> face_set(
+            candidate.faces.begin(), candidate.faces.end());
+        std::vector<std::size_t> owners;
+        std::size_t original_triangles = 0;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed[index] || primitives[index].source_faces.empty()) continue;
+            const bool has_candidate_face = std::any_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return face_set.contains(face); });
+            if (!has_candidate_face) continue;
+            const bool fully_owned = std::all_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return face_set.contains(face); });
+            if (!fully_owned) continue;
+            owners.push_back(index);
+            original_triangles += triangulatePrimitive(
+                primitives[index].primitive).faces.size();
+        }
+        if (owners.empty())
+        {
+            ++profile.ownership_rejections;
+            continue;
+        }
+        std::vector<OutputPrimitive> surface_set;
+        SupportClippedBoxStats clip_stats;
+        appendSupportClippedBoxSurfaces(
+            surface_set, candidate, tolerance, clip_stats);
+        if (clip_stats.clipped_faces != 0 ||
+            clip_stats.discarded_faces != 0)
+            ++profile.support_clipped_candidates;
+        profile.support_clipped_faces += clip_stats.clipped_faces;
+        profile.support_discarded_faces += clip_stats.discarded_faces;
+        profile.maximum_removed_penetration = std::max(
+            profile.maximum_removed_penetration,
+            clip_stats.maximum_removed_penetration);
+        if (surface_set.empty())
+        {
+            ++profile.ownership_rejections;
+            continue;
+        }
+        const std::size_t candidate_triangles =
+            triangulatedFaceCount(surface_set);
+        if (candidate_triangles >= original_triangles)
+        {
+            ++profile.workload_rejections;
+            continue;
+        }
+        const auto distance_started = std::chrono::steady_clock::now();
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                filled_surface_mesh, surface_set,
+                maximum_error_distance + tolerance);
+        profile.certificate_samples += certificate.samples;
+        bool accepted = certificate.certified && !certificate.exceeded;
+        if (!accepted && !certificate.exceeded)
+            accepted = maximumFilledSurfaceDistance(
+                filled_surface_mesh, surface_set, error_sample_spacing,
+                maximum_error_distance + tolerance) <=
+                maximum_error_distance + tolerance;
+        profile.distance_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - distance_started).count();
+        if (!accepted)
+        {
+            ++profile.error_rejections;
+            continue;
+        }
+        for (const auto owner : owners) consumed[owner] = true;
+        for (const auto face : candidate.faces)
+            if (face < claimed_faces.size()) claimed_faces[face] = true;
+        profile.consumed_primitives += owners.size();
+        ++profile.accepted;
+        ++accepted_count;
+        accepted_protrusions.push_back(candidate);
+        replacements.insert(
+            replacements.end(),
+            std::make_move_iterator(surface_set.begin()),
+            std::make_move_iterator(surface_set.end()));
+    }
+
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size() + replacements.size());
+    for (std::size_t index = 0; index < primitives.size(); ++index)
+        if (!consumed[index]) result.push_back(std::move(primitives[index]));
+    result.insert(result.end(),
+                  std::make_move_iterator(replacements.begin()),
+                  std::make_move_iterator(replacements.end()));
+    SupportContactClipStats contact_stats;
+    result = clipSupportContactOcclusion(
+        std::move(result), accepted_protrusions, tolerance,
+        occluded_support_certificates, contact_stats);
+    profile.contact_clipped_primitives = contact_stats.clipped_primitives;
+    profile.contact_removed_primitives = contact_stats.removed_primitives;
+    profile.contact_output_fragments = contact_stats.output_fragments;
+    profile.contact_removed_area = contact_stats.removed_area;
+    std::ofstream stream(profile_path);
+    stream << std::setprecision(17)
+           << "{\"generated_candidates\":" << profile.generated
+           << ",\"overlap_rejections\":" << profile.overlap_rejections
+           << ",\"ownership_rejections\":" << profile.ownership_rejections
+           << ",\"workload_rejections\":" << profile.workload_rejections
+           << ",\"error_rejections\":" << profile.error_rejections
+           << ",\"accepted\":" << profile.accepted
+           << ",\"consumed_primitives\":" << profile.consumed_primitives
+           << ",\"certificate_samples\":" << profile.certificate_samples
+           << ",\"support_clipped_candidates\":"
+           << profile.support_clipped_candidates
+           << ",\"support_clipped_faces\":" << profile.support_clipped_faces
+           << ",\"support_discarded_faces\":"
+           << profile.support_discarded_faces
+           << ",\"maximum_removed_penetration\":"
+           << profile.maximum_removed_penetration
+           << ",\"contact_clipped_primitives\":"
+           << profile.contact_clipped_primitives
+           << ",\"contact_removed_primitives\":"
+           << profile.contact_removed_primitives
+           << ",\"contact_output_fragments\":"
+           << profile.contact_output_fragments
+           << ",\"contact_removed_area\":"
+           << profile.contact_removed_area
+           << ",\"distance_seconds\":" << profile.distance_seconds
+           << ",\"output_primitives\":" << result.size()
+           << ",\"total_seconds\":" << std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count()
+           << "}\n";
+    return result;
 }
 
 std::vector<OutputPrimitive> fillCertifiedIntercomponentGaps(
@@ -12419,20 +13425,28 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
 
     const double merge_tolerance =
         std::max(diagonal * 1.0e-9, 1.0e-10);
-    // Stage 3 is a surface-candidate search.  A set of neighboring surfaces may
-    // merge only into another supported surface primitive; it must never be
-    // replaced by the boundary of a fitted solid.  The former spatial hierarchy
-    // emitted six box faces as one enclosing-volume candidate and consequently
-    // destroyed correctly recognized disks and analytic bands on round CAD
-    // models.  Volume certificates remain valid for proving that an already
-    // existing surface is occluded, but they are not geometry candidates.
+    // A non-coplanar protruding component cannot in general be represented by
+    // one planar patch.  Detect a complete component from a dominant support
+    // plane and emit only its five exposed box faces.  This avoids arbitrary
+    // spatial subtrees cutting the main body into unrelated local boxes.
+    std::size_t support_surface_set_merges = 0;
+    std::vector<OutputPrimitive> occluded_support_certificates;
+    output = mergeSupportProtrusionSurfaceSets(
+        mesh, filled_surface_mesh, std::move(output), effective_options,
+        diagonal, model_surface_area, merge_tolerance,
+        maximum_open_error_distance,
+        std::max(diagonal / 192.0, 1.0e-30),
+        support_surface_set_merges,
+        occluded_support_certificates,
+        output_directory / "support_protrusion_merge_profile.json");
+    stats.merged_spatial_primitive_groups = support_surface_set_merges;
     {
         std::ofstream profile(
             output_directory / "spatial_group_fixed_point_profile.json");
-        profile << "{\"passes\":0,\"surface_only\":true"
+        profile << "{\"passes\":1,\"surface_only\":true"
                 << ",\"requested_limit\":" << std::setprecision(17)
                 << maximum_open_error_distance
-                << ",\"accepted_groups\":0"
+                << ",\"accepted_groups\":" << support_surface_set_merges
                 << ",\"removed_enclosed_primitives\":0"
                 << ",\"output_primitives\":" << output.size() << "}\n";
     }
@@ -12451,6 +13465,10 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // faces to an arbitrary surviving enclosure face does not imply that the
     // survivor's finite polygon covers the same projection.
     std::vector<OutputPrimitive> coverage_certificate_primitives = output;
+    coverage_certificate_primitives.insert(
+        coverage_certificate_primitives.end(),
+        std::make_move_iterator(occluded_support_certificates.begin()),
+        std::make_move_iterator(occluded_support_certificates.end()));
 
     std::size_t locally_enclosed_primitives = 0;
     output = removePrimitivesInsideEnclosureGroups(

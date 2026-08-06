@@ -37,6 +37,18 @@ must still be handled when faces do not share vertex indices. A redundant proxy
 is removed only when the retained proxy union covers its complete geometric
 support; vertex-only or sparse-sample checks are not sufficient.
 
+The collision OBJ contains only the exposed boundary of an accepted composite
+proxy.  When an outward protrusion is replaced by five box-shaped surface
+patches, all four side patches are clipped at the exact support plane and the
+covered contact footprint is subtracted from the support polygon.  Omitting the
+box back face alone is insufficient: leaving the support face underneath would
+create an internal overlapping surface and enlarge RSS nodes.  Contact cutouts
+are topologically protected from the later Hausdorff merge, because filling
+them has zero directed surface error but would recreate query-only internal
+geometry.  A support polygon with several contacts is partitioned into local
+strips rather than triangulated across all holes, avoiding long triangles whose
+RSS bounds span distant attachments.
+
 Two tempting shortcuts are explicitly invalid:
 
 - projected overlap between parallel planes is not three-dimensional coverage;
