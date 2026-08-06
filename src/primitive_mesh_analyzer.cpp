@@ -4013,6 +4013,16 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                              const std::size_t second) -> std::optional<Fit>
     {
         ++profile.fit_attempts;
+        // A directed candidate-to-reference distance cannot detect geometry
+        // deleted behind another source surface. Preserve explicitly restored
+        // openings until a complete enclosure candidate replaces the whole
+        // responsibility set.
+        if (items[first].output.preserves_cavity_opening ||
+            items[second].output.preserves_cavity_opening)
+        {
+            ++profile.protected_cutout_rejections;
+            return std::nullopt;
+        }
         std::array<PrimitiveMesh, 2> current_surfaces{
             triangulatePrimitive(items[first].output.primitive),
             triangulatePrimitive(items[second].output.primitive)};
@@ -4046,6 +4056,9 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             items[first].output, current_surfaces[0]);
         const auto second_normal = representativeNormal(
             items[second].output, current_surfaces[1]);
+        const bool isolated_non_coplanar_pair =
+            external_neighbors.empty() && first_normal && second_normal &&
+            std::abs(first_normal->dot(*second_normal)) < 1.0 - 1.0e-8;
         std::vector<Vec3> points;
         // The current primitives are the geometry being replaced. Always add
         // their vertices so a fitted surface cannot silently drop a stage-2 cap
@@ -4162,6 +4175,11 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 maximum_open_error_distance + tolerance)
             {
                 ++profile.error_rejections;
+                continue;
+            }
+            if (isolated_non_coplanar_pair)
+            {
+                ++profile.connectivity_rejections;
                 continue;
             }
             std::vector<Vec3> candidate_points = points;
@@ -4361,15 +4379,22 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                     for (const auto next : items[neighbor_id].neighbors)
                         neighbor_queue.push(next);
                 }
-                // Losing a historical adjacency is not itself an error. The
-                // directed distance test and final conservative audit decide
-                // whether this larger envelope is acceptable.
+                if (!preserves_connections)
+                {
+                    ++profile.connectivity_rejections;
+                    continue;
+                }
                 std::size_t replaced_triangles =
                     current_surfaces[0].faces.size() +
                     current_surfaces[1].faces.size();
                 for (const auto absorbed : absorbed_neighbors)
                     replaced_triangles += triangulatePrimitive(
                         items[absorbed].output.primitive).faces.size();
+                if (boundary.size() - 2 > replaced_triangles)
+                {
+                    ++profile.workload_rejections;
+                    continue;
+                }
                 geometric_candidates.push_back({
                     std::move(surface), boundary.size() - 2,
                     absorbed_error, std::move(absorbed_neighbors)});
@@ -4502,6 +4527,11 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 items[absorbed].active)
                 replaced_triangles += triangulatePrimitive(
                     items[absorbed].output.primitive).faces.size();
+        if (fit->triangles > replaced_triangles)
+        {
+            ++profile.workload_rejections;
+            continue;
+        }
         std::vector<std::size_t> consumed{
             candidate.first, candidate.second};
         consumed.insert(consumed.end(), fit->absorbed_neighbors.begin(),
