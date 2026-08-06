@@ -259,9 +259,9 @@ int main()
                 "a loose error must merge adjacent surfaces into closed surface envelopes");
         require(readText(root / "spatial_group_loose" /
                          "adjacent_envelope_group_profile.json").find(
-                    "\"strategy\":\"adjacent_closed_envelope_fixed_point\"") !=
+                    "\"strategy\":\"adjacent_convex_envelope_fixed_point\"") !=
                     std::string::npos,
-                "non-coplanar adjacent merges must retain a multi-surface shell");
+                "non-coplanar adjacent merges must use a convex surface shell");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=

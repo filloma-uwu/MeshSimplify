@@ -62,26 +62,25 @@ configured circumferential segment count.
    supported surface replacements from the union of their unique
    responsibility vertices. Coplanar work remains a single polygon surface.
    Certified disks, annuli, cylindrical bands, and conical bands are atomic at
-   this stage: a lower-fidelity planar or box-shell fit cannot replace them.
-   After each group growth the accumulated responsibility faces are also
-   re-tested by the certified revolved-surface fitter. A partial ring can thus
-   become a disk/cylinder/cone assembly once all of its adjacent pieces have
-   joined; the box shell remains only the certification fallback.
-   A non-coplanar merge is represented by a group of six polygon surfaces that
-   form one closed oriented bounding shell; it is never flattened into one
-   plane. The group inherits every adjacency of its two children, so subsequent
-   merges grow naturally through the connected surface instead of using a
-   whole-model fallback candidate. There is no model identifier, coordinate,
-   primitive-count, or per-merge triangle-reduction gate. The measured
-   user-directed distance decides whether the closed candidate is accepted.
-   Failed candidates are cached by the two endpoint versions. The work list is
-   streaming and greedy: a pair is fitted only when it reaches the front, an
-   accepted result is applied immediately, and only the changed group and its
-   neighbors are re-enqueued.
+   this stage: a generic convex fit cannot replace them. A complete model or
+   geometric component is first tested for a conservative revolved envelope.
+   This requires either certified circular end rings or a circular projected
+   convex silhouette; rectangular silhouettes therefore cannot become round.
+   The candidate is always a closed side-plus-two-caps surface and must reduce
+   triangle work and pass the user's directed-distance limit.
 
-   Stage 3 still exports surface candidates only. A fitted box is an internal
-   certificate represented in the OBJ by its six polygon faces; there is no box
-   or other volumetric primitive in the output interface. Candidate distance is
+   The non-coplanar fallback is the three-dimensional convex hull of the
+   responsibility vertices, never an oriented box. A hull that penetrates an
+   unconsumed surface is rejected; contained generated patches are consumed
+   with it. Large surface sets are evaluated per complete model and connected
+   component. Pairwise fixed-point growth is reserved for at most 512 active
+   groups so a failed large model cannot create thousands of mutually
+   intersecting local hulls or exceed the offline per-model budget. There is no
+   model identifier, filename, or coordinate-specific path.
+
+   Stage 3 still exports surface candidates only. Convex and revolved envelopes
+   are emitted as ordinary polygon, disk, and band surfaces; there is no box or
+   other volumetric primitive in the output interface. Candidate distance is
    certified first with the 1-Lipschitz property of point-to-mesh distance; an
    unresolved certificate falls back to the full deterministic surface
    sampler. Hole filling itself is not charged because phase 1 is the distance

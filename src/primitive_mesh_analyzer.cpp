@@ -2,6 +2,7 @@
 
 #include "clipper2/clipper.h"
 #include "clipper2/clipper.triangulation.h"
+#include "QuickHull.hpp"
 
 #include <algorithm>
 #include <array>
@@ -774,6 +775,8 @@ void appendBoxRectangles(
     double covered_face_sign,
     std::uint64_t enclosure_group);
 
+std::vector<Vec2> convexHull(std::vector<Vec2> points, double tolerance);
+
 struct RingCircularity
 {
     std::size_t point_count = 0;
@@ -977,6 +980,74 @@ std::optional<Primitive> fitCertifiedRevolvedSurface(
             }
         }
     }
+    return best;
+}
+
+struct ConservativeRevolvedDiagnostics
+{
+    std::size_t axes_tested = 0;
+    std::array<std::size_t, 5> failures{};
+    std::size_t relaxed_candidates = 0;
+    std::size_t circular_silhouette_candidates = 0;
+};
+
+std::optional<Primitive> fitConservativeRevolvedEnvelope(
+    const Mesh& mesh,
+    const std::vector<std::uint32_t>& faces,
+    const PrimitiveMeshAnalysisOptions& options,
+    const double analytic_tolerance,
+    ConservativeRevolvedDiagnostics* diagnostics = nullptr)
+{
+    if (!options.allow_round_surfaces || faces.empty()) return std::nullopt;
+    const auto vertices = uniqueVertices(mesh, faces);
+    std::optional<Primitive> best;
+    double best_surface_area = std::numeric_limits<double>::infinity();
+    for (const Mat3& frame : candidateFrames(mesh, vertices))
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            if (diagnostics) ++diagnostics->axes_tested;
+            Primitive candidate = fitConeOnAxis(
+                mesh, vertices, static_cast<Vec3>(frame.col(axis)),
+                options.round_surface_segments, analytic_tolerance);
+            ConeFitFailure failure = ConeFitFailure::None;
+            ConeFitDiagnostics ring_diagnostics;
+            const bool exact = coneFitIsCertified(
+                mesh, faces, candidate, options.circle_radial_tolerance,
+                analytic_tolerance, &failure, &ring_diagnostics);
+            if (diagnostics)
+                ++diagnostics->failures[static_cast<std::size_t>(failure)];
+            std::vector<Vec2> projected;
+            projected.reserve(vertices.size());
+            for (const auto vertex : vertices)
+            {
+                const Vec3 local = candidate.axes.transposeMultiply(
+                    mesh.vertices[vertex] - candidate.center);
+                projected.emplace_back(local.y(), local.z());
+            }
+            projected = convexHull(std::move(projected), analytic_tolerance);
+            const bool circular_silhouette = projected.size() >= 6 &&
+                ringLooksCircular(projected,
+                                  2.0 * options.circle_radial_tolerance);
+            // Normal and radial failures occur after both end silhouettes have
+            // passed their circular-ring certificates. They indicate interior
+            // details or a recessed side, both of which an outer collision
+            // proxy may conservatively fill. Geometry and end-ring failures do
+            // not establish a circular silhouette and remain hard rejections.
+            if (!exact && failure != ConeFitFailure::Normal &&
+                failure != ConeFitFailure::Radial &&
+                !(failure == ConeFitFailure::EndRing && circular_silhouette))
+                continue;
+            if (diagnostics && !exact) ++diagnostics->relaxed_candidates;
+            if (diagnostics && circular_silhouette)
+                ++diagnostics->circular_silhouette_candidates;
+            const double surface_area =
+                primitiveSurfaceArea(candidate, 1.0e-12);
+            if (!best || surface_area < best_surface_area)
+            {
+                best = std::move(candidate);
+                best_surface_area = surface_area;
+            }
+        }
     return best;
 }
 
@@ -6786,6 +6857,248 @@ std::vector<OutputPrimitive> clipAdjacentFaceTrianglesAtOcclusionPlanes(
     return result;
 }
 
+struct ConvexHullSurface
+{
+    std::vector<OutputPrimitive> shell;
+    std::vector<Vec3> vertices;
+    std::vector<Face> faces;
+    Bounds bounds;
+};
+
+std::optional<ConvexHullSurface> fitConvexHullSurface(
+    std::vector<Vec3> points,
+    const std::vector<std::uint32_t>& responsibility,
+    const std::uint64_t enclosure_group,
+    const double tolerance)
+{
+    std::sort(points.begin(), points.end(), [](const Vec3& first, const Vec3& second)
+    {
+        if (first.x() != second.x()) return first.x() < second.x();
+        if (first.y() != second.y()) return first.y() < second.y();
+        return first.z() < second.z();
+    });
+    points.erase(std::unique(points.begin(), points.end(),
+        [&](const Vec3& first, const Vec3& second)
+        { return (first - second).norm() <= tolerance; }), points.end());
+    if (points.size() < 4) return std::nullopt;
+
+    Mesh point_mesh;
+    point_mesh.vertices = points;
+    std::vector<std::uint32_t> point_ids(points.size());
+    std::iota(point_ids.begin(), point_ids.end(), 0);
+    const BoxFit dimensionality = fitBox(point_mesh, point_ids);
+    if (std::min({dimensionality.half_size.x(), dimensionality.half_size.y(),
+                  dimensionality.half_size.z()}) <= tolerance)
+        return std::nullopt;
+
+    Bounds input_bounds;
+    std::vector<quickhull::Vector3<double>> cloud;
+    cloud.reserve(points.size());
+    for (const Vec3& point : points)
+    {
+        input_bounds.lower = input_bounds.lower.cwiseMin(point);
+        input_bounds.upper = input_bounds.upper.cwiseMax(point);
+        cloud.emplace_back(point.x(), point.y(), point.z());
+    }
+    const double scale = std::max(
+        (input_bounds.upper - input_bounds.lower).norm(), tolerance);
+    quickhull::QuickHull<double> builder;
+    const auto hull = builder.getConvexHull(
+        cloud, true, false, std::max(tolerance / scale, 1.0e-12));
+    if (hull.getVertexBuffer().size() < 4 ||
+        hull.getIndexBuffer().size() < 12 ||
+        hull.getIndexBuffer().size() % 3 != 0)
+        return std::nullopt;
+
+    ConvexHullSurface result;
+    result.vertices.reserve(hull.getVertexBuffer().size());
+    Vec3 center = Vec3::Zero();
+    for (const auto& vertex : hull.getVertexBuffer())
+    {
+        const Vec3 converted(vertex.x, vertex.y, vertex.z);
+        result.vertices.push_back(converted);
+        result.bounds.lower = result.bounds.lower.cwiseMin(converted);
+        result.bounds.upper = result.bounds.upper.cwiseMax(converted);
+        center += converted;
+    }
+    center /= static_cast<double>(result.vertices.size());
+    const auto& indices = hull.getIndexBuffer();
+    result.faces.reserve(indices.size() / 3);
+    result.shell.reserve(indices.size() / 3);
+    for (std::size_t offset = 0; offset < indices.size(); offset += 3)
+    {
+        Face face{
+            static_cast<std::uint32_t>(indices[offset]),
+            static_cast<std::uint32_t>(indices[offset + 1]),
+            static_cast<std::uint32_t>(indices[offset + 2])};
+        Vec3 normal = (result.vertices[face[1]] - result.vertices[face[0]])
+                          .cross(result.vertices[face[2]] - result.vertices[face[0]]);
+        if (normal.norm() <= tolerance * tolerance) continue;
+        if (normal.dot(result.vertices[face[0]] - center) < 0.0)
+            std::swap(face[1], face[2]);
+        result.faces.push_back(face);
+        Primitive triangle;
+        triangle.kind = Kind::Polygon;
+        triangle.polygon = {result.vertices[face[0]], result.vertices[face[1]],
+                            result.vertices[face[2]]};
+        OutputPrimitive item;
+        item.primitive = std::move(triangle);
+        item.source_faces = responsibility;
+        item.enclosure_group = enclosure_group;
+        result.shell.push_back(std::move(item));
+    }
+    if (result.faces.size() < 4) return std::nullopt;
+    return result;
+}
+
+bool boundsOverlap(const Bounds& first, const Bounds& second,
+                   const double tolerance)
+{
+    for (int axis = 0; axis < 3; ++axis)
+        if (first.upper[axis] < second.lower[axis] - tolerance ||
+            second.upper[axis] < first.lower[axis] - tolerance)
+            return false;
+    return true;
+}
+
+bool pointStrictlyInsideHull(const ConvexHullSurface& hull, const Vec3& point,
+                             const double tolerance)
+{
+    for (const Face& face : hull.faces)
+    {
+        Vec3 normal = (hull.vertices[face[1]] - hull.vertices[face[0]])
+                          .cross(hull.vertices[face[2]] - hull.vertices[face[0]]);
+        const double length = normal.norm();
+        if (length <= 1.0e-30) continue;
+        normal /= length;
+        if (normal.dot(point - hull.vertices[face[0]]) > -tolerance)
+            return false;
+    }
+    return true;
+}
+
+bool segmentIntersectsHullInterior(const ConvexHullSurface& hull,
+                                   const Vec3& first, const Vec3& second,
+                                   const double tolerance)
+{
+    double lower = 0.0;
+    double upper = 1.0;
+    for (const Face& face : hull.faces)
+    {
+        Vec3 normal = (hull.vertices[face[1]] - hull.vertices[face[0]])
+                          .cross(hull.vertices[face[2]] - hull.vertices[face[0]]);
+        const double length = normal.norm();
+        if (length <= 1.0e-30) continue;
+        normal /= length;
+        const double first_distance =
+            normal.dot(first - hull.vertices[face[0]]);
+        const double delta = normal.dot(second - first);
+        const double limit = -tolerance;
+        if (std::abs(delta) <= 1.0e-30)
+        {
+            if (first_distance > limit) return false;
+            continue;
+        }
+        const double crossing = (limit - first_distance) / delta;
+        if (delta > 0.0) upper = std::min(upper, crossing);
+        else lower = std::max(lower, crossing);
+        if (lower > upper) return false;
+    }
+    return upper >= 0.0 && lower <= 1.0 &&
+           std::max(lower, 0.0) <= std::min(upper, 1.0);
+}
+
+bool segmentIntersectsTriangleInterior(
+    const Vec3& first, const Vec3& second,
+    const std::array<Vec3, 3>& triangle, const double tolerance)
+{
+    const Vec3 direction = second - first;
+    const Vec3 edge1 = triangle[1] - triangle[0];
+    const Vec3 edge2 = triangle[2] - triangle[0];
+    const Vec3 p = direction.cross(edge2);
+    const double determinant = edge1.dot(p);
+    const double scale = std::max({direction.norm(), edge1.norm(), edge2.norm(), 1.0});
+    if (std::abs(determinant) <= tolerance * scale * scale) return false;
+    const double inverse = 1.0 / determinant;
+    const Vec3 relative = first - triangle[0];
+    const double u = relative.dot(p) * inverse;
+    const Vec3 q = relative.cross(edge1);
+    const double v = direction.dot(q) * inverse;
+    const double t = edge2.dot(q) * inverse;
+    const double barycentric_tolerance = tolerance / scale;
+    return u > barycentric_tolerance && v > barycentric_tolerance &&
+           u + v < 1.0 - barycentric_tolerance &&
+           t > barycentric_tolerance && t < 1.0 - barycentric_tolerance;
+}
+
+bool groupIntrudesConvexHull(const ConvexHullSurface& hull,
+                             const std::vector<OutputPrimitive>& shell,
+                             const double tolerance)
+{
+    Bounds group_bounds;
+    std::vector<PrimitiveMesh> meshes;
+    for (const auto& item : shell)
+    {
+        PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
+        for (const Vec3& vertex : mesh.vertices)
+        {
+            group_bounds.lower = group_bounds.lower.cwiseMin(vertex);
+            group_bounds.upper = group_bounds.upper.cwiseMax(vertex);
+        }
+        meshes.push_back(std::move(mesh));
+    }
+    if (!boundsOverlap(hull.bounds, group_bounds, tolerance)) return false;
+    for (const PrimitiveMesh& mesh : meshes)
+    {
+        for (const Vec3& vertex : mesh.vertices)
+            if (pointStrictlyInsideHull(hull, vertex, tolerance)) return true;
+        for (const Face& face : mesh.faces)
+            for (int edge = 0; edge < 3; ++edge)
+                if (segmentIntersectsHullInterior(
+                        hull, mesh.vertices[face[edge]],
+                        mesh.vertices[face[(edge + 1) % 3]], tolerance))
+                    return true;
+        for (const Face& hull_face : hull.faces)
+            for (int edge = 0; edge < 3; ++edge)
+            {
+                const Vec3& first = hull.vertices[hull_face[edge]];
+                const Vec3& second = hull.vertices[hull_face[(edge + 1) % 3]];
+                for (const Face& face : mesh.faces)
+                {
+                    const std::array<Vec3, 3> triangle{
+                        mesh.vertices[face[0]], mesh.vertices[face[1]],
+                        mesh.vertices[face[2]]};
+                    if (segmentIntersectsTriangleInterior(
+                            first, second, triangle, tolerance))
+                        return true;
+                }
+            }
+    }
+    return false;
+}
+
+struct EnvelopeMergeGroup
+{
+    std::vector<OutputPrimitive> shell;
+    std::vector<std::uint32_t> responsibility;
+    Bounds bounds;
+    bool contains_round_surface = false;
+    std::size_t triangle_workload = 0;
+    std::unordered_set<std::size_t> neighbors;
+    std::uint64_t version = 0;
+    bool active = true;
+};
+
+struct EnvelopeFitResult
+{
+    std::vector<OutputPrimitive> shell;
+    std::vector<std::uint32_t> responsibility;
+    Bounds bounds;
+    bool contains_round_surface = false;
+    std::size_t triangle_workload = 0;
+    std::vector<std::size_t> consumed_groups;
+};
+
 std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     const Mesh& responsibility_mesh,
     const Mesh& distance_reference,
@@ -6798,13 +7111,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     const std::filesystem::path& profile_path)
 {
     const auto started = std::chrono::steady_clock::now();
-    struct Group
-    {
-        std::vector<OutputPrimitive> shell;
-        std::unordered_set<std::size_t> neighbors;
-        std::uint64_t version = 0;
-        bool active = true;
-    };
+    using Group = EnvelopeMergeGroup;
     struct Candidate
     {
         std::size_t first = 0;
@@ -6812,6 +7119,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::uint64_t first_version = 0;
         std::uint64_t second_version = 0;
     };
+    using FitResult = EnvelopeFitResult;
     struct Profile
     {
         std::size_t input_primitives = 0;
@@ -6822,6 +7130,13 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t error_rejections = 0;
         std::size_t certified_round_candidates = 0;
         std::size_t accepted_round_groups = 0;
+        std::size_t conservative_round_component_attempts = 0;
+        std::size_t accepted_conservative_round_components = 0;
+        std::size_t batch_convex_component_attempts = 0;
+        std::size_t accepted_batch_convex_components = 0;
+        std::size_t convex_hull_candidates = 0;
+        std::size_t absorbed_intersecting_groups = 0;
+        std::size_t round_surface_intersection_rejections = 0;
         std::size_t accepted_groups = 0;
         std::size_t certificate_samples = 0;
         std::size_t fine_distance_evaluations = 0;
@@ -6837,11 +7152,297 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     // changed.
     const double candidate_error_limit = maximum_error_distance * 0.99;
 
+    // Test complete geometric components before pairwise growth. A conservative
+    // revolved envelope is admissible only when both end silhouettes are
+    // certified circular, it reduces triangle work, and its directed error is
+    // within the same user limit used by every later merge.
+    std::uint64_t next_component_enclosure_group = 1;
+    for (const auto& primitive : primitives)
+        next_component_enclosure_group = std::max(
+            next_component_enclosure_group, primitive.enclosure_group + 1);
+    std::vector<bool> all_source_faces(responsibility_mesh.faces.size(), true);
+    Bounds responsibility_bounds;
+    for (const Vec3& vertex : responsibility_mesh.vertices)
+    {
+        responsibility_bounds.lower =
+            responsibility_bounds.lower.cwiseMin(vertex);
+        responsibility_bounds.upper =
+            responsibility_bounds.upper.cwiseMax(vertex);
+    }
+    const double component_analytic_tolerance = std::max(
+        tolerance * 8.0,
+        (responsibility_bounds.upper - responsibility_bounds.lower).norm() *
+            options.analytic_surface_relative_tolerance);
+    auto source_components = faceComponentsApproximate(
+        responsibility_mesh, all_source_faces,
+        component_analytic_tolerance);
+    if (source_components.size() > 1)
+    {
+        std::vector<std::uint32_t> complete_model_faces(
+            responsibility_mesh.faces.size());
+        std::iota(complete_model_faces.begin(), complete_model_faces.end(), 0);
+        source_components.insert(source_components.begin(),
+                                 std::move(complete_model_faces));
+    }
+    std::vector<bool> consumed_primitives(primitives.size(), false);
+    std::vector<OutputPrimitive> component_replacements;
+    for (const auto& component : source_components)
+    {
+        ++profile.conservative_round_component_attempts;
+        ConservativeRevolvedDiagnostics fit_diagnostics;
+        const auto revolved = fitConservativeRevolvedEnvelope(
+            responsibility_mesh, component, options,
+            component_analytic_tolerance,
+            &fit_diagnostics);
+        {
+            std::ofstream diagnostic(profile_path.parent_path() /
+                                     "conservative_round_fit_profile.jsonl",
+                                     std::ios::app);
+            diagnostic << "{\"component_faces\":" << component.size()
+                       << ",\"axes_tested\":" << fit_diagnostics.axes_tested
+                       << ",\"failure_geometry\":"
+                       << fit_diagnostics.failures[0]
+                       << ",\"failure_end_ring\":"
+                       << fit_diagnostics.failures[2]
+                       << ",\"failure_normal\":"
+                       << fit_diagnostics.failures[3]
+                       << ",\"failure_radial\":"
+                       << fit_diagnostics.failures[4]
+                       << ",\"relaxed_candidates\":"
+                       << fit_diagnostics.relaxed_candidates
+                       << ",\"circular_silhouette_candidates\":"
+                       << fit_diagnostics.circular_silhouette_candidates
+                       << "}\n";
+        }
+        if (!revolved) continue;
+        std::unordered_set<std::uint32_t> component_faces(
+            component.begin(), component.end());
+        std::vector<std::size_t> owners;
+        std::size_t input_workload = 0;
+        bool partial_owner = false;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed_primitives[index]) continue;
+            if (primitives[index].source_faces.empty()) continue;
+            const bool touches = std::any_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return component_faces.contains(face); });
+            if (!touches) continue;
+            const bool fully_owned = std::all_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return component_faces.contains(face); });
+            if (!fully_owned)
+            {
+                partial_owner = true;
+                break;
+            }
+            owners.push_back(index);
+            input_workload +=
+                triangulatePrimitive(primitives[index].primitive).faces.size();
+        }
+        if (partial_owner || owners.empty()) continue;
+
+        std::vector<OutputPrimitive> candidate;
+        Primitive side = *revolved;
+        side.kind = std::abs(side.base_radius - side.top_radius) <=
+                1.0e-8 * std::max({side.base_radius, side.top_radius,
+                                    side.height})
+            ? Kind::CylindricalBand : Kind::ConicalBand;
+        candidate.push_back({std::move(side), component});
+        const auto append_cap = [&](const Vec3& center, const double radius)
+        {
+            Primitive disk;
+            disk.kind = Kind::Disk;
+            disk.center = center;
+            disk.axes = revolved->axes;
+            disk.base_radius = radius;
+            disk.top_radius = radius;
+            disk.segments = revolved->segments;
+            candidate.push_back({std::move(disk), component});
+        };
+        append_cap(revolved->center, revolved->base_radius);
+        append_cap(revolved->center +
+                       revolved->axes.col(0) * revolved->height,
+                   revolved->top_radius);
+        const std::size_t candidate_workload =
+            triangulatedFaceCount(candidate);
+        if (candidate.size() < 2 || candidate_workload >= input_workload)
+        {
+            std::ofstream diagnostic(profile_path.parent_path() /
+                                     "conservative_round_candidate_profile.jsonl",
+                                     std::ios::app);
+            diagnostic << std::setprecision(17)
+                       << "{\"component_faces\":" << component.size()
+                       << ",\"height\":" << revolved->height
+                       << ",\"base_radius\":" << revolved->base_radius
+                       << ",\"top_radius\":" << revolved->top_radius
+                       << ",\"candidate_primitives\":" << candidate.size()
+                       << ",\"candidate_triangles\":" << candidate_workload
+                       << ",\"input_triangles\":" << input_workload
+                       << ",\"rejection\":\"workload_or_open_shell\"}\n";
+            continue;
+        }
+        for (auto& item : candidate)
+        {
+            item.source_faces = component;
+            item.enclosure_group = next_component_enclosure_group;
+        }
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                distance_reference, candidate,
+                candidate_error_limit + tolerance);
+        bool accepted = certificate.certified && !certificate.exceeded;
+        double measured_distance = certificate.observed_maximum;
+        if (!accepted && !certificate.exceeded)
+        {
+            measured_distance = maximumFilledSurfaceDistance(
+                distance_reference, candidate, error_sample_spacing,
+                candidate_error_limit + tolerance);
+            accepted = measured_distance <= candidate_error_limit + tolerance;
+        }
+        {
+            std::ofstream diagnostic(profile_path.parent_path() /
+                                     "conservative_round_candidate_profile.jsonl",
+                                     std::ios::app);
+            diagnostic << std::setprecision(17)
+                       << "{\"component_faces\":" << component.size()
+                       << ",\"height\":" << revolved->height
+                       << ",\"base_radius\":" << revolved->base_radius
+                       << ",\"top_radius\":" << revolved->top_radius
+                       << ",\"candidate_primitives\":" << candidate.size()
+                       << ",\"candidate_triangles\":" << candidate_workload
+                       << ",\"input_triangles\":" << input_workload
+                       << ",\"certificate_exceeded\":"
+                       << (certificate.exceeded ? "true" : "false")
+                       << ",\"certificate_certified\":"
+                       << (certificate.certified ? "true" : "false")
+                       << ",\"observed_distance\":" << measured_distance
+                       << ",\"limit\":" << candidate_error_limit
+                       << ",\"accepted\":" << (accepted ? "true" : "false")
+                       << "}\n";
+        }
+        if (!accepted) continue;
+        for (const auto owner : owners) consumed_primitives[owner] = true;
+        component_replacements.insert(
+            component_replacements.end(),
+            std::make_move_iterator(candidate.begin()),
+            std::make_move_iterator(candidate.end()));
+        ++next_component_enclosure_group;
+        ++profile.accepted_conservative_round_components;
+        merged_group_count += owners.size() - 1;
+    }
+    for (const auto& component : source_components)
+    {
+        std::unordered_set<std::uint32_t> component_faces(
+            component.begin(), component.end());
+        std::vector<std::size_t> owners;
+        std::size_t input_workload = 0;
+        bool partial_owner = false;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed_primitives[index] ||
+                primitives[index].source_faces.empty())
+                continue;
+            const bool touches = std::any_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return component_faces.contains(face); });
+            if (!touches) continue;
+            const bool fully_owned = std::all_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face) { return component_faces.contains(face); });
+            if (!fully_owned)
+            {
+                partial_owner = true;
+                break;
+            }
+            owners.push_back(index);
+            input_workload +=
+                triangulatePrimitive(primitives[index].primitive).faces.size();
+        }
+        if (partial_owner || owners.empty()) continue;
+        ++profile.batch_convex_component_attempts;
+        std::vector<Vec3> points;
+        for (const auto vertex : uniqueVertices(responsibility_mesh, component))
+            points.push_back(responsibility_mesh.vertices[vertex]);
+        auto hull = fitConvexHullSurface(
+            std::move(points), component, next_component_enclosure_group,
+            tolerance);
+        if (!hull || hull->faces.size() >= input_workload) continue;
+
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                distance_reference, hull->shell,
+                candidate_error_limit + tolerance);
+        bool accepted = certificate.certified && !certificate.exceeded;
+        if (!accepted && !certificate.exceeded)
+            accepted = maximumFilledSurfaceDistance(
+                distance_reference, hull->shell, error_sample_spacing,
+                candidate_error_limit + tolerance) <=
+                candidate_error_limit + tolerance;
+        if (!accepted) continue;
+
+        std::unordered_set<std::size_t> owner_set(owners.begin(), owners.end());
+        std::vector<std::size_t> enclosed_generated_primitives;
+        bool intersects_unowned = false;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed_primitives[index] || owner_set.contains(index)) continue;
+            const Bounds item_bounds = primitiveBounds(primitives[index].primitive);
+            if (!boundsOverlap(hull->bounds, item_bounds, tolerance * 8.0))
+                continue;
+            if (groupIntrudesConvexHull(
+                    *hull, std::vector<OutputPrimitive>{primitives[index]},
+                    tolerance * 8.0))
+            {
+                if (primitives[index].source_faces.empty())
+                {
+                    enclosed_generated_primitives.push_back(index);
+                    continue;
+                }
+                intersects_unowned = true;
+                break;
+            }
+        }
+        if (intersects_unowned) continue;
+        for (const auto owner : owners) consumed_primitives[owner] = true;
+        for (const auto enclosed : enclosed_generated_primitives)
+            consumed_primitives[enclosed] = true;
+        component_replacements.insert(
+            component_replacements.end(),
+            std::make_move_iterator(hull->shell.begin()),
+            std::make_move_iterator(hull->shell.end()));
+        ++next_component_enclosure_group;
+        ++profile.accepted_batch_convex_components;
+        merged_group_count += owners.size() - 1;
+    }
+    if (!component_replacements.empty())
+    {
+        std::vector<OutputPrimitive> replaced;
+        replaced.reserve(primitives.size() + component_replacements.size());
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+            if (!consumed_primitives[index])
+                replaced.push_back(std::move(primitives[index]));
+        replaced.insert(replaced.end(),
+                        std::make_move_iterator(component_replacements.begin()),
+                        std::make_move_iterator(component_replacements.end()));
+        primitives = std::move(replaced);
+    }
+
     std::vector<Group> groups;
     groups.reserve(primitives.size());
     for (auto& primitive : primitives)
     {
         Group group;
+        group.responsibility = primitive.source_faces;
+        group.bounds = primitiveBounds(primitive.primitive);
+        group.contains_round_surface =
+            isCertifiedRoundSurfaceKind(primitive.primitive.kind);
+        group.triangle_workload =
+            triangulatePrimitive(primitive.primitive).faces.size();
         group.shell.push_back(std::move(primitive));
         groups.push_back(std::move(group));
     }
@@ -6947,68 +7548,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             next_enclosure_group = std::max(
                 next_enclosure_group, primitive.enclosure_group + 1);
 
-    struct CacheEntry
-    {
-        std::uint64_t first_version = 0;
-        std::uint64_t second_version = 0;
-        bool rejected = false;
-    };
-    std::unordered_map<std::uint64_t, CacheEntry> cache;
-    const auto pairKey = [](std::size_t first, std::size_t second)
-    {
-        if (first > second) std::swap(first, second);
-        return (static_cast<std::uint64_t>(first) << 32U) |
-               static_cast<std::uint64_t>(second);
-    };
-    const auto fitPair = [&](std::size_t first, std::size_t second)
-        -> std::optional<std::vector<OutputPrimitive>>
+    const std::function<std::optional<FitResult>(std::size_t, std::size_t)>
+        fitPair = [&](std::size_t first, std::size_t second)
+        -> std::optional<FitResult>
     {
         ++profile.candidate_evaluations;
         if (first > second) std::swap(first, second);
-        const std::uint64_t key = pairKey(first, second);
-        const auto cached = cache.find(key);
-        if (cached != cache.end() && cached->second.rejected &&
-            cached->second.first_version == groups[first].version &&
-            cached->second.second_version == groups[second].version)
-        {
-            ++profile.cache_hits;
-            return std::nullopt;
-        }
-
-        Mesh fitting_mesh;
-        std::vector<std::uint32_t> fitting_vertices;
-        std::vector<std::uint32_t> responsibility;
-        for (const auto group : {first, second})
-            for (const auto& primitive : groups[group].shell)
-            {
-                if (isCertifiedRoundSurfaceKind(primitive.primitive.kind))
-                {
-                    ++profile.degenerate_rejections;
-                    cache[key] = {
-                        groups[first].version, groups[second].version, true};
-                    return std::nullopt;
-                }
-                const PrimitiveMesh surface = triangulatePrimitive(primitive.primitive);
-                for (const Vec3& vertex : surface.vertices)
-                {
-                    fitting_vertices.push_back(static_cast<std::uint32_t>(
-                        fitting_mesh.vertices.size()));
-                    fitting_mesh.vertices.push_back(vertex);
-                }
-                responsibility.insert(
-                    responsibility.end(), primitive.source_faces.begin(),
-                    primitive.source_faces.end());
-            }
-        if (fitting_vertices.size() < 4)
-        {
-            ++profile.degenerate_rejections;
-            cache[key] = {groups[first].version, groups[second].version, true};
-            return std::nullopt;
-        }
-        std::sort(responsibility.begin(), responsibility.end());
-        responsibility.erase(
-            std::unique(responsibility.begin(), responsibility.end()),
-            responsibility.end());
         const auto candidatePassesError =
             [&](const std::vector<OutputPrimitive>& candidate)
         {
@@ -7033,44 +7578,157 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             return accepted;
         };
 
-        // A partial CAD component may not form a complete circular ring during
-        // stage 2. Re-test the accumulated source responsibility after every
-        // group growth. Once the complete set certifies a revolved surface, it
-        // is both tighter and semantically stronger than the box fallback.
-        if (const auto revolved = fitCertifiedRevolvedSurface(
-                responsibility_mesh, responsibility, options,
-                tolerance * 8.0))
+        std::vector<std::size_t> consumed{first, second};
+        std::optional<ConvexHullSurface> hull;
+        std::vector<std::uint32_t> responsibility;
+        while (true)
         {
-            ++profile.certified_round_candidates;
-            std::vector<OutputPrimitive> round_candidate;
-            appendRevolvedSurfacePatches(
-                round_candidate, responsibility_mesh, *revolved,
-                responsibility, tolerance * 8.0);
-            if (!round_candidate.empty() &&
-                candidatePassesError(round_candidate))
+            std::vector<Vec3> points;
+            responsibility.clear();
+            bool contains_round_surface = false;
+            for (const auto group : consumed)
             {
-                ++profile.accepted_round_groups;
-                return round_candidate;
+                contains_round_surface |= groups[group].contains_round_surface;
+                responsibility.insert(
+                    responsibility.end(), groups[group].responsibility.begin(),
+                    groups[group].responsibility.end());
+                for (const auto& primitive : groups[group].shell)
+                {
+                    const PrimitiveMesh surface =
+                        triangulatePrimitive(primitive.primitive);
+                    points.insert(points.end(), surface.vertices.begin(),
+                                  surface.vertices.end());
+                }
             }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            std::size_t input_triangle_workload = 0;
+            for (const auto group : consumed)
+                input_triangle_workload += groups[group].triangle_workload;
+
+            // A complete accumulated responsibility can become a certified
+            // revolved surface even if no pair at the beginning was complete.
+            // Preserve that analytic representation instead of tessellating it
+            // into a generic convex shell.
+            if (const auto revolved = fitCertifiedRevolvedSurface(
+                    responsibility_mesh, responsibility, options,
+                    tolerance * 8.0))
+            {
+                ++profile.certified_round_candidates;
+                std::vector<OutputPrimitive> round_candidate;
+                appendRevolvedSurfacePatches(
+                    round_candidate, responsibility_mesh, *revolved,
+                    responsibility, tolerance * 8.0);
+                const std::size_t round_workload =
+                    triangulatedFaceCount(round_candidate);
+                if (!round_candidate.empty() &&
+                    round_workload < input_triangle_workload &&
+                    candidatePassesError(round_candidate))
+                {
+                    ++profile.accepted_round_groups;
+                    Bounds bounds;
+                    for (const auto& item : round_candidate)
+                    {
+                        const Bounds item_bounds = primitiveBounds(item.primitive);
+                        bounds.lower = bounds.lower.cwiseMin(item_bounds.lower);
+                        bounds.upper = bounds.upper.cwiseMax(item_bounds.upper);
+                    }
+                    FitResult result;
+                    result.shell = std::move(round_candidate);
+                    result.responsibility = responsibility;
+                    result.bounds = bounds;
+                    result.contains_round_surface = true;
+                    result.triangle_workload = round_workload;
+                    result.consumed_groups = consumed;
+                    return result;
+                }
+            }
+            if (contains_round_surface)
+            {
+                ++profile.degenerate_rejections;
+                return std::nullopt;
+            }
+
+            hull = fitConvexHullSurface(
+                std::move(points), responsibility, next_enclosure_group,
+                tolerance);
+            if (!hull)
+            {
+                ++profile.degenerate_rejections;
+                return std::nullopt;
+            }
+            ++profile.convex_hull_candidates;
+
+            bool expanded = false;
+            for (std::size_t group = 0; group < groups.size(); ++group)
+            {
+                if (!groups[group].active ||
+                    std::find(consumed.begin(), consumed.end(), group) !=
+                        consumed.end())
+                    continue;
+                if (!boundsOverlap(hull->bounds, groups[group].bounds,
+                                   tolerance * 8.0))
+                    continue;
+                if (!groupIntrudesConvexHull(*hull, groups[group].shell,
+                                             tolerance * 8.0))
+                    continue;
+                if (groups[group].contains_round_surface)
+                {
+                    ++profile.round_surface_intersection_rejections;
+                    return std::nullopt;
+                }
+                consumed.push_back(group);
+                ++profile.absorbed_intersecting_groups;
+                expanded = true;
+            }
+            if (!expanded && hull->faces.size() >= input_triangle_workload)
+            {
+                std::optional<std::size_t> best_neighbor;
+                for (const auto member : consumed)
+                    for (const auto neighbor : groups[member].neighbors)
+                    {
+                        if (!groups[neighbor].active ||
+                            groups[neighbor].contains_round_surface ||
+                            std::find(consumed.begin(), consumed.end(), neighbor) !=
+                                consumed.end())
+                            continue;
+                        if (!best_neighbor ||
+                            groups[neighbor].triangle_workload >
+                                groups[*best_neighbor].triangle_workload ||
+                            (groups[neighbor].triangle_workload ==
+                                 groups[*best_neighbor].triangle_workload &&
+                             neighbor < *best_neighbor))
+                            best_neighbor = neighbor;
+                    }
+                if (!best_neighbor)
+                {
+                    ++profile.degenerate_rejections;
+                    return std::nullopt;
+                }
+                consumed.push_back(*best_neighbor);
+                expanded = true;
+            }
+            if (!expanded) break;
+            std::sort(consumed.begin(), consumed.end());
+            consumed.erase(std::unique(consumed.begin(), consumed.end()),
+                           consumed.end());
         }
-        const BoxFit box = fitBox(fitting_mesh, fitting_vertices);
-        if (std::min({box.half_size.x(), box.half_size.y(),
-                      box.half_size.z()}) <= tolerance)
-        {
-            ++profile.degenerate_rejections;
-            cache[key] = {groups[first].version, groups[second].version, true};
-            return std::nullopt;
-        }
-        std::vector<OutputPrimitive> candidate;
-        appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
-                            next_enclosure_group);
-        if (!candidatePassesError(candidate))
+
+        if (!candidatePassesError(hull->shell))
         {
             ++profile.error_rejections;
-            cache[key] = {groups[first].version, groups[second].version, true};
             return std::nullopt;
         }
-        return candidate;
+        FitResult result;
+        result.shell = std::move(hull->shell);
+        result.responsibility = std::move(responsibility);
+        result.bounds = hull->bounds;
+        result.contains_round_surface = false;
+        result.triangle_workload = hull->faces.size();
+        result.consumed_groups = std::move(consumed);
+        return result;
     };
 
     std::queue<Candidate> queue;
@@ -7081,9 +7739,11 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             !groups[first].neighbors.contains(second)) return;
         queue.push({first, second, groups[first].version, groups[second].version});
     };
-    for (std::size_t first = 0; first < groups.size(); ++first)
-        for (const auto second : groups[first].neighbors)
-            if (first < second) enqueue(first, second);
+    constexpr std::size_t maximum_pairwise_group_count = 512;
+    if (groups.size() <= maximum_pairwise_group_count)
+        for (std::size_t first = 0; first < groups.size(); ++first)
+            for (const auto second : groups[first].neighbors)
+                if (first < second) enqueue(first, second);
 
     while (!queue.empty())
     {
@@ -7097,28 +7757,37 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         auto candidate = fitPair(pair.first, pair.second);
         if (!candidate) continue;
 
-        std::vector<std::size_t> affected(
-            groups[pair.first].neighbors.begin(), groups[pair.first].neighbors.end());
-        affected.insert(affected.end(), groups[pair.second].neighbors.begin(),
-                        groups[pair.second].neighbors.end());
+        std::vector<std::size_t> affected;
+        for (const auto consumed : candidate->consumed_groups)
+            affected.insert(affected.end(), groups[consumed].neighbors.begin(),
+                            groups[consumed].neighbors.end());
         std::sort(affected.begin(), affected.end());
         affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
-        groups[pair.first].shell = std::move(*candidate);
+        groups[pair.first].shell = std::move(candidate->shell);
+        groups[pair.first].responsibility = std::move(candidate->responsibility);
+        groups[pair.first].bounds = candidate->bounds;
+        groups[pair.first].contains_round_surface =
+            candidate->contains_round_surface;
+        groups[pair.first].triangle_workload = candidate->triangle_workload;
         groups[pair.first].neighbors.clear();
         ++groups[pair.first].version;
-        groups[pair.second].active = false;
-        ++groups[pair.second].version;
+        for (const auto consumed : candidate->consumed_groups)
+            if (consumed != pair.first)
+            {
+                groups[consumed].active = false;
+                ++groups[consumed].version;
+            }
         for (const auto neighbor : affected)
         {
-            groups[neighbor].neighbors.erase(pair.first);
-            groups[neighbor].neighbors.erase(pair.second);
-            if (neighbor == pair.first || neighbor == pair.second ||
-                !groups[neighbor].active) continue;
+            for (const auto consumed : candidate->consumed_groups)
+                groups[neighbor].neighbors.erase(consumed);
+            if (neighbor == pair.first || !groups[neighbor].active) continue;
             connect(pair.first, neighbor);
         }
-        groups[pair.second].neighbors.clear();
+        for (const auto consumed : candidate->consumed_groups)
+            if (consumed != pair.first) groups[consumed].neighbors.clear();
         ++next_enclosure_group;
-        ++merged_group_count;
+        merged_group_count += candidate->consumed_groups.size() - 1;
         ++profile.accepted_groups;
         for (const auto neighbor : groups[pair.first].neighbors)
             enqueue(pair.first, neighbor);
@@ -7133,7 +7802,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     std::ofstream stream(profile_path);
     stream << std::setprecision(17)
            << "{\"complete\":true"
-           << ",\"strategy\":\"adjacent_closed_envelope_fixed_point\""
+           << ",\"strategy\":\"adjacent_convex_envelope_fixed_point\""
            << ",\"input_primitives\":" << profile.input_primitives
            << ",\"initial_adjacencies\":" << profile.initial_adjacencies
            << ",\"candidate_evaluations\":" << profile.candidate_evaluations
@@ -7144,6 +7813,22 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.certified_round_candidates
            << ",\"accepted_round_groups\":"
            << profile.accepted_round_groups
+           << ",\"conservative_round_component_attempts\":"
+           << profile.conservative_round_component_attempts
+           << ",\"accepted_conservative_round_components\":"
+           << profile.accepted_conservative_round_components
+           << ",\"batch_convex_component_attempts\":"
+           << profile.batch_convex_component_attempts
+           << ",\"accepted_batch_convex_components\":"
+           << profile.accepted_batch_convex_components
+           << ",\"pairwise_enabled\":"
+           << (groups.size() <= maximum_pairwise_group_count ? "true" : "false")
+           << ",\"convex_hull_candidates\":"
+           << profile.convex_hull_candidates
+           << ",\"absorbed_intersecting_groups\":"
+           << profile.absorbed_intersecting_groups
+           << ",\"round_surface_intersection_rejections\":"
+           << profile.round_surface_intersection_rejections
            << ",\"accepted_groups\":" << profile.accepted_groups
            << ",\"certificate_samples\":" << profile.certificate_samples
            << ",\"fine_distance_evaluations\":"
@@ -14604,6 +15289,29 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     double analytic_filled_cavity_volume = 0.0;
     if (effective_options.allow_round_surfaces)
     {
+        // Certify a complete revolved CAD component before hole filling or
+        // planar partitioning changes its responsibility graph.  This is a
+        // strict geometric test: protrusions, internal walls, or an off-axis
+        // recess make the certificate fail and the component continues through
+        // the ordinary surface pipeline.  A true disk-like or frustum-like
+        // body is therefore represented by its analytic side and end surfaces
+        // instead of thousands of nearly coplanar wedges.
+        std::vector<bool> all_faces(mesh.faces.size(), true);
+        const double analytic_tolerance = diagonal *
+            effective_options.analytic_surface_relative_tolerance;
+        for (const auto& component : faceComponentsApproximate(
+                 mesh, all_faces, analytic_tolerance))
+        {
+            const auto fit = fitCertifiedRevolvedSurface(
+                mesh, component, effective_options, analytic_tolerance);
+            if (!fit) continue;
+            const std::size_t previous_size = output.size();
+            appendRevolvedSurfacePatches(
+                output, mesh, *fit, component, analytic_tolerance);
+            if (output.size() == previous_size) continue;
+            for (const auto face : component)
+                responsibility_faces[face] = false;
+        }
         // Surface recognition precedes exact coplanar clustering. It sees the
         // complete connected CAD patch, including all of its inner boundary
         // loops, so small bores cannot disappear into thousands of fallback
@@ -14639,10 +15347,11 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         // Recognize only analytic surface patches.  A shared axis/radius fit may
         // identify a lateral band and its planar end faces, but no closed
         // closed round object is ever inserted into the candidate set.
-        for (const auto& component : faceComponents(mesh, responsibility_faces))
+        const double analytic_tolerance = diagonal *
+            effective_options.analytic_surface_relative_tolerance;
+        for (const auto& component : faceComponentsApproximate(
+                 mesh, responsibility_faces, analytic_tolerance))
         {
-            const double analytic_tolerance = diagonal *
-                effective_options.analytic_surface_relative_tolerance;
             const auto fit = fitCertifiedRevolvedSurface(
                 mesh, component, effective_options, analytic_tolerance);
             if (!fit) continue;
