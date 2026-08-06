@@ -14322,6 +14322,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                 << ",\"removed_enclosed_primitives\":0"
                 << ",\"output_primitives\":" << output.size() << "}\n";
     }
+    const std::vector<OutputPrimitive> pre_local_merge_output = output;
     output = mergeAdjacentSurfacePrimitives(
         mesh, filled_surface_mesh, std::move(output),
         std::max(diagonal * 1.0e-9, 1.0e-10),
@@ -14330,6 +14331,25 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         stats.merged_local_planar_primitives,
         output_directory / "surface_merge_profile.json");
     requireSurfaceCandidates(output, "phase 3 surface merging");
+
+    // Local surface merging is allowed to simplify geometry, but it cannot
+    // transfer responsibility to a finite replacement that fails the actual
+    // conservative coverage test. Roll back the whole local stage instead of
+    // repairing hundreds of missing source faces one triangle at a time.
+    {
+        std::vector<OutputPrimitive> local_merge_certificates = output;
+        local_merge_certificates.insert(
+            local_merge_certificates.end(),
+            occluded_support_certificates.begin(),
+            occluded_support_certificates.end());
+        const FinalCoverageAudit local_merge_coverage =
+            auditFinalConservativeCoverage(mesh, output, merge_tolerance,
+                                           &local_merge_certificates, nullptr,
+                                           &excluded_faces);
+        if (local_merge_coverage.unassigned_source_faces != 0 ||
+            local_merge_coverage.failed_source_faces != 0)
+            output = pre_local_merge_output;
+    }
 
     // Preserve the exact responsibility owners produced by the fixed-point
     // merge before deleting surfaces hidden inside enclosure groups. A removed
@@ -14348,6 +14368,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // three side-panel bottoms is handled as one Boolean occlusion event, just
     // like the support face hidden by several protrusion contacts.
     ParallelOcclusionStats parallel_occlusion_stats;
+    const std::vector<OutputPrimitive> pre_parallel_occlusion_output = output;
     const std::size_t parallel_certificate_begin =
         coverage_certificate_primitives.size();
     output = clipParallelInternalSurfaceOcclusion(
@@ -14427,6 +14448,16 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         output = std::move(orthogonal_input);
     else
         output = std::move(orthogonal_output);
+    // Occlusion is an optimization, never the authority for conservative
+    // coverage. Roll the entire pass back if it loses even one source face;
+    // this avoids reaching the expensive per-face exact repair path.
+    const FinalCoverageAudit post_occlusion_coverage =
+        auditFinalConservativeCoverage(
+            mesh, output, merge_tolerance, &coverage_certificate_primitives,
+            nullptr, &excluded_faces);
+    if (post_occlusion_coverage.unassigned_source_faces != 0 ||
+        post_occlusion_coverage.failed_source_faces != 0)
+        output = pre_parallel_occlusion_output;
     {
         std::ofstream parallel_profile(
             output_directory / "parallel_occlusion_profile.json");
@@ -14594,15 +14625,34 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     }
     markStage("final_volume_recognition");
     std::size_t volume_occluded_primitives = 0;
+    const std::vector<OutputPrimitive> pre_volume_occlusion_output = output;
     output = clipPlanarOcclusionByClosedVolumes(
         std::move(output), active_closed_volumes, certified_closed_extrusions,
         std::max(diagonal * 1.0e-9, 1.0e-10), volume_occluded_primitives,
         nullptr, false);
+    const FinalCoverageAudit post_volume_coverage =
+        auditFinalConservativeCoverage(
+            mesh, output, merge_tolerance, &coverage_certificate_primitives,
+            &certified_closed_extrusions, &excluded_faces);
+    if (post_volume_coverage.unassigned_source_faces != 0 ||
+        post_volume_coverage.failed_source_faces != 0)
+    {
+        output = pre_volume_occlusion_output;
+        volume_occluded_primitives = 0;
+    }
     stats.removed_contained_primitives += volume_occluded_primitives;
     markStage("final_volume_occlusion");
+    const std::vector<OutputPrimitive> pre_outer_occlusion_output = output;
     output = clipParallelOuterOcclusion(
         std::move(output), (lower + upper) * 0.5, diagonal * 0.03,
         std::max(diagonal * 1.0e-9, 1.0e-10));
+    const FinalCoverageAudit post_outer_coverage =
+        auditFinalConservativeCoverage(
+            mesh, output, merge_tolerance, &coverage_certificate_primitives,
+            &certified_closed_extrusions, &excluded_faces);
+    if (post_outer_coverage.unassigned_source_faces != 0 ||
+        post_outer_coverage.failed_source_faces != 0)
+        output = pre_outer_occlusion_output;
     recordStageError("final_surface_cleanup", output);
     std::vector<OutputPrimitive> simplification_error_primitives = output;
     markStage("final_surface_canonicalization");
@@ -14623,17 +14673,19 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         coverage.failed_with_certificate_planar_owner;
     const std::size_t pre_repair_failed_with_certificate_band_owner =
         coverage.failed_with_certificate_band_owner;
-    const std::vector<std::uint32_t> repair_face_ids = coverage.failed_face_ids;
     std::size_t repair_merged_groups = 0;
     std::size_t repair_output_primitives = 0;
     std::size_t repair_output_triangles = 0;
-    if (!coverage.failed_face_ids.empty())
+    std::unordered_set<std::uint32_t> repaired_face_set;
+    while (!coverage.failed_face_ids.empty())
     {
         std::vector<OutputPrimitive> repair_output;
         repair_output.reserve(coverage.failed_face_ids.size());
         for (const auto face_id : coverage.failed_face_ids)
         {
-            if (face_id >= mesh.faces.size()) continue;
+            if (face_id >= mesh.faces.size() ||
+                !repaired_face_set.insert(face_id).second)
+                continue;
             Primitive triangle;
             triangle.kind = Kind::Triangle;
             for (int corner = 0; corner < 3; ++corner)
@@ -14641,6 +14693,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                     mesh.vertices[mesh.faces[face_id][corner]];
             repair_output.push_back({std::move(triangle), {face_id}});
         }
+        if (repair_output.empty()) break;
         // Coverage repair is exact surface fallback.  Do not turn failed source
         // faces into a fitted box shell: that would reintroduce a solid candidate
         // after the surface-only stage-3 search.
@@ -14652,8 +14705,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             if (item.enclosure_group != 0)
                 item.enclosure_group += group_offset;
 
-        repair_output_primitives = repair_output.size();
-        repair_output_triangles = triangulatedFaceCount(repair_output);
+        repair_output_primitives += repair_output.size();
+        repair_output_triangles += triangulatedFaceCount(repair_output);
         for (const auto& item : repair_output)
         {
             coverage_certificate_primitives.push_back(item);
@@ -14672,6 +14725,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             mesh, output, final_tolerance, &coverage_certificate_primitives,
             &certified_closed_extrusions, &excluded_faces);
     }
+    std::vector<std::uint32_t> repair_face_ids(
+        repaired_face_set.begin(), repaired_face_set.end());
+    std::sort(repair_face_ids.begin(), repair_face_ids.end());
     {
         std::ofstream profile(output_directory /
                               "coverage_audit_pre_repair.json");
