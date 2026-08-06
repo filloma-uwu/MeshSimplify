@@ -10,7 +10,6 @@ add_library(pqss_proxy_mesh STATIC
     src/mesh_pool.cpp
     src/options.cpp
     src/primitive_mesh_analyzer.cpp
-    deps/quickhull/QuickHull.cpp
     deps/clipper2/CPP/Clipper2Lib/src/clipper.engine.cpp
     deps/clipper2/CPP/Clipper2Lib/src/clipper.offset.cpp
     deps/clipper2/CPP/Clipper2Lib/src/clipper.rectclip.cpp
@@ -21,7 +20,6 @@ target_include_directories(pqss_proxy_mesh
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/clipper2/CPP/Clipper2Lib/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/deps/quickhull
 )
 
 target_compile_features(pqss_proxy_mesh PUBLIC cxx_std_20)

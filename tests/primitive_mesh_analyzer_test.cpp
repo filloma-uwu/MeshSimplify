@@ -254,14 +254,14 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
-                    group_loose_stats.primitive_count > 0 &&
-                    group_loose_stats.merged_spatial_primitive_groups > 0,
-                "a loose error must merge adjacent surfaces into closed surface envelopes");
+                    group_loose_stats.primitive_count > 6 &&
+                    group_loose_stats.merged_spatial_primitive_groups == 0,
+                "a loose error must not replace non-analytic adjacent surfaces with a solid envelope");
         require(readText(root / "spatial_group_loose" /
                          "adjacent_envelope_group_profile.json").find(
-                    "\"strategy\":\"adjacent_convex_envelope_fixed_point\"") !=
+                    "\"strategy\":\"certified_analytic_surface_fixed_point\"") !=
                     std::string::npos,
-                "non-coplanar adjacent merges must use a convex surface shell");
+                "non-coplanar adjacent merges must be limited to certified analytic surfaces");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=

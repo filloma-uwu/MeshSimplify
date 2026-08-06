@@ -5,9 +5,10 @@ visual collision proxy meshes optimized for PQSS `BuildStrategy::Optimized`
 BVHs.
 
 The first supported mode is `ConservativeOuter`: the generated proxy is a
-certified union of local convex outer parts. It may produce false-positive
-collision results, but must not introduce false negatives on the validated
-collision workload.
+certified union of supported analytic surface patches. It may produce
+false-positive collision results, but must not introduce false negatives on
+the validated collision workload. Unsupported non-planar geometry remains a
+surface mesh; it is never replaced by a generic box or convex solid.
 
 ## Fixed Decisions
 

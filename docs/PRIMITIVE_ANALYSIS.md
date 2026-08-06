@@ -62,25 +62,24 @@ configured circumferential segment count.
    supported surface replacements from the union of their unique
    responsibility vertices. Coplanar work remains a single polygon surface.
    Certified disks, annuli, cylindrical bands, and conical bands are atomic at
-   this stage: a generic convex fit cannot replace them. A complete model or
+   this stage. A complete model or
    geometric component is first tested for a conservative revolved envelope.
    This requires either certified circular end rings or a circular projected
    convex silhouette; rectangular silhouettes therefore cannot become round.
    The candidate is always a closed side-plus-two-caps surface and must reduce
    triangle work and pass the user's directed-distance limit.
 
-   The non-coplanar fallback is the three-dimensional convex hull of the
-   responsibility vertices, never an oriented box. A hull that penetrates an
-   unconsumed surface is rejected; contained generated patches are consumed
-   with it. Large surface sets are evaluated per complete model and connected
-   component. Pairwise fixed-point growth is reserved for at most 512 active
-   groups so a failed large model cannot create thousands of mutually
-   intersecting local hulls or exceed the offline per-model budget. There is no
-   model identifier, filename, or coordinate-specific path.
+   There is no generic non-planar fallback. If adjacent patches cannot be
+   certified as one of the supported analytic surface types, they remain as
+   their current surface patches. In particular, neither an oriented box nor a
+   three-dimensional convex hull may replace merely complex or slightly curved
+   geometry. Pairwise analytic growth is reserved for at most 512 active groups
+   to bound failed-fit work. There is no model identifier, filename, or
+   coordinate-specific path.
 
-   Stage 3 still exports surface candidates only. Convex and revolved envelopes
-   are emitted as ordinary polygon, disk, and band surfaces; there is no box or
-   other volumetric primitive in the output interface. Candidate distance is
+   Stage 3 exports surface candidates only. Revolved envelopes are emitted as
+   ordinary disk and band surfaces; there is no box, convex hull, or other
+   volumetric primitive in the output interface. Candidate distance is
    certified first with the 1-Lipschitz property of point-to-mesh distance; an
    unresolved certificate falls back to the full deterministic surface
    sampler. Hole filling itself is not charged because phase 1 is the distance
@@ -131,8 +130,8 @@ Each analyzed model directory contains:
   ratios when repeated closed components contain fillable spaces;
 - `spatial_group_fixed_point_profile.json`: records that stage 3 is operating in
   surface-only mode and the requested directed-error limit;
-- `adjacent_envelope_group_profile.json`: adjacency count, accepted closed-shell
-  group merges, distance work, and final group workload;
+- `adjacent_envelope_group_profile.json`: adjacency count, accepted certified
+  analytic surface merges, distance work, and final group workload;
 - `coverage_audit_pre_repair.json`: exported workload before conservative
   fallback repair, the exact source-face IDs, and the reduced repair workload;
 - `final_occlusion_certificate_profile.json`: historical versus active closed
