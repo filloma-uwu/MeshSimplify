@@ -6516,6 +6516,248 @@ std::vector<OutputPrimitive> clipAdjacentFacesAtOcclusionPlanes(
     return result;
 }
 
+std::vector<OutputPrimitive> clipAdjacentFaceTrianglesAtOcclusionPlanes(
+    std::vector<OutputPrimitive> primitives,
+    const std::vector<OutputPrimitive>& occlusion_certificates,
+    const Vec3& model_center,
+    const double tolerance,
+    ParallelOcclusionStats& stats)
+{
+    constexpr int clipper_precision = 8;
+    struct Plane
+    {
+        const Primitive* surface = nullptr;
+        Vec3 normal = Vec3::Zero();
+        double offset = 0.0;
+        double keep_sign = 1.0;
+        Bounds bounds;
+        bool seam_tolerant = false;
+    };
+    std::vector<Plane> planes;
+    for (const auto& certificate : occlusion_certificates)
+    {
+        if (certificate.primitive.kind != Kind::Polygon ||
+            certificate.primitive.polygon.size() < 3)
+            continue;
+        Vec3 normal;
+        if (!planarNormal(certificate.primitive, tolerance, normal)) continue;
+        const Vec3 point = certificate.primitive.polygon.front();
+        const double orientation = normal.dot(model_center - point);
+        if (std::abs(orientation) <= tolerance) continue;
+        planes.push_back({
+            &certificate.primitive, normal, normal.dot(point),
+            orientation > 0.0 ? 1.0 : -1.0,
+            primitiveBounds(certificate.primitive),
+            certificate.preserves_cavity_opening});
+    }
+    if (planes.empty()) return primitives;
+
+    const auto clippedHalfspace = [&](const std::vector<Vec3>& polygon,
+                                      const Plane& plane)
+    {
+        std::vector<Vec3> clipped;
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3& first = polygon[index];
+            const Vec3& second = polygon[(index + 1) % polygon.size()];
+            const double first_value = plane.keep_sign *
+                (plane.normal.dot(first) - plane.offset);
+            const double second_value = plane.keep_sign *
+                (plane.normal.dot(second) - plane.offset);
+            const bool first_inside = first_value >= -tolerance;
+            const bool second_inside = second_value >= -tolerance;
+            if (first_inside) clipped.push_back(first);
+            if (first_inside != second_inside)
+            {
+                const double denominator = first_value - second_value;
+                if (std::abs(denominator) > 1.0e-30)
+                    clipped.push_back(first + (second - first) *
+                        (first_value / denominator));
+            }
+        }
+        std::vector<Vec3> unique;
+        for (const Vec3& point : clipped)
+            if (unique.empty() || (point - unique.back()).norm() > tolerance)
+                unique.push_back(point);
+        if (unique.size() > 1 &&
+            (unique.front() - unique.back()).norm() <= tolerance)
+            unique.pop_back();
+        return unique;
+    };
+    const auto candidateMeetsFootprint = [&](const Primitive& candidate,
+                                             const Plane& plane)
+    {
+        if (plane.seam_tolerant) return true;
+        std::vector<Vec3> points;
+        for (std::size_t index = 0; index < candidate.polygon.size(); ++index)
+        {
+            const Vec3& first = candidate.polygon[index];
+            const Vec3& second = candidate.polygon[
+                (index + 1) % candidate.polygon.size()];
+            const double a = plane.normal.dot(first) - plane.offset;
+            const double b = plane.normal.dot(second) - plane.offset;
+            if (std::abs(a) <= tolerance) points.push_back(first);
+            if ((a < -tolerance && b > tolerance) ||
+                (a > tolerance && b < -tolerance))
+                points.push_back(first + (second - first) * (a / (a - b)));
+        }
+        return std::any_of(points.begin(), points.end(), [&](const Vec3& point)
+        {
+            return point.x() >= plane.bounds.lower.x() - tolerance * 16.0 &&
+                   point.x() <= plane.bounds.upper.x() + tolerance * 16.0 &&
+                   point.y() >= plane.bounds.lower.y() - tolerance * 16.0 &&
+                   point.y() <= plane.bounds.upper.y() + tolerance * 16.0 &&
+                   point.z() >= plane.bounds.lower.z() - tolerance * 16.0 &&
+                   point.z() <= plane.bounds.upper.z() + tolerance * 16.0;
+        });
+    };
+
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size());
+    for (OutputPrimitive& item : primitives)
+    {
+        if (item.primitive.kind != Kind::Polygon ||
+            item.primitive.polygon.size() < 3)
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        std::vector<const Plane*> active_planes;
+        for (const Plane& plane : planes)
+        {
+            double minimum = std::numeric_limits<double>::infinity();
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (const Vec3& point : item.primitive.polygon)
+            {
+                const double side = plane.keep_sign *
+                    (plane.normal.dot(point) - plane.offset);
+                minimum = std::min(minimum, side);
+                maximum = std::max(maximum, side);
+            }
+            if (minimum >= -tolerance || maximum <= tolerance) continue;
+            if (!candidateMeetsFootprint(item.primitive, plane)) continue;
+            active_planes.push_back(&plane);
+        }
+        if (active_planes.empty())
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+
+        const PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
+        std::vector<std::vector<Vec3>> pieces;
+        pieces.reserve(mesh.faces.size());
+        for (const Face& face : mesh.faces)
+            pieces.push_back({mesh.vertices[face[0]], mesh.vertices[face[1]],
+                              mesh.vertices[face[2]]});
+        const std::size_t input_triangles = pieces.size();
+        for (const Plane* plane : active_planes)
+        {
+            std::vector<std::vector<Vec3>> next;
+            next.reserve(pieces.size() * 2);
+            for (const auto& piece : pieces)
+            {
+                double minimum = std::numeric_limits<double>::infinity();
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (const Vec3& point : piece)
+                {
+                    const double side = plane->keep_sign *
+                        (plane->normal.dot(point) - plane->offset);
+                    minimum = std::min(minimum, side);
+                    maximum = std::max(maximum, side);
+                }
+                if (minimum >= -tolerance)
+                {
+                    next.push_back(piece);
+                    continue;
+                }
+                if (maximum <= tolerance) continue;
+                auto clipped = clippedHalfspace(piece, *plane);
+                if (clipped.size() >= 3) next.push_back(std::move(clipped));
+            }
+            pieces = std::move(next);
+            if (pieces.empty()) break;
+        }
+        if (pieces.empty())
+        {
+            ++stats.removed_primitives;
+            continue;
+        }
+
+        Vec3 normal;
+        if (!planarNormal(item.primitive, tolerance, normal))
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        const Vec3 origin = item.primitive.polygon.front();
+        const Mat3 basis = orthonormalFrame(normal);
+        Mat3 frame;
+        frame.col(0) = basis.col(1);
+        frame.col(1) = basis.col(2);
+        frame.col(2) = normal;
+        Clipper2Lib::PathsD paths;
+        for (const auto& piece : pieces)
+        {
+            Clipper2Lib::PathD path;
+            for (const Vec3& point : piece)
+            {
+                const Vec3 local = frame.transposeMultiply(point - origin);
+                path.emplace_back(local.x(), local.y());
+            }
+            if (std::abs(Clipper2Lib::Area(path)) <= tolerance * tolerance)
+                continue;
+            if (Clipper2Lib::Area(path) < 0.0) std::reverse(path.begin(), path.end());
+            paths.push_back(std::move(path));
+        }
+        auto united = Clipper2Lib::Union(
+            paths, Clipper2Lib::FillRule::NonZero, clipper_precision);
+        if (united.empty())
+        {
+            ++stats.removed_primitives;
+            continue;
+        }
+        if (std::any_of(united.begin(), united.end(),
+            [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
+        {
+            Clipper2Lib::PathsD triangles;
+            if (Clipper2Lib::Triangulate(
+                    united, clipper_precision, triangles, false) !=
+                Clipper2Lib::TriangulateResult::success)
+            {
+                result.push_back(std::move(item));
+                continue;
+            }
+            united = std::move(triangles);
+        }
+        std::size_t emitted = 0;
+        for (const auto& path : united)
+        {
+            std::vector<Vec2> boundary;
+            for (const auto& point : path)
+                boundary.emplace_back(point.x, point.y);
+            boundary = simplifyPolygon(std::move(boundary), tolerance);
+            if (boundary.size() < 3 ||
+                triangulatePolygon(boundary).size() + 2 != boundary.size())
+                continue;
+            OutputPrimitive fragment = item;
+            fragment.primitive = polygonPrimitive(boundary, origin, frame);
+            fragment.preserves_cavity_opening = true;
+            result.push_back(std::move(fragment));
+            ++emitted;
+        }
+        if (emitted == 0)
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        ++stats.clipped_primitives;
+        stats.output_fragments += emitted;
+        (void)input_triangles;
+    }
+    return result;
+}
+
 std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
     std::vector<OutputPrimitive> primitives,
     const Vec3& model_center,
@@ -14151,7 +14393,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const std::size_t orthogonal_input_count = output.size();
     std::vector<OutputPrimitive> orthogonal_input = output;
     std::vector<OutputPrimitive> orthogonal_output =
-        clipAdjacentFacesAtOcclusionPlanes(
+        clipAdjacentFaceTrianglesAtOcclusionPlanes(
             std::move(output), orthogonal_occlusion_planes,
             (lower + upper) * 0.5, merge_tolerance,
             parallel_occlusion_stats);
