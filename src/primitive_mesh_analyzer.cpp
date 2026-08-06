@@ -15442,22 +15442,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     filled_surface_mesh.vertices = std::move(phase1_triangulated.vertices);
     filled_surface_mesh.faces = std::move(phase1_triangulated.faces);
     std::vector<OutputPrimitive>().swap(phase1_hole_filled);
-    const double stage_error_sample_spacing =
-        std::max(diagonal / 192.0, 1.0e-30);
-    const auto recordStageError = [&](const char* stage,
-                                      const std::vector<OutputPrimitive>& stage_output)
-    {
-        const double maximum_distance = maximumFilledSurfaceDistance(
-            filled_surface_mesh, stage_output, stage_error_sample_spacing,
-            std::numeric_limits<double>::infinity());
-        std::ofstream profile(output_directory / "stage_error_profile.jsonl",
-                              std::ios::app);
-        profile << std::setprecision(17)
-                << "{\"stage\":\"" << stage
-                << "\",\"primitives\":" << stage_output.size()
-                << ",\"triangles\":" << triangulatedFaceCount(stage_output)
-                << ",\"maximum_distance\":" << maximum_distance << "}\n";
-    };
     markStage("phase1_hole_filled_reference");
 
     CoplanarCanonicalizationStats coplanar_stats;
@@ -15491,7 +15475,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     structural_cleanup = StructuralCleanup{};
     std::vector<OutputPrimitive>().swap(restored_cavity_output);
     std::vector<bool>().swap(responsibility_faces);
-    recordStageError("phase2_input", output);
     markStage("exact_surface_union");
 
     const double merge_tolerance =
@@ -15745,7 +15728,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         post_merge_coplanar_stats.removed_primitives;
     stats.removed_coplanar_overlap_area +=
         post_merge_coplanar_stats.removed_overlap_area;
-    recordStageError("phase3_merged", output);
     markStage("hausdorff_surface_merging");
 
     // Closed-box recognition is bookkeeping only. Its six rectangles remain the
@@ -15804,7 +15786,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // limit on large CAD meshes.
     certified_closed_extrusions = recognizeEnclosureGroupExtrusions(
         coverage_certificate_primitives,
-        std::max(diagonal * 1.0e-9, 1.0e-10), true);
+        std::max(diagonal * 1.0e-9, 1.0e-10), false);
     const std::vector<BoxFit> active_closed_volumes =
         selectActiveBoxCertificates(
             coverage_certificate_primitives, certified_closed_volumes,
@@ -15854,7 +15836,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     if (post_outer_coverage.unassigned_source_faces != 0 ||
         post_outer_coverage.failed_source_faces != 0)
         output = pre_outer_occlusion_output;
-    recordStageError("final_surface_cleanup", output);
     std::vector<OutputPrimitive> simplification_error_primitives = output;
     markStage("final_surface_canonicalization");
 
@@ -15957,7 +15938,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         }
         profile << "]}\n";
     }
-    recordStageError("coverage_repaired", output);
     const PrimitiveMesh simplification_error_proxy =
         triangulateOutputPrimitives(simplification_error_primitives);
     std::vector<OutputPrimitive>().swap(simplification_error_primitives);

@@ -99,6 +99,10 @@ configured circumferential segment count.
    certificates and are never exported to PQSS. Contact cutouts cannot be
    refilled by the error merge, and multi-contact supports are decomposed into
    local strips to avoid long, BVH-unfriendly triangles.
+   Final volume-occlusion certificates are rebuilt only from explicit
+   `enclosure_group` shells. Ungrouped planar patches are not speculatively
+   combined into extrusions; doing so is quadratic on large CAD soups and can
+   erase surfaces without a closed-envelope ownership proof.
 8. Canonicalize the final outer surface and triangulate each semantic patch.
 
 The approach combines the face-based hierarchical framework of Attene,
@@ -133,8 +137,10 @@ Each analyzed model directory contains:
   fallback repair, the exact source-face IDs, and the reduced repair workload;
 - `final_occlusion_certificate_profile.json`: historical versus active closed
   certificates used by final overlap removal;
-- `stage_error_profile.jsonl`: primitive workload and measured maximum error at
-  phase 2, phase 3, final cleanup, and conservative repair.
+- `stage_error_profile.jsonl`: reserved stage-profile stream. Full directed
+  distance is measured once by the final audit; intermediate full-surface
+  scans are deliberately omitted because they do not participate in candidate
+  acceptance and dominate runtime on large CAD meshes.
 
 The maximum and mean simplification errors in `model.json` and the viewer are
 directed from phase 3/4 to phase 1. Strict conservative coverage is still
