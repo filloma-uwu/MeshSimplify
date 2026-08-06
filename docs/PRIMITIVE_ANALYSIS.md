@@ -60,29 +60,27 @@ configured circumferential segment count.
    and an endpoint lying inside another edge do not disappear merely because
    the two OBJ patches lack an identical vertex. For every adjacent pair, fit
    supported surface replacements from the union of their unique
-   responsibility vertices. The exact enclosing hull is the surface candidate.
-   There is no normal-angle, primitive-count, or per-merge triangle-reduction
-   gate. A symmetric local support-distance bound first prevents either source
-   patch from being dropped onto an unrelated remote source surface; the
-   candidate plane is then intersected with every actual external neighboring
-   surface. Those intersection points extend the candidate hull, and a
-   candidate that cannot continue one of the old geometric connections is
-   rejected. The measured user-directed distance finally decides whether the
-   connected candidate is accepted. Failed candidates
-   are cached by the two endpoint versions. The work list is streaming and
-   greedy: a pair is fitted only when it reaches the front, an accepted result
-   is applied immediately, and no global queue of already-fitted candidates is
-   built. After an accepted merge, only the changed patch and its neighbors are
-   re-enqueued. Iteration stops at a fixed point, and a final audit throws if
-   any acceptable adjacent candidate remains.
+   responsibility vertices. Coplanar work remains a single polygon surface.
+   A non-coplanar merge is represented by a group of six polygon surfaces that
+   form one closed oriented bounding shell; it is never flattened into one
+   plane. The group inherits every adjacency of its two children, so subsequent
+   merges grow naturally through the connected surface instead of using a
+   whole-model fallback candidate. There is no model identifier, coordinate,
+   primitive-count, or per-merge triangle-reduction gate. The measured
+   user-directed distance decides whether the closed candidate is accepted.
+   Failed candidates are cached by the two endpoint versions. The work list is
+   streaming and greedy: a pair is fitted only when it reaches the front, an
+   accepted result is applied immediately, and only the changed group and its
+   neighbors are re-enqueued.
 
-   Stage 3 creates surface candidates only. It never creates a fitted box,
-   cylinder solid, frustum solid, or the boundary of such a fitted volume.
-   Candidate distance is certified first with the 1-Lipschitz property of
-   point-to-mesh distance; an unresolved certificate falls back to the full
-   deterministic surface sampler. Hole filling itself is not charged because
-   phase 1 is the distance reference. PQSS workload and a target primitive
-   count are not part of the geometry decision.
+   Stage 3 still exports surface candidates only. A fitted box is an internal
+   certificate represented in the OBJ by its six polygon faces; there is no box
+   or other volumetric primitive in the output interface. Candidate distance is
+   certified first with the 1-Lipschitz property of point-to-mesh distance; an
+   unresolved certificate falls back to the full deterministic surface
+   sampler. Hole filling itself is not charged because phase 1 is the distance
+   reference. PQSS workload and a target primitive count are not part of the
+   geometry decision.
 
    Coverage auditing retains the pre-canonicalization owner of every source
    face. This is necessary because coplanar union may rewrite the final
@@ -124,6 +122,8 @@ Each analyzed model directory contains:
   ratios when repeated closed components contain fillable spaces;
 - `spatial_group_fixed_point_profile.json`: records that stage 3 is operating in
   surface-only mode and the requested directed-error limit;
+- `adjacent_envelope_group_profile.json`: adjacency count, accepted closed-shell
+  group merges, distance work, and final group workload;
 - `coverage_audit_pre_repair.json`: exported workload before conservative
   fallback repair, the exact source-face IDs, and the reduced repair workload;
 - `final_occlusion_certificate_profile.json`: historical versus active closed

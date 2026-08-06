@@ -4650,31 +4650,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
     for (auto& item : items)
         if (item.active) result.push_back(std::move(item.output));
 
-    // The fixed point also evaluates the envelope of the current active set.
-    // This is a normal candidate in the same error/workload comparison, not a
-    // model-specific fallback: whenever an OBB encloses the current source
-    // responsibility within the directed limit and uses fewer triangles, it
-    // wins over the locally merged set. Keeping it in this routine means every
-    // input model follows the same candidate policy.
-    {
-        std::vector<std::uint32_t> all_faces(responsibility_mesh.faces.size());
-        std::iota(all_faces.begin(), all_faces.end(), 0U);
-        const BoxFit envelope_box = fitBox(
-            responsibility_mesh, uniqueVertices(responsibility_mesh, all_faces));
-        std::vector<OutputPrimitive> envelope;
-        appendBoxRectangles(envelope, envelope_box, all_faces, -1, 0.0, 1);
-        const std::size_t result_triangles = triangulatedFaceCount(result);
-        const std::size_t envelope_triangles = triangulatedFaceCount(envelope);
-        const double envelope_error = maximumFilledSurfaceDistance(
-            distance_reference, envelope, error_sample_spacing,
-            maximum_open_error_distance + tolerance);
-        if (envelope_triangles < result_triangles &&
-            envelope_error <= maximum_open_error_distance + tolerance)
-        {
-            result = std::move(envelope);
-            ++profile.accepted_merges;
-        }
-    }
     std::ofstream profile_stream(profile_path);
     profile_stream << std::setprecision(17)
         << "{\"complete\":true"
@@ -6790,6 +6765,332 @@ std::vector<OutputPrimitive> clipAdjacentFaceTrianglesAtOcclusionPlanes(
         stats.output_fragments += emitted;
         (void)input_triangles;
     }
+    return result;
+}
+
+std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
+    const Mesh& responsibility_mesh,
+    const Mesh& distance_reference,
+    std::vector<OutputPrimitive> primitives,
+    const double tolerance,
+    const double maximum_error_distance,
+    const double error_sample_spacing,
+    std::size_t& merged_group_count,
+    const std::filesystem::path& profile_path)
+{
+    const auto started = std::chrono::steady_clock::now();
+    struct Group
+    {
+        std::vector<OutputPrimitive> shell;
+        std::unordered_set<std::size_t> neighbors;
+        std::uint64_t version = 0;
+        bool active = true;
+    };
+    struct Candidate
+    {
+        std::size_t first = 0;
+        std::size_t second = 0;
+        std::uint64_t first_version = 0;
+        std::uint64_t second_version = 0;
+    };
+    struct Profile
+    {
+        std::size_t input_primitives = 0;
+        std::size_t initial_adjacencies = 0;
+        std::size_t candidate_evaluations = 0;
+        std::size_t cache_hits = 0;
+        std::size_t degenerate_rejections = 0;
+        std::size_t error_rejections = 0;
+        std::size_t accepted_groups = 0;
+        std::size_t certificate_samples = 0;
+        std::size_t fine_distance_evaluations = 0;
+        double distance_seconds = 0.0;
+    } profile;
+    profile.input_primitives = primitives.size();
+    merged_group_count = 0;
+    if (primitives.size() < 2) return primitives;
+
+    std::vector<Group> groups;
+    groups.reserve(primitives.size());
+    for (auto& primitive : primitives)
+    {
+        Group group;
+        group.shell.push_back(std::move(primitive));
+        groups.push_back(std::move(group));
+    }
+    const auto connect = [&](const std::size_t first, const std::size_t second)
+    {
+        if (first == second) return;
+        groups[first].neighbors.insert(second);
+        groups[second].neighbors.insert(first);
+    };
+
+    // Responsibility adjacency is stable under a group merge and remains the
+    // authoritative topology. It lets a closed envelope grow through the same
+    // connected surface without requiring its newly fitted faces to retain all
+    // historical pairwise intersections.
+    std::vector<std::vector<std::size_t>> face_owners(
+        responsibility_mesh.faces.size());
+    for (std::size_t group = 0; group < groups.size(); ++group)
+        for (const auto face : groups[group].shell.front().source_faces)
+            if (face < face_owners.size()) face_owners[face].push_back(group);
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edge_faces;
+    edge_faces.reserve(responsibility_mesh.faces.size() * 3);
+    for (std::uint32_t face = 0; face < responsibility_mesh.faces.size(); ++face)
+    {
+        const Face& triangle = responsibility_mesh.faces[face];
+        for (int edge = 0; edge < 3; ++edge)
+            edge_faces[edgeKey(triangle[edge], triangle[(edge + 1) % 3])]
+                .push_back(face);
+        const auto& owners = face_owners[face];
+        for (std::size_t first = 0; first < owners.size(); ++first)
+            for (std::size_t second = first + 1; second < owners.size(); ++second)
+                connect(owners[first], owners[second]);
+    }
+    for (const auto& [edge, faces] : edge_faces)
+    {
+        (void)edge;
+        for (std::size_t first_face = 0; first_face < faces.size(); ++first_face)
+            for (std::size_t second_face = first_face + 1;
+                 second_face < faces.size(); ++second_face)
+                for (const auto first : face_owners[faces[first_face]])
+                    for (const auto second : face_owners[faces[second_face]])
+                        connect(first, second);
+    }
+
+    // Restored caps and fitted surfaces may carry no source face. Add geometric
+    // vertex adjacency so they still participate in the same fixed point.
+    struct PointKey
+    {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        std::int64_t z = 0;
+        bool operator==(const PointKey&) const = default;
+    };
+    struct PointKeyHash
+    {
+        std::size_t operator()(const PointKey& point) const noexcept
+        {
+            std::size_t seed = std::hash<std::int64_t>{}(point.x);
+            seed ^= std::hash<std::int64_t>{}(point.y) +
+                    0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            seed ^= std::hash<std::int64_t>{}(point.z) +
+                    0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    const double cell_size = std::max(tolerance * 8.0, 1.0e-12);
+    const auto pointKey = [&](const Vec3& point)
+    {
+        return PointKey{
+            static_cast<std::int64_t>(std::llround(point.x() / cell_size)),
+            static_cast<std::int64_t>(std::llround(point.y() / cell_size)),
+            static_cast<std::int64_t>(std::llround(point.z() / cell_size))};
+    };
+    std::unordered_map<PointKey, std::vector<std::size_t>, PointKeyHash> owners;
+    for (std::size_t group = 0; group < groups.size(); ++group)
+    {
+        std::unordered_set<PointKey, PointKeyHash> keys;
+        for (const auto& primitive : groups[group].shell)
+        {
+            const PrimitiveMesh surface = triangulatePrimitive(primitive.primitive);
+            for (const Vec3& vertex : surface.vertices) keys.insert(pointKey(vertex));
+        }
+        for (const PointKey& key : keys)
+        {
+            for (std::int64_t dx = -1; dx <= 1; ++dx)
+                for (std::int64_t dy = -1; dy <= 1; ++dy)
+                    for (std::int64_t dz = -1; dz <= 1; ++dz)
+                    {
+                        const auto found = owners.find(
+                            {key.x + dx, key.y + dy, key.z + dz});
+                        if (found == owners.end()) continue;
+                        for (const auto other : found->second) connect(group, other);
+                    }
+            owners[key].push_back(group);
+        }
+    }
+    for (const Group& group : groups)
+        profile.initial_adjacencies += group.neighbors.size();
+    profile.initial_adjacencies /= 2;
+
+    std::uint64_t next_enclosure_group = 1;
+    for (const Group& group : groups)
+        for (const auto& primitive : group.shell)
+            next_enclosure_group = std::max(
+                next_enclosure_group, primitive.enclosure_group + 1);
+
+    struct CacheEntry
+    {
+        std::uint64_t first_version = 0;
+        std::uint64_t second_version = 0;
+        bool rejected = false;
+    };
+    std::unordered_map<std::uint64_t, CacheEntry> cache;
+    const auto pairKey = [](std::size_t first, std::size_t second)
+    {
+        if (first > second) std::swap(first, second);
+        return (static_cast<std::uint64_t>(first) << 32U) |
+               static_cast<std::uint64_t>(second);
+    };
+    const auto fitPair = [&](std::size_t first, std::size_t second)
+        -> std::optional<std::vector<OutputPrimitive>>
+    {
+        ++profile.candidate_evaluations;
+        if (first > second) std::swap(first, second);
+        const std::uint64_t key = pairKey(first, second);
+        const auto cached = cache.find(key);
+        if (cached != cache.end() && cached->second.rejected &&
+            cached->second.first_version == groups[first].version &&
+            cached->second.second_version == groups[second].version)
+        {
+            ++profile.cache_hits;
+            return std::nullopt;
+        }
+
+        Mesh fitting_mesh;
+        std::vector<std::uint32_t> fitting_vertices;
+        std::vector<std::uint32_t> responsibility;
+        for (const auto group : {first, second})
+            for (const auto& primitive : groups[group].shell)
+            {
+                const PrimitiveMesh surface = triangulatePrimitive(primitive.primitive);
+                for (const Vec3& vertex : surface.vertices)
+                {
+                    fitting_vertices.push_back(static_cast<std::uint32_t>(
+                        fitting_mesh.vertices.size()));
+                    fitting_mesh.vertices.push_back(vertex);
+                }
+                responsibility.insert(
+                    responsibility.end(), primitive.source_faces.begin(),
+                    primitive.source_faces.end());
+            }
+        if (fitting_vertices.size() < 4)
+        {
+            ++profile.degenerate_rejections;
+            cache[key] = {groups[first].version, groups[second].version, true};
+            return std::nullopt;
+        }
+        std::sort(responsibility.begin(), responsibility.end());
+        responsibility.erase(
+            std::unique(responsibility.begin(), responsibility.end()),
+            responsibility.end());
+        const BoxFit box = fitBox(fitting_mesh, fitting_vertices);
+        if (std::min({box.half_size.x(), box.half_size.y(),
+                      box.half_size.z()}) <= tolerance)
+        {
+            ++profile.degenerate_rejections;
+            cache[key] = {groups[first].version, groups[second].version, true};
+            return std::nullopt;
+        }
+        std::vector<OutputPrimitive> candidate;
+        appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
+                            next_enclosure_group);
+        const auto distance_started = std::chrono::steady_clock::now();
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                distance_reference, candidate,
+                maximum_error_distance + tolerance);
+        profile.distance_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - distance_started).count();
+        profile.certificate_samples += certificate.samples;
+        bool accepted = !certificate.exceeded;
+        if (accepted && !certificate.certified)
+        {
+            ++profile.fine_distance_evaluations;
+            const auto fine_started = std::chrono::steady_clock::now();
+            accepted = maximumFilledSurfaceDistance(
+                distance_reference, candidate, error_sample_spacing,
+                maximum_error_distance + tolerance) <=
+                maximum_error_distance + tolerance;
+            profile.distance_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - fine_started).count();
+        }
+        if (!accepted)
+        {
+            ++profile.error_rejections;
+            cache[key] = {groups[first].version, groups[second].version, true};
+            return std::nullopt;
+        }
+        return candidate;
+    };
+
+    std::queue<Candidate> queue;
+    const auto enqueue = [&](std::size_t first, std::size_t second)
+    {
+        if (first > second) std::swap(first, second);
+        if (!groups[first].active || !groups[second].active ||
+            !groups[first].neighbors.contains(second)) return;
+        queue.push({first, second, groups[first].version, groups[second].version});
+    };
+    for (std::size_t first = 0; first < groups.size(); ++first)
+        for (const auto second : groups[first].neighbors)
+            if (first < second) enqueue(first, second);
+
+    while (!queue.empty())
+    {
+        const Candidate pair = queue.front();
+        queue.pop();
+        if (!groups[pair.first].active || !groups[pair.second].active ||
+            groups[pair.first].version != pair.first_version ||
+            groups[pair.second].version != pair.second_version ||
+            !groups[pair.first].neighbors.contains(pair.second))
+            continue;
+        auto candidate = fitPair(pair.first, pair.second);
+        if (!candidate) continue;
+
+        std::vector<std::size_t> affected(
+            groups[pair.first].neighbors.begin(), groups[pair.first].neighbors.end());
+        affected.insert(affected.end(), groups[pair.second].neighbors.begin(),
+                        groups[pair.second].neighbors.end());
+        std::sort(affected.begin(), affected.end());
+        affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+        groups[pair.first].shell = std::move(*candidate);
+        groups[pair.first].neighbors.clear();
+        ++groups[pair.first].version;
+        groups[pair.second].active = false;
+        ++groups[pair.second].version;
+        for (const auto neighbor : affected)
+        {
+            groups[neighbor].neighbors.erase(pair.first);
+            groups[neighbor].neighbors.erase(pair.second);
+            if (neighbor == pair.first || neighbor == pair.second ||
+                !groups[neighbor].active) continue;
+            connect(pair.first, neighbor);
+        }
+        groups[pair.second].neighbors.clear();
+        ++next_enclosure_group;
+        ++merged_group_count;
+        ++profile.accepted_groups;
+        for (const auto neighbor : groups[pair.first].neighbors)
+            enqueue(pair.first, neighbor);
+    }
+
+    std::vector<OutputPrimitive> result;
+    for (auto& group : groups)
+        if (group.active)
+            result.insert(result.end(),
+                          std::make_move_iterator(group.shell.begin()),
+                          std::make_move_iterator(group.shell.end()));
+    std::ofstream stream(profile_path);
+    stream << std::setprecision(17)
+           << "{\"complete\":true"
+           << ",\"strategy\":\"adjacent_closed_envelope_fixed_point\""
+           << ",\"input_primitives\":" << profile.input_primitives
+           << ",\"initial_adjacencies\":" << profile.initial_adjacencies
+           << ",\"candidate_evaluations\":" << profile.candidate_evaluations
+           << ",\"cache_hits\":" << profile.cache_hits
+           << ",\"degenerate_rejections\":" << profile.degenerate_rejections
+           << ",\"error_rejections\":" << profile.error_rejections
+           << ",\"accepted_groups\":" << profile.accepted_groups
+           << ",\"certificate_samples\":" << profile.certificate_samples
+           << ",\"fine_distance_evaluations\":"
+           << profile.fine_distance_evaluations
+           << ",\"distance_seconds\":" << profile.distance_seconds
+           << ",\"output_primitives\":" << result.size()
+           << ",\"output_triangles\":" << triangulatedFaceCount(result)
+           << ",\"total_seconds\":" << std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count() << "}\n";
     return result;
 }
 
@@ -14450,7 +14751,6 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                 << ",\"removed_enclosed_primitives\":0"
                 << ",\"output_primitives\":" << output.size() << "}\n";
     }
-    const std::vector<OutputPrimitive> pre_local_merge_output = output;
     output = mergeAdjacentSurfacePrimitives(
         mesh, filled_surface_mesh, std::move(output),
         std::max(diagonal * 1.0e-9, 1.0e-10),
@@ -14459,25 +14759,15 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         stats.merged_local_planar_primitives,
         output_directory / "surface_merge_profile.json");
     requireSurfaceCandidates(output, "phase 3 surface merging");
-
-    // Local surface merging is allowed to simplify geometry, but it cannot
-    // transfer responsibility to a finite replacement that fails the actual
-    // conservative coverage test. Roll back the whole local stage instead of
-    // repairing hundreds of missing source faces one triangle at a time.
-    {
-        std::vector<OutputPrimitive> local_merge_certificates = output;
-        local_merge_certificates.insert(
-            local_merge_certificates.end(),
-            occluded_support_certificates.begin(),
-            occluded_support_certificates.end());
-        const FinalCoverageAudit local_merge_coverage =
-            auditFinalConservativeCoverage(mesh, output, merge_tolerance,
-                                           &local_merge_certificates, nullptr,
-                                           &excluded_faces);
-        if (local_merge_coverage.unassigned_source_faces != 0 ||
-            local_merge_coverage.failed_source_faces != 0)
-            output = pre_local_merge_output;
-    }
+    std::size_t adjacent_envelope_group_merges = 0;
+    output = mergeAdjacentEnvelopeGroups(
+        mesh, filled_surface_mesh, std::move(output), merge_tolerance,
+        maximum_open_error_distance,
+        std::max(diagonal / 192.0, 1.0e-30),
+        adjacent_envelope_group_merges,
+        output_directory / "adjacent_envelope_group_profile.json");
+    stats.merged_spatial_primitive_groups += adjacent_envelope_group_merges;
+    requireSurfaceCandidates(output, "phase 3 closed envelope merging");
 
     // Preserve the exact responsibility owners produced by the fixed-point
     // merge before deleting surfaces hidden inside enclosure groups. A removed

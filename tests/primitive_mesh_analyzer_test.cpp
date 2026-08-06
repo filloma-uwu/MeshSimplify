@@ -255,8 +255,13 @@ int main()
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
                     group_loose_stats.primitive_count > 0 &&
-                    group_loose_stats.merged_spatial_primitive_groups == 0,
-                "a loose error must retain surface candidates and never create a solid candidate");
+                    group_loose_stats.merged_spatial_primitive_groups > 0,
+                "a loose error must merge adjacent surfaces into closed surface envelopes");
+        require(readText(root / "spatial_group_loose" /
+                         "adjacent_envelope_group_profile.json").find(
+                    "\"strategy\":\"adjacent_closed_envelope_fixed_point\"") !=
+                    std::string::npos,
+                "non-coplanar adjacent merges must retain a multi-surface shell");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=
