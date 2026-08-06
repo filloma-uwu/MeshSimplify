@@ -63,6 +63,10 @@ configured circumferential segment count.
    responsibility vertices. Coplanar work remains a single polygon surface.
    Certified disks, annuli, cylindrical bands, and conical bands are atomic at
    this stage: a lower-fidelity planar or box-shell fit cannot replace them.
+   After each group growth the accumulated responsibility faces are also
+   re-tested by the certified revolved-surface fitter. A partial ring can thus
+   become a disk/cylinder/cone assembly once all of its adjacent pieces have
+   joined; the box shell remains only the certification fallback.
    A non-coplanar merge is represented by a group of six polygon surfaces that
    form one closed oriented bounding shell; it is never flattened into one
    plane. The group inherits every adjacency of its two children, so subsequent

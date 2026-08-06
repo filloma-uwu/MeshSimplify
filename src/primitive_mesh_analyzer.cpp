@@ -6790,6 +6790,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     const Mesh& responsibility_mesh,
     const Mesh& distance_reference,
     std::vector<OutputPrimitive> primitives,
+    const PrimitiveMeshAnalysisOptions& options,
     const double tolerance,
     const double maximum_error_distance,
     const double error_sample_spacing,
@@ -6819,6 +6820,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t cache_hits = 0;
         std::size_t degenerate_rejections = 0;
         std::size_t error_rejections = 0;
+        std::size_t certified_round_candidates = 0;
+        std::size_t accepted_round_groups = 0;
         std::size_t accepted_groups = 0;
         std::size_t certificate_samples = 0;
         std::size_t fine_distance_evaluations = 0;
@@ -7006,6 +7009,50 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         responsibility.erase(
             std::unique(responsibility.begin(), responsibility.end()),
             responsibility.end());
+        const auto candidatePassesError =
+            [&](const std::vector<OutputPrimitive>& candidate)
+        {
+            const auto distance_started = std::chrono::steady_clock::now();
+            const FilledSurfaceDistanceCertificate certificate =
+                certifyFilledSurfaceDistance(
+                    distance_reference, candidate,
+                    candidate_error_limit + tolerance);
+            profile.distance_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - distance_started).count();
+            profile.certificate_samples += certificate.samples;
+            if (certificate.exceeded) return false;
+            if (certificate.certified) return true;
+            ++profile.fine_distance_evaluations;
+            const auto fine_started = std::chrono::steady_clock::now();
+            const bool accepted = maximumFilledSurfaceDistance(
+                distance_reference, candidate, error_sample_spacing,
+                candidate_error_limit + tolerance) <=
+                candidate_error_limit + tolerance;
+            profile.distance_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - fine_started).count();
+            return accepted;
+        };
+
+        // A partial CAD component may not form a complete circular ring during
+        // stage 2. Re-test the accumulated source responsibility after every
+        // group growth. Once the complete set certifies a revolved surface, it
+        // is both tighter and semantically stronger than the box fallback.
+        if (const auto revolved = fitCertifiedRevolvedSurface(
+                responsibility_mesh, responsibility, options,
+                tolerance * 8.0))
+        {
+            ++profile.certified_round_candidates;
+            std::vector<OutputPrimitive> round_candidate;
+            appendRevolvedSurfacePatches(
+                round_candidate, responsibility_mesh, *revolved,
+                responsibility, tolerance * 8.0);
+            if (!round_candidate.empty() &&
+                candidatePassesError(round_candidate))
+            {
+                ++profile.accepted_round_groups;
+                return round_candidate;
+            }
+        }
         const BoxFit box = fitBox(fitting_mesh, fitting_vertices);
         if (std::min({box.half_size.x(), box.half_size.y(),
                       box.half_size.z()}) <= tolerance)
@@ -7017,27 +7064,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::vector<OutputPrimitive> candidate;
         appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
                             next_enclosure_group);
-        const auto distance_started = std::chrono::steady_clock::now();
-        const FilledSurfaceDistanceCertificate certificate =
-            certifyFilledSurfaceDistance(
-                distance_reference, candidate,
-                candidate_error_limit + tolerance);
-        profile.distance_seconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - distance_started).count();
-        profile.certificate_samples += certificate.samples;
-        bool accepted = !certificate.exceeded;
-        if (accepted && !certificate.certified)
-        {
-            ++profile.fine_distance_evaluations;
-            const auto fine_started = std::chrono::steady_clock::now();
-            accepted = maximumFilledSurfaceDistance(
-                distance_reference, candidate, error_sample_spacing,
-                candidate_error_limit + tolerance) <=
-                candidate_error_limit + tolerance;
-            profile.distance_seconds += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - fine_started).count();
-        }
-        if (!accepted)
+        if (!candidatePassesError(candidate))
         {
             ++profile.error_rejections;
             cache[key] = {groups[first].version, groups[second].version, true};
@@ -7113,6 +7140,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << ",\"cache_hits\":" << profile.cache_hits
            << ",\"degenerate_rejections\":" << profile.degenerate_rejections
            << ",\"error_rejections\":" << profile.error_rejections
+           << ",\"certified_round_candidates\":"
+           << profile.certified_round_candidates
+           << ",\"accepted_round_groups\":"
+           << profile.accepted_round_groups
            << ",\"accepted_groups\":" << profile.accepted_groups
            << ",\"certificate_samples\":" << profile.certificate_samples
            << ",\"fine_distance_evaluations\":"
@@ -14792,7 +14823,8 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     requireSurfaceCandidates(output, "phase 3 surface merging");
     std::size_t adjacent_envelope_group_merges = 0;
     output = mergeAdjacentEnvelopeGroups(
-        mesh, filled_surface_mesh, std::move(output), merge_tolerance,
+        mesh, filled_surface_mesh, std::move(output), effective_options,
+        merge_tolerance,
         maximum_open_error_distance,
         std::max(diagonal / 192.0, 1.0e-30),
         adjacent_envelope_group_merges,
