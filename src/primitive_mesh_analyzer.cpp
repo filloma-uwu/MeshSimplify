@@ -6300,7 +6300,67 @@ std::vector<OutputPrimitive> clipAdjacentFacesAtOcclusionPlanes(
                     intersection = std::move(unique);
                 }
             }
-            if (intersection.size() < 2) continue;
+            if (intersection.size() < 2)
+            {
+                // Fall back to the actual triangulated surface.  This handles
+                // polygon seams whose winding order does not describe the
+                // geometric boundary, while keeping every retained point on
+                // the requested half-space.
+                const PrimitiveMesh triangle_mesh = triangulatePrimitive(
+                    item.primitive);
+                std::vector<Vec3> kept_points;
+                for (const Face& face : triangle_mesh.faces)
+                {
+                    std::vector<Vec3> triangle{
+                        triangle_mesh.vertices[face[0]],
+                        triangle_mesh.vertices[face[1]],
+                        triangle_mesh.vertices[face[2]]};
+                    const double first_side = certificate_normal.dot(triangle[0]) - offset;
+                    const double second_side = certificate_normal.dot(triangle[1]) - offset;
+                    const double third_side = certificate_normal.dot(triangle[2]) - offset;
+                    if (!((first_side < -tolerance &&
+                           (second_side > tolerance || third_side > tolerance)) ||
+                          (second_side < -tolerance &&
+                           (first_side > tolerance || third_side > tolerance)) ||
+                          (third_side < -tolerance &&
+                           (first_side > tolerance || second_side > tolerance))))
+                        continue;
+                    const auto clipped_triangle = clipToHalfspace(
+                        triangle, certificate_normal, offset,
+                        certificate_normal.dot(model_center - certificate_point) >
+                            0.0 ? 1.0 : -1.0);
+                    kept_points.insert(kept_points.end(),
+                        clipped_triangle.begin(), clipped_triangle.end());
+                }
+                if (kept_points.size() >= 3)
+                {
+                    Vec3 local_normal;
+                    if (!planarNormal(item.primitive, tolerance, local_normal))
+                        continue;
+                    const Mat3 basis = orthonormalFrame(local_normal);
+                    std::vector<Vec2> projected_points;
+                    projected_points.reserve(kept_points.size());
+                    for (const Vec3& point : kept_points)
+                    {
+                        const Vec3 local = basis.transposeMultiply(
+                            point - item.primitive.polygon.front());
+                        projected_points.emplace_back(local.x(), local.y());
+                    }
+                    const auto hull = convexHull(projected_points, tolerance);
+                    if (hull.size() >= 3)
+                    {
+                        current.clear();
+                        current.reserve(hull.size());
+                        for (const Vec2& point : hull)
+                            current.push_back(item.primitive.polygon.front() +
+                                basis * Vec3(point.x(), point.y(), 0.0));
+                        changed = true;
+                        ++stats.clipped_primitives;
+                        continue;
+                    }
+                }
+                continue;
+            }
             const Bounds certificate_bounds = primitiveBounds(
                 certificate.primitive);
             const bool footprint_match = std::any_of(
