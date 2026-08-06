@@ -55,10 +55,10 @@ async function waitLoaded(page, model) {
 
   await page.selectOption('#modelSelect', '16');
   await waitLoaded(page, 16);
-  await page.click('[data-mode="primitives"]');
+  await page.click('[data-mode="phase3"]');
   await page.waitForFunction(() => window.__primitiveViewerDiagnostics().visiblePrimitives > 0);
-  await page.click('[data-mode="overlay"]');
-  await page.waitForFunction(() => window.__primitiveViewerDiagnostics().mode === 'overlay');
+  await page.click('[data-mode="split"]');
+  await page.waitForFunction(() => window.__primitiveViewerDiagnostics().mode === 'split');
   await page.screenshot({ path: path.join(screenshots, 'primitive-analysis-full-model-16.png'), fullPage: true });
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
