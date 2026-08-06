@@ -64,8 +64,11 @@ configured circumferential segment count.
    There is no normal-angle, primitive-count, or per-merge triangle-reduction
    gate. A symmetric local support-distance bound first prevents either source
    patch from being dropped onto an unrelated remote source surface; the
-   measured user-directed distance then decides whether the surviving candidate
-   is accepted. Failed candidates
+   candidate plane is then intersected with every actual external neighboring
+   surface. Those intersection points extend the candidate hull, and a
+   candidate that cannot continue one of the old geometric connections is
+   rejected. The measured user-directed distance finally decides whether the
+   connected candidate is accepted. Failed candidates
    are cached by the two endpoint versions. The work list is streaming and
    greedy: a pair is fitted only when it reaches the front, an accepted result
    is applied immediately, and no global queue of already-fitted candidates is

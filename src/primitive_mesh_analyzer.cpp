@@ -3424,6 +3424,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         std::size_t cache_hits = 0;
         std::size_t fit_attempts = 0;
         std::size_t containment_rejections = 0;
+        std::size_t connectivity_rejections = 0;
         std::size_t error_rejections = 0;
         std::size_t unsupported_rejections = 0;
         std::size_t accepted_merges = 0;
@@ -3837,10 +3838,82 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         std::array<PrimitiveMesh, 2> current_surfaces{
             triangulatePrimitive(items[first].output.primitive),
             triangulatePrimitive(items[second].output.primitive)};
+        const double connection_tolerance = boundary_cell * 2.0;
+        const double connection_tolerance_squared =
+            connection_tolerance * connection_tolerance;
+        const auto surfacesTouch = [&](const Primitive& first_primitive,
+                                       const PrimitiveMesh& first_surface,
+                                       const Primitive& second_primitive,
+                                       const PrimitiveMesh& second_surface)
+        {
+            for (const Vec3& vertex : first_surface.vertices)
+                if (containsPointCached(
+                        second_primitive, second_surface,
+                        vertex, connection_tolerance))
+                    return true;
+            for (const Vec3& vertex : second_surface.vertices)
+                if (containsPointCached(
+                        first_primitive, first_surface,
+                        vertex, connection_tolerance))
+                    return true;
+            for (const Face& first_face : first_surface.faces)
+                for (int first_edge = 0; first_edge < 3; ++first_edge)
+                {
+                    const Vec3& first_begin =
+                        first_surface.vertices[first_face[first_edge]];
+                    const Vec3& first_end = first_surface.vertices[
+                        first_face[(first_edge + 1) % 3]];
+                    for (const Face& second_face : second_surface.faces)
+                        for (int second_edge = 0; second_edge < 3;
+                             ++second_edge)
+                        {
+                            const Vec3& second_begin =
+                                second_surface.vertices[
+                                    second_face[second_edge]];
+                            const Vec3& second_end =
+                                second_surface.vertices[
+                                    second_face[(second_edge + 1) % 3]];
+                            if (segmentDistanceSquared(
+                                    first_begin, first_end,
+                                    second_begin, second_end) <=
+                                connection_tolerance_squared)
+                                return true;
+                        }
+                }
+            return false;
+        };
+        struct ExternalNeighborSurface
+        {
+            PrimitiveMesh surface;
+        };
+        std::vector<ExternalNeighborSurface> external_neighbors;
+        std::unordered_set<std::size_t> external_neighbor_ids =
+            items[first].neighbors;
+        external_neighbor_ids.insert(
+            items[second].neighbors.begin(), items[second].neighbors.end());
+        external_neighbor_ids.erase(first);
+        external_neighbor_ids.erase(second);
+        for (const auto neighbor : external_neighbor_ids)
+        {
+            if (!items[neighbor].active) continue;
+            PrimitiveMesh neighbor_surface =
+                triangulatePrimitive(items[neighbor].output.primitive);
+            if (!surfacesTouch(
+                    items[first].output.primitive, current_surfaces[0],
+                    items[neighbor].output.primitive, neighbor_surface) &&
+                !surfacesTouch(
+                    items[second].output.primitive, current_surfaces[1],
+                    items[neighbor].output.primitive, neighbor_surface))
+                continue;
+            external_neighbors.push_back({std::move(neighbor_surface)});
+        }
         const auto first_normal = representativeNormal(
             items[first].output, current_surfaces[0]);
         const auto second_normal = representativeNormal(
             items[second].output, current_surfaces[1]);
+        const bool isolated_non_coplanar_pair =
+            external_neighbors.empty() && first_normal && second_normal &&
+            std::abs(first_normal->dot(*second_normal)) < 1.0 - 1.0e-8;
         std::vector<Vec3> points;
         // The current primitives are the geometry being replaced. Always add
         // their vertices so a fitted surface cannot silently drop a stage-2 cap
@@ -3958,14 +4031,79 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 ++profile.error_rejections;
                 continue;
             }
+            if (isolated_non_coplanar_pair)
+            {
+                ++profile.connectivity_rejections;
+                continue;
+            }
+            std::vector<Vec3> candidate_points = points;
+            bool preserves_connections = true;
+            for (const auto& neighbor : external_neighbors)
+            {
+                std::vector<Vec3> intersections;
+                for (const Face& face : neighbor.surface.faces)
+                {
+                    std::array<Vec3, 3> triangle{
+                        neighbor.surface.vertices[face[0]],
+                        neighbor.surface.vertices[face[1]],
+                        neighbor.surface.vertices[face[2]]};
+                    std::array<double, 3> signed_distances{};
+                    bool coplanar = true;
+                    for (int corner = 0; corner < 3; ++corner)
+                    {
+                        signed_distances[corner] =
+                            (triangle[corner] - origin).dot(normal);
+                        coplanar &= std::abs(signed_distances[corner]) <=
+                                    connection_tolerance;
+                    }
+                    if (coplanar)
+                    {
+                        intersections.insert(
+                            intersections.end(), triangle.begin(), triangle.end());
+                        continue;
+                    }
+                    for (int edge = 0; edge < 3; ++edge)
+                    {
+                        const int next = (edge + 1) % 3;
+                        const double first_distance = signed_distances[edge];
+                        const double second_distance = signed_distances[next];
+                        if (std::abs(first_distance) <= connection_tolerance)
+                            intersections.push_back(triangle[edge]);
+                        if ((first_distance < -connection_tolerance &&
+                             second_distance > connection_tolerance) ||
+                            (first_distance > connection_tolerance &&
+                             second_distance < -connection_tolerance))
+                        {
+                            const double fraction = first_distance /
+                                (first_distance - second_distance);
+                            intersections.push_back(
+                                triangle[edge] +
+                                (triangle[next] - triangle[edge]) * fraction);
+                        }
+                    }
+                }
+                if (intersections.empty())
+                {
+                    preserves_connections = false;
+                    break;
+                }
+                candidate_points.insert(
+                    candidate_points.end(),
+                    intersections.begin(), intersections.end());
+            }
+            if (!preserves_connections)
+            {
+                ++profile.connectivity_rejections;
+                continue;
+            }
             const Mat3 basis = orthonormalFrame(normal);
             Mat3 frame;
             frame.col(0) = basis.col(1);
             frame.col(1) = basis.col(2);
             frame.col(2) = normal;
             std::vector<Vec2> projected;
-            projected.reserve(points.size());
-            for (const Vec3& point : points)
+            projected.reserve(candidate_points.size());
+            for (const Vec3& point : candidate_points)
             {
                 const Vec3 local = frame.transposeMultiply(point - origin);
                 projected.emplace_back(local.x(), local.y());
@@ -4259,6 +4397,8 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         << ",\"cache_hits\":" << profile.cache_hits
         << ",\"fit_attempts\":" << profile.fit_attempts
         << ",\"containment_rejections\":" << profile.containment_rejections
+        << ",\"connectivity_rejections\":"
+        << profile.connectivity_rejections
         << ",\"error_rejections\":" << profile.error_rejections
         << ",\"unsupported_rejections\":" << profile.unsupported_rejections
         << ",\"accepted_merges\":" << profile.accepted_merges

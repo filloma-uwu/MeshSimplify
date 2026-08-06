@@ -235,13 +235,18 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 t_junction, root / "surface_t_junction", group_loose);
         require(t_junction_stats.containment_validation_passed &&
-                    t_junction_stats.primitive_count == 1,
-                "a boundary-segment T junction must be treated as adjacent");
+                    t_junction_stats.primitive_count == 2,
+                "an isolated non-coplanar T junction must be attempted without collapsing to one detached plane");
         require(readText(root / "surface_t_junction" /
                          "surface_merge_profile.json").find(
                     "\"segment_contact_adjacencies\":1") !=
                     std::string::npos,
                 "T-junction adjacency must come from segment contact");
+        require(readText(root / "surface_t_junction" /
+                         "surface_merge_profile.json").find(
+                    "\"connectivity_rejections\":") !=
+                    std::string::npos,
+                "surface merge profiling must expose rejected disconnected replacements");
 
         auto group_strict = group_loose;
         group_strict.maximum_open_error_distance = 0.0;
