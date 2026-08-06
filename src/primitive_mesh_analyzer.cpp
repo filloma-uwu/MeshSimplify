@@ -6100,6 +6100,556 @@ struct SupportContactClipStats
     double removed_area = 0.0;
 };
 
+struct ParallelOcclusionStats
+{
+    std::size_t candidate_count = 0;
+    std::size_t accepted_candidates = 0;
+    std::size_t clipped_primitives = 0;
+    std::size_t removed_primitives = 0;
+    std::size_t output_fragments = 0;
+    double removed_area = 0.0;
+    double maximum_covered_ratio = 0.0;
+    std::vector<std::pair<std::size_t, double>> candidate_ratios;
+    std::vector<std::size_t> accepted_ids;
+};
+
+// A face removed as an internal parallel layer is also an occlusion witness
+// for the portions of orthogonal neighbour faces that continue through that
+// layer.  Treating the witness as a 2-D coverer only removes the layer itself;
+// the neighbour then leaves a thin, fully internal skirt in the proxy.  Clip
+// that skirt against the witness plane whenever the two polygons actually
+// meet.  The decision is purely geometric (plane intersection + footprint
+// containment) and therefore applies equally to any combination of panels.
+std::vector<OutputPrimitive> clipAdjacentFacesAtOcclusionPlanes(
+    std::vector<OutputPrimitive> primitives,
+    const std::vector<OutputPrimitive>& occlusion_certificates,
+    const Vec3& model_center,
+    const double tolerance,
+    ParallelOcclusionStats& stats)
+{
+    const auto polygonArea = [](const std::vector<Vec3>& polygon)
+    {
+        if (polygon.size() < 3) return 0.0;
+        Vec3 vector_area = Vec3::Zero();
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+            vector_area += polygon[index].cross(
+                polygon[(index + 1) % polygon.size()]);
+        return 0.5 * vector_area.norm();
+    };
+    const auto convexProjected = [](const std::vector<Vec2>& polygon)
+    {
+        int sign = 0;
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec2 first = polygon[(index + polygon.size() - 1) % polygon.size()];
+            const Vec2 second = polygon[index];
+            const Vec2 third = polygon[(index + 1) % polygon.size()];
+            const Vec2 first_edge = second - first;
+            const Vec2 second_edge = third - second;
+            const double cross = first_edge.x() * second_edge.y() -
+                first_edge.y() * second_edge.x();
+            if (std::abs(cross) <= 1.0e-12) continue;
+            const int current_sign = cross > 0.0 ? 1 : -1;
+            if (sign == 0) sign = current_sign;
+            else if (sign != current_sign) return false;
+        }
+        return sign != 0;
+    };
+    auto clipToHalfspace = [&](const std::vector<Vec3>& polygon,
+                               const Vec3& normal, const double offset,
+                               const double keep_sign)
+    {
+        std::vector<Vec3> result;
+        if (polygon.empty()) return result;
+        const auto signed_value = [&](const Vec3& point)
+        { return keep_sign * (normal.dot(point) - offset); };
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3& first = polygon[index];
+            const Vec3& second = polygon[(index + 1) % polygon.size()];
+            const double first_value = signed_value(first);
+            const double second_value = signed_value(second);
+            const bool first_inside = first_value >= -tolerance;
+            const bool second_inside = second_value >= -tolerance;
+            if (first_inside) result.push_back(first);
+            if (first_inside != second_inside)
+            {
+                const double denominator = first_value - second_value;
+                if (std::abs(denominator) > 1.0e-30)
+                {
+                    const double weight = first_value / denominator;
+                    result.push_back(first + (second - first) * weight);
+                }
+            }
+        }
+        std::vector<Vec3> cleaned;
+        for (const Vec3& point : result)
+            if (cleaned.empty() || (point - cleaned.back()).norm() > tolerance)
+                cleaned.push_back(point);
+        if (cleaned.size() > 1 &&
+            (cleaned.front() - cleaned.back()).norm() <= tolerance)
+            cleaned.pop_back();
+        bool removed_collinear = true;
+        while (removed_collinear && cleaned.size() >= 3)
+        {
+            removed_collinear = false;
+            for (std::size_t index = 0; index < cleaned.size(); ++index)
+            {
+                const Vec3 previous = cleaned[
+                    (index + cleaned.size() - 1) % cleaned.size()];
+                const Vec3 current = cleaned[index];
+                const Vec3 next = cleaned[(index + 1) % cleaned.size()];
+                const Vec3 first = current - previous;
+                const Vec3 second = next - current;
+                if (first.norm() <= tolerance || second.norm() <= tolerance ||
+                    first.cross(second).norm() <= tolerance *
+                        std::max(first.norm() * second.norm(), 1.0))
+                {
+                    cleaned.erase(cleaned.begin() + index);
+                    removed_collinear = true;
+                    break;
+                }
+            }
+        }
+        return cleaned;
+    };
+
+    auto planeIntersectionPoints = [&](const std::vector<Vec3>& polygon,
+                                       const Vec3& normal, const double offset)
+    {
+        std::vector<Vec3> points;
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3& first = polygon[index];
+            const Vec3& second = polygon[(index + 1) % polygon.size()];
+            const double first_value = normal.dot(first) - offset;
+            const double second_value = normal.dot(second) - offset;
+            if (std::abs(first_value) <= tolerance)
+                points.push_back(first);
+            if ((first_value < -tolerance && second_value > tolerance) ||
+                (first_value > tolerance && second_value < -tolerance))
+            {
+                const double weight = first_value /
+                    (first_value - second_value);
+                points.push_back(first + (second - first) * weight);
+            }
+        }
+        std::vector<Vec3> unique;
+        for (const Vec3& point : points)
+            if (std::none_of(unique.begin(), unique.end(),
+                [&](const Vec3& other)
+                { return (point - other).norm() <= tolerance * 8.0; }))
+                unique.push_back(point);
+        return unique;
+    };
+
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size());
+    for (OutputPrimitive& item : primitives)
+    {
+        if (item.primitive.kind != Kind::Polygon ||
+            item.primitive.polygon.size() < 3)
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        std::vector<Vec3> current = item.primitive.polygon;
+        bool changed = false;
+        for (const OutputPrimitive& certificate : occlusion_certificates)
+        {
+            if (certificate.primitive.kind != Kind::Polygon ||
+                certificate.primitive.polygon.size() < 3)
+                continue;
+            Vec3 certificate_normal;
+            if (!planarNormal(certificate.primitive, tolerance,
+                              certificate_normal))
+                continue;
+            const Vec3 certificate_point =
+                certificate.primitive.polygon.front();
+            const double offset = certificate_normal.dot(certificate_point);
+            std::vector<Vec3> intersection = planeIntersectionPoints(
+                current, certificate_normal, offset);
+            if (intersection.size() < 2)
+            {
+                // A few CAD polygons are exported with a seam that skips the
+                // geometric boundary edge. Recover the plane cut from all
+                // opposite-side vertex pairs instead of trusting that seam's
+                // winding order.
+                for (std::size_t first = 0; first < current.size(); ++first)
+                    for (std::size_t second = first + 1;
+                         second < current.size(); ++second)
+                    {
+                        const double a = certificate_normal.dot(current[first]) - offset;
+                        const double b = certificate_normal.dot(current[second]) - offset;
+                        if ((a < -tolerance && b > tolerance) ||
+                            (a > tolerance && b < -tolerance))
+                        {
+                            const double weight = a / (a - b);
+                            intersection.push_back(current[first] +
+                                (current[second] - current[first]) * weight);
+                        }
+                    }
+                if (intersection.size() > 2)
+                {
+                    std::vector<Vec3> unique;
+                    for (const Vec3& point : intersection)
+                        if (std::none_of(unique.begin(), unique.end(),
+                            [&](const Vec3& other)
+                            { return (point - other).norm() <= tolerance * 8.0; }))
+                            unique.push_back(point);
+                    intersection = std::move(unique);
+                }
+            }
+            if (intersection.size() < 2) continue;
+            const Bounds certificate_bounds = primitiveBounds(
+                certificate.primitive);
+            const bool footprint_match = std::any_of(
+                intersection.begin(), intersection.end(), [&](const Vec3& point)
+                {
+                    return point.x() >= certificate_bounds.lower.x() - tolerance * 16.0 &&
+                           point.x() <= certificate_bounds.upper.x() + tolerance * 16.0 &&
+                           point.y() >= certificate_bounds.lower.y() - tolerance * 16.0 &&
+                           point.y() <= certificate_bounds.upper.y() + tolerance * 16.0 &&
+                           point.z() >= certificate_bounds.lower.z() - tolerance * 16.0 &&
+                           point.z() <= certificate_bounds.upper.z() + tolerance * 16.0;
+                });
+            if (!footprint_match && !certificate.preserves_cavity_opening)
+                continue;
+
+            const double orientation = certificate_normal.dot(
+                model_center - certificate_point);
+            if (std::abs(orientation) <= tolerance) continue;
+            const double keep_sign = orientation > 0.0 ? 1.0 : -1.0;
+            std::vector<Vec3> clipped = clipToHalfspace(
+                current, certificate_normal, offset, keep_sign);
+            if (clipped.size() < 3) { current.clear(); changed = true; break; }
+            const double before_area = polygonArea(current);
+            const double after_area = polygonArea(clipped);
+            double minimum_side = std::numeric_limits<double>::infinity();
+            double maximum_side = -std::numeric_limits<double>::infinity();
+            for (const Vec3& point : current)
+            {
+                const double side = keep_sign * (certificate_normal.dot(point) - offset);
+                minimum_side = std::min(minimum_side, side);
+                maximum_side = std::max(maximum_side, side);
+            }
+            const bool crosses_plane = minimum_side < -tolerance &&
+                                       maximum_side > tolerance;
+            if (after_area + tolerance * tolerance < before_area || crosses_plane)
+            {
+                Vec3 clipped_normal = Vec3::Zero();
+                for (std::size_t index = 1; index + 1 < clipped.size(); ++index)
+                {
+                    clipped_normal = (clipped[index] - clipped.front()).cross(
+                        clipped[index + 1] - clipped.front());
+                    if (clipped_normal.norm() > tolerance * tolerance)
+                    {
+                        clipped_normal /= clipped_normal.norm();
+                        break;
+                    }
+                }
+                if (clipped_normal.norm() <= 0.0) continue;
+                const Mat3 clipped_basis = orthonormalFrame(clipped_normal);
+                std::vector<Vec2> clipped_projected;
+                clipped_projected.reserve(clipped.size());
+                bool coplanar = true;
+                for (const Vec3& point : clipped)
+                {
+                    if (std::abs(clipped_normal.dot(point - clipped.front())) >
+                        tolerance * 16.0)
+                    {
+                        coplanar = false;
+                        break;
+                    }
+                    const Vec3 local = clipped_basis.transposeMultiply(
+                        point - clipped.front());
+                    clipped_projected.emplace_back(local.x(), local.y());
+                }
+                if (coplanar && signedArea(clipped_projected) < 0.0)
+                    std::reverse(clipped_projected.begin(),
+                                clipped_projected.end());
+                const auto clipped_triangles = triangulatePolygon(clipped_projected);
+                if (!coplanar || (clipped_triangles.size() + 2 !=
+                    clipped_projected.size() &&
+                    !convexProjected(clipped_projected)))
+                {
+                    // Some recognised CAD polygons contain a collinear seam
+                    // that is harmless before clipping but makes their vertex
+                    // order non-simple after a plane cut.  Reconstruct only
+                    // this clipped fragment from its own boundary hull; this
+                    // never broadens the kept half-space.
+                    const auto hull = convexHull(clipped_projected, tolerance);
+                    if (hull.size() < 3) continue;
+                    const Vec3 clip_origin = current.front();
+                    clipped.clear();
+                    clipped.reserve(hull.size());
+                    for (const Vec2& point : hull)
+                        clipped.push_back(clip_origin + clipped_basis *
+                            Vec3(point.x(), point.y(), 0.0));
+                }
+                current = clipped;
+                changed = true;
+                ++stats.clipped_primitives;
+                stats.removed_area += std::max(before_area - after_area, 0.0);
+            }
+        }
+        if (current.size() < 3 || polygonArea(current) <= tolerance * tolerance)
+        {
+            ++stats.removed_primitives;
+            continue;
+        }
+        Vec3 candidate_normal = Vec3::Zero();
+        for (std::size_t index = 1; index + 1 < current.size(); ++index)
+        {
+            candidate_normal = (current[index] - current.front()).cross(
+                current[index + 1] - current.front());
+            if (candidate_normal.norm() > tolerance * tolerance)
+            {
+                candidate_normal /= candidate_normal.norm();
+                break;
+            }
+        }
+        std::vector<Vec2> projected;
+        if (candidate_normal.norm() <= 0.0)
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        const Mat3 candidate_basis = orthonormalFrame(candidate_normal);
+        projected.reserve(current.size());
+        for (const Vec3& point : current)
+        {
+            if (std::abs(candidate_normal.dot(point - current.front())) >
+                tolerance * 16.0)
+            {
+                projected.clear();
+                break;
+            }
+            const Vec3 local = candidate_basis.transposeMultiply(
+                point - current.front());
+            projected.emplace_back(local.x(), local.y());
+        }
+        if (!projected.empty() && signedArea(projected) < 0.0)
+            std::reverse(projected.begin(), projected.end());
+        if (projected.size() != current.size() ||
+            (triangulatePolygon(projected).size() + 2 != projected.size() &&
+             !convexProjected(projected)))
+        {
+            // The clipping planes can meet at a polygon vertex.  If numerical
+            // noise makes the resulting ordering non-simple, retain the
+            // original face rather than exporting an invalid/self-crossing
+            // polygon.
+            result.push_back(std::move(item));
+            continue;
+        }
+        if (!changed)
+        {
+            result.push_back(std::move(item));
+            continue;
+        }
+        OutputPrimitive clipped = item;
+        clipped.primitive.polygon = std::move(current);
+        clipped.preserves_cavity_opening = true;
+        result.push_back(std::move(clipped));
+        ++stats.output_fragments;
+    }
+    return result;
+}
+
+std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
+    std::vector<OutputPrimitive> primitives,
+    const Vec3& model_center,
+    const double maximum_depth,
+    const double tolerance,
+    std::vector<OutputPrimitive>& coverage_certificates,
+    ParallelOcclusionStats& stats)
+{
+    constexpr int clipper_precision = 8;
+    (void)model_center;
+    // Occlusion decisions in one pass must see the same geometry.  If a
+    // coverer is moved out of `primitives` before a later candidate is tested,
+    // a face hidden by several coverers can incorrectly survive merely because
+    // the first coverers were already consumed.  Keep only the immutable
+    // primitive geometry as the decision snapshot; responsibility metadata is
+    // still taken from the live candidate below.
+    std::vector<Primitive> source_geometry;
+    source_geometry.reserve(primitives.size());
+    for (const auto& item : primitives)
+        source_geometry.push_back(item.primitive);
+    std::vector<OutputPrimitive> result;
+    result.reserve(primitives.size());
+    for (std::size_t candidate_id = 0; candidate_id < primitives.size();
+         ++candidate_id)
+    {
+        OutputPrimitive& candidate = primitives[candidate_id];
+        if (candidate.preserves_cavity_opening ||
+            candidate.primitive.kind != Kind::Polygon ||
+            candidate.primitive.polygon.size() < 3)
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        Vec3 normal;
+        if (!planarNormal(candidate.primitive, tolerance, normal))
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        const Vec3 origin = candidate.primitive.polygon.front();
+        const double candidate_distance = normal.dot(origin);
+        const Mat3 basis = orthonormalFrame(normal);
+        Mat3 frame;
+        frame.col(0) = basis.col(1);
+        frame.col(1) = basis.col(2);
+        frame.col(2) = normal;
+        Clipper2Lib::PathD candidate_path;
+        for (const Vec3& vertex : candidate.primitive.polygon)
+        {
+            const Vec3 local = frame.transposeMultiply(vertex - origin);
+            candidate_path.emplace_back(local.x(), local.y());
+        }
+        if (Clipper2Lib::Area(candidate_path) < 0.0)
+            std::reverse(candidate_path.begin(), candidate_path.end());
+        const double candidate_area = std::abs(
+            Clipper2Lib::Area(candidate_path));
+        if (candidate_area <= tolerance * tolerance)
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+
+        ++stats.candidate_count;
+        Clipper2Lib::PathsD positive_coverers;
+        Clipper2Lib::PathsD negative_coverers;
+        for (std::size_t coverer_id = 0; coverer_id < primitives.size();
+             ++coverer_id)
+        {
+            if (coverer_id == candidate_id ||
+                source_geometry[coverer_id].kind != Kind::Polygon ||
+                source_geometry[coverer_id].polygon.size() < 3)
+                continue;
+            Vec3 coverer_normal;
+            if (!planarNormal(
+                    source_geometry[coverer_id], tolerance,
+                    coverer_normal))
+                continue;
+            if (std::abs(coverer_normal.dot(normal)) < 1.0 - 1.0e-8)
+                continue;
+            const double coverer_distance = normal.dot(
+                source_geometry[coverer_id].polygon.front());
+            const double signed_depth = coverer_distance - candidate_distance;
+            if (std::abs(signed_depth) <= tolerance ||
+                std::abs(signed_depth) > maximum_depth)
+                continue;
+            Clipper2Lib::PathD path;
+            for (const Vec3& vertex : source_geometry[coverer_id].polygon)
+            {
+                const Vec3 local = frame.transposeMultiply(vertex - origin);
+                path.emplace_back(local.x(), local.y());
+            }
+            if (std::abs(Clipper2Lib::Area(path)) <= tolerance * tolerance)
+                continue;
+            if (Clipper2Lib::Area(path) < 0.0)
+                std::reverse(path.begin(), path.end());
+            if (signed_depth > 0.0)
+                positive_coverers.push_back(std::move(path));
+            else
+                negative_coverers.push_back(std::move(path));
+        }
+        if (positive_coverers.empty() && negative_coverers.empty())
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        const auto unionFor = [&](const Clipper2Lib::PathsD& coverers)
+        {
+            return coverers.empty()
+                ? Clipper2Lib::PathsD{}
+                : Clipper2Lib::Union(
+                    coverers, Clipper2Lib::FillRule::NonZero,
+                    clipper_precision);
+        };
+        const auto positive_union = unionFor(positive_coverers);
+        const auto negative_union = unionFor(negative_coverers);
+        const auto coveredFor = [&](const Clipper2Lib::PathsD& cover_union)
+        {
+            return cover_union.empty()
+                ? 0.0
+                : std::abs(Clipper2Lib::Area(Clipper2Lib::Intersect(
+                    Clipper2Lib::PathsD{candidate_path}, cover_union,
+                    Clipper2Lib::FillRule::NonZero, clipper_precision)));
+        };
+        const double positive_area = coveredFor(positive_union);
+        const double negative_area = coveredFor(negative_union);
+        const bool use_positive = positive_area >= negative_area;
+        const auto& cover_union = use_positive ? positive_union : negative_union;
+        const double covered_area = std::max(positive_area, negative_area);
+        const double covered_ratio = covered_area / candidate_area;
+        stats.candidate_ratios.emplace_back(candidate_id, covered_ratio);
+        stats.maximum_covered_ratio = std::max(
+            stats.maximum_covered_ratio, covered_ratio);
+        // A high same-facing outward coverage ratio is the geometric signature
+        // of an internal layer.  A lower threshold permits partial inner caps
+        // such as a wall hidden by several outer strips, while the direction
+        // and bounded depth reject opposing exterior faces.
+        if (covered_ratio < 0.80)
+        {
+            result.push_back(std::move(candidate));
+            continue;
+        }
+        ++stats.accepted_candidates;
+        stats.accepted_ids.push_back(candidate_id);
+        const auto remaining = Clipper2Lib::Difference(
+            Clipper2Lib::PathsD{candidate_path}, cover_union,
+            Clipper2Lib::FillRule::NonZero, clipper_precision);
+        const double removed_area = std::max(
+            candidate_area - std::abs(Clipper2Lib::Area(remaining)), 0.0);
+        coverage_certificates.push_back(candidate);
+        ++stats.clipped_primitives;
+        stats.removed_area += removed_area;
+        if (remaining.empty())
+        {
+            ++stats.removed_primitives;
+            continue;
+        }
+        Clipper2Lib::PathsD output_paths = remaining;
+        if (std::any_of(remaining.begin(), remaining.end(),
+            [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
+        {
+            Clipper2Lib::PathsD triangles;
+            if (Clipper2Lib::Triangulate(
+                    remaining, clipper_precision, triangles, false) !=
+                Clipper2Lib::TriangulateResult::success)
+            {
+                result.push_back(std::move(candidate));
+                --stats.clipped_primitives;
+                stats.removed_area -= removed_area;
+                coverage_certificates.pop_back();
+                continue;
+            }
+            output_paths = std::move(triangles);
+        }
+        for (const auto& path : output_paths)
+        {
+            if (std::abs(Clipper2Lib::Area(path)) <= tolerance * tolerance)
+                continue;
+            std::vector<Vec2> boundary;
+            for (const auto& point : path)
+                boundary.emplace_back(point.x, point.y);
+            boundary = simplifyPolygon(std::move(boundary), tolerance);
+            if (boundary.size() < 3 ||
+                triangulatePolygon(boundary).size() + 2 != boundary.size())
+                continue;
+            OutputPrimitive fragment = candidate;
+            fragment.primitive = polygonPrimitive(boundary, origin, frame);
+            fragment.preserves_cavity_opening = true;
+            result.push_back(std::move(fragment));
+            ++stats.output_fragments;
+        }
+    }
+    return result;
+}
+
 std::vector<OutputPrimitive> clipSupportContactOcclusion(
     std::vector<OutputPrimitive> primitives,
     const std::vector<RecognizedProtrusion>& protrusions,
@@ -13469,6 +14019,162 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         coverage_certificate_primitives.end(),
         std::make_move_iterator(occluded_support_certificates.begin()),
         std::make_move_iterator(occluded_support_certificates.end()));
+
+    // Remove inner parallel layers from the same current surface set before
+    // any of their outer coverers are discarded.  Coverage is computed from
+    // the union of all same-facing outward patches, so a bottom face hidden by
+    // three side-panel bottoms is handled as one Boolean occlusion event, just
+    // like the support face hidden by several protrusion contacts.
+    ParallelOcclusionStats parallel_occlusion_stats;
+    const std::size_t parallel_certificate_begin =
+        coverage_certificate_primitives.size();
+    output = clipParallelInternalSurfaceOcclusion(
+        std::move(output), (lower + upper) * 0.5,
+        diagonal * 0.03, merge_tolerance,
+        coverage_certificate_primitives, parallel_occlusion_stats);
+    // The newly appended certificates are the actual faces removed in this
+    // pass.  Use only those witnesses for the orthogonal propagation step;
+    // feeding every active primitive here would turn ordinary adjacent panels
+    // into clipping planes and could erase legitimate exterior surfaces.
+    std::vector<OutputPrimitive> parallel_certificates;
+    if (parallel_certificate_begin < coverage_certificate_primitives.size())
+        parallel_certificates.insert(
+            parallel_certificates.end(),
+            coverage_certificate_primitives.begin() + parallel_certificate_begin,
+            coverage_certificate_primitives.end());
+    // Keep the surviving parallel coverers paired with the removed witnesses.
+    // A removed lower skin may be separated from its surviving support plane
+    // by a thin wall; orthogonal neighbours must be clipped at that surviving
+    // plane, not at the already removed skin itself.
+    std::vector<OutputPrimitive> orthogonal_occlusion_planes =
+        parallel_certificates;
+    const auto active_end = coverage_certificate_primitives.begin() +
+        static_cast<std::ptrdiff_t>(parallel_certificate_begin);
+    for (auto active = coverage_certificate_primitives.begin();
+         active != active_end; ++active)
+    {
+        Vec3 active_normal;
+        if (!planarNormal(active->primitive, merge_tolerance, active_normal))
+            continue;
+        const double active_distance = active_normal.dot(
+            planarPoint(active->primitive));
+        bool paired = false;
+        for (const auto& certificate : parallel_certificates)
+        {
+            Vec3 certificate_normal;
+            if (!planarNormal(certificate.primitive, merge_tolerance,
+                              certificate_normal) ||
+                std::abs(active_normal.dot(certificate_normal)) < 1.0 - 1.0e-8)
+                continue;
+            if (active_normal.dot(certificate_normal) < 0.0)
+                certificate_normal = -certificate_normal;
+            const double certificate_distance = certificate_normal.dot(
+                planarPoint(certificate.primitive));
+            if (std::abs(active_distance - certificate_distance) > merge_tolerance &&
+                std::abs(active_distance - certificate_distance) <= diagonal * 0.03)
+            {
+                paired = true;
+                break;
+            }
+        }
+        if (paired)
+        {
+            OutputPrimitive plane = *active;
+            // Internal marker for the orthogonal pass: this plane is a
+            // surviving coverer paired with a removed witness, so its finite
+            // footprint need not contain the intersection endpoint exactly
+            // (the endpoint may lie on a shared CAD seam).
+            plane.preserves_cavity_opening = true;
+            orthogonal_occlusion_planes.push_back(std::move(plane));
+        }
+    }
+    const std::size_t orthogonal_input_count = output.size();
+    std::vector<OutputPrimitive> orthogonal_input = output;
+    std::vector<OutputPrimitive> orthogonal_output =
+        clipAdjacentFacesAtOcclusionPlanes(
+            std::move(output), orthogonal_occlusion_planes,
+            (lower + upper) * 0.5, merge_tolerance,
+            parallel_occlusion_stats);
+    // Orthogonal propagation is deliberately transactional.  A malformed CAD
+    // seam can make a plane witness appear to cover unrelated patches; if one
+    // pass would erase more than a fifth of the active surface set, retain the
+    // pre-pass geometry and let the conservative coverage audit decide the
+    // remaining cleanup.  This keeps the generic rule from becoming a hidden
+    // model-specific aggressive simplifier.
+    if (orthogonal_output.size() * 5 < orthogonal_input_count * 4)
+        output = std::move(orthogonal_input);
+    else
+        output = std::move(orthogonal_output);
+    {
+        std::ofstream parallel_profile(
+            output_directory / "parallel_occlusion_profile.json");
+        parallel_profile << "{\"candidate_count\":"
+            << parallel_occlusion_stats.candidate_count
+            << ",\"accepted_candidates\":"
+            << parallel_occlusion_stats.accepted_candidates
+            << ",\"clipped_primitives\":"
+            << parallel_occlusion_stats.clipped_primitives
+            << ",\"removed_primitives\":"
+            << parallel_occlusion_stats.removed_primitives
+            << ",\"output_fragments\":"
+            << parallel_occlusion_stats.output_fragments
+            << ",\"removed_area\":"
+            << parallel_occlusion_stats.removed_area
+            << ",\"maximum_covered_ratio\":"
+            << parallel_occlusion_stats.maximum_covered_ratio
+            << ",\"accepted_ids\":[";
+        for (std::size_t index = 0; index <
+             parallel_occlusion_stats.accepted_ids.size(); ++index)
+        {
+            if (index != 0) parallel_profile << ',';
+            parallel_profile << parallel_occlusion_stats.accepted_ids[index];
+        }
+        parallel_profile << "],\"candidate_ratios\":[";
+        for (std::size_t index = 0; index <
+             parallel_occlusion_stats.candidate_ratios.size(); ++index)
+        {
+            if (index != 0) parallel_profile << ',';
+            parallel_profile << "["
+                << parallel_occlusion_stats.candidate_ratios[index].first
+                << "," << parallel_occlusion_stats.candidate_ratios[index].second
+                << "]";
+        }
+        parallel_profile << "]}\n";
+    }
+
+    // Run the generic prismatic-occlusion pass before enclosure bookkeeping.
+    // This is intentionally model-independent: if the current surface set
+    // contains a certified open/closed extrusion, planar caps hidden inside it
+    // are removed using the same coverage certificate used by the final audit.
+    // The workload ceiling prevents this cleanup from trading a small amount of
+    // redundant surface for an unbounded triangle increase.
+    std::size_t regularized_occluded = 0;
+    std::size_t regularized_extrusions = 0;
+    OcclusionClipStats regularized_clip_stats;
+    bool regularized_rolled_back = false;
+    const std::size_t regularized_workload = triangulatedFaceCount(output);
+    output = clipRegularizedPlanarOcclusion(
+        mesh, std::move(output), merge_tolerance,
+        coverage_certificate_primitives, nullptr, &excluded_faces,
+        regularized_workload, regularized_occluded,
+        regularized_extrusions, regularized_clip_stats,
+        regularized_rolled_back);
+    stats.removed_contained_primitives += regularized_occluded;
+    {
+        std::ofstream regularized_profile(
+            output_directory / "regularized_occlusion_profile.json");
+        regularized_profile << "{\"recognized_extrusions\":"
+            << regularized_extrusions
+            << ",\"removed_primitives\":" << regularized_occluded
+            << ",\"rolled_back\":"
+            << (regularized_rolled_back ? "true" : "false")
+            << ",\"clipped_primitives\":"
+            << regularized_clip_stats.clipped_primitives
+            << ",\"input_triangles\":"
+            << regularized_clip_stats.input_triangles
+            << ",\"output_triangles\":"
+            << regularized_clip_stats.output_triangles << "}\n";
+    }
 
     std::size_t locally_enclosed_primitives = 0;
     output = removePrimitivesInsideEnclosureGroups(
