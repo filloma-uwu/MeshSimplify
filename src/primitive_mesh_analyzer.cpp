@@ -3166,6 +3166,44 @@ void appendRevolvedSurfacePatches(std::vector<OutputPrimitive>& output,
                 fit.top_radius, std::move(top_faces));
 }
 
+std::uint32_t roundSegmentsForError(const double radius,
+                                    const double maximum_error,
+                                    const std::uint32_t minimum_segments)
+{
+    if (radius <= 0.0 || maximum_error <= 0.0)
+        return std::max<std::uint32_t>(minimum_segments, 3);
+    // A regular polygon with vertex radius R*sec(pi/n) circumscribes a circle
+    // of radius R. Its maximum outward radial error is
+    // R*(sec(pi/n)-1). Reserve ten percent of the user's total directed error
+    // for later arithmetic/canonicalization and solve this bound for n.
+    const double budget = maximum_error * 0.9;
+    const double cosine = std::clamp(
+        radius / (radius + budget), 0.0, 1.0);
+    const double angle = std::acos(cosine);
+    if (angle <= 1.0e-12) return 4096;
+    const auto required = static_cast<std::uint32_t>(
+        std::ceil(std::numbers::pi / angle));
+    return std::clamp(
+        std::max(required, minimum_segments),
+        static_cast<std::uint32_t>(3),
+        static_cast<std::uint32_t>(4096));
+}
+
+void refineRoundSurfaceSegments(std::vector<OutputPrimitive>& surfaces,
+                                const double maximum_error)
+{
+    for (OutputPrimitive& item : surfaces)
+    {
+        Primitive& primitive = item.primitive;
+        if (!isCertifiedRoundSurfaceKind(primitive.kind) ||
+            !primitive.band_axial_ranges.empty())
+            continue;
+        primitive.segments = roundSegmentsForError(
+            std::max(primitive.base_radius, primitive.top_radius),
+            maximum_error, primitive.segments);
+    }
+}
+
 struct CylindricalRegionExtractionStats
 {
     std::size_t candidate_axes = 0;
@@ -7790,6 +7828,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
 
         std::vector<OutputPrimitive> candidate;
         Primitive side = *revolved;
+        const std::uint32_t adaptive_segments = roundSegmentsForError(
+            std::max(side.base_radius, side.top_radius),
+            candidate_error_limit, side.segments);
+        side.segments = adaptive_segments;
         side.kind = std::abs(side.base_radius - side.top_radius) <=
                 1.0e-8 * std::max({side.base_radius, side.top_radius,
                                     side.height})
@@ -7803,7 +7845,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             disk.axes = revolved->axes;
             disk.base_radius = radius;
             disk.top_radius = radius;
-            disk.segments = revolved->segments;
+            disk.segments = adaptive_segments;
             candidate.push_back({std::move(disk), component});
         };
         append_cap(revolved->center, revolved->base_radius);
@@ -8058,6 +8100,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             appendRevolvedSurfacePatches(
                 round_candidate, responsibility_mesh, *revolved,
                 responsibility, tolerance * 8.0);
+            refineRoundSurfaceSegments(
+                round_candidate, candidate_error_limit);
             const std::size_t round_workload =
                 triangulatedFaceCount(round_candidate);
             if (!round_candidate.empty() &&
@@ -12291,7 +12335,7 @@ StructuralCleanup identifyStructuralRedundantFaces(
     closure_options.maximum_open_error_distance =
         options.maximum_open_error_distance >= 0.0
             ? options.maximum_open_error_distance
-            : model_diagonal * 0.02;
+            : model_diagonal * 0.08;
     std::vector<std::unordered_set<std::uint32_t>> ignored_neighbors;
     const auto clusters = coplanarClusters(
         mesh, model_diagonal * options.coplanar_relative_tolerance, ignored_neighbors);
@@ -15603,7 +15647,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double maximum_open_error_distance =
         effective_options.maximum_open_error_distance >= 0.0
             ? effective_options.maximum_open_error_distance
-            : diagonal * 0.02;
+            : diagonal * 0.08;
     stats.maximum_open_error_distance_limit = maximum_open_error_distance;
 
     // There is deliberately no enclosing-volume candidate phase.  Every
@@ -15749,6 +15793,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             std::make_move_iterator(classified.begin()),
             std::make_move_iterator(classified.end()));
     }
+    refineRoundSurfaceSegments(output, maximum_open_error_distance);
     decltype(adjacency){}.swap(adjacency);
     decltype(clusters){}.swap(clusters);
     output = fillCertifiedIntercomponentGaps(
@@ -15860,10 +15905,12 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // spatial subtrees cutting the main body into unrelated local boxes.
     std::size_t support_surface_set_merges = 0;
     std::vector<OutputPrimitive> occluded_support_certificates;
+    const double support_surface_error_limit = std::min(
+        maximum_open_error_distance, diagonal * 0.02);
     output = mergeSupportProtrusionSurfaceSets(
         mesh, filled_surface_mesh, std::move(output), effective_options,
         diagonal, model_surface_area, merge_tolerance,
-        maximum_open_error_distance,
+        support_surface_error_limit,
         std::max(diagonal / 192.0, 1.0e-30),
         support_surface_set_merges,
         occluded_support_certificates,
