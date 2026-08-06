@@ -2958,16 +2958,49 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
     {
         if (primitive.polygon.size() < 3)
             throw std::runtime_error("polygon primitive has fewer than three vertices");
-        result.vertices = primitive.polygon;
-        const Vec3 normal = (primitive.polygon[1] - primitive.polygon[0])
-                                .cross(primitive.polygon[2] - primitive.polygon[0]);
-        if (normal.norm() <= 1.0e-30)
+        Vec3 polygon_lower = Vec3::Constant(
+            std::numeric_limits<double>::infinity());
+        Vec3 polygon_upper = Vec3::Constant(
+            -std::numeric_limits<double>::infinity());
+        for (const Vec3& vertex : primitive.polygon)
         {
-            std::ostringstream message;
-            message << "polygon primitive has a degenerate plane; vertices=";
-            for (const Vec3& vertex : primitive.polygon)
-                message << " (" << vertex.x() << ',' << vertex.y() << ',' << vertex.z() << ')';
-            throw std::runtime_error(message.str());
+            polygon_lower = polygon_lower.cwiseMin(vertex);
+            polygon_upper = polygon_upper.cwiseMax(vertex);
+        }
+        const double duplicate_tolerance = std::max(
+            (polygon_upper - polygon_lower).norm() * 1.0e-12,
+            1.0e-12);
+        result.vertices.reserve(primitive.polygon.size());
+        for (const Vec3& vertex : primitive.polygon)
+            if (std::none_of(
+                    result.vertices.begin(), result.vertices.end(),
+                    [&](const Vec3& existing)
+                    { return (existing - vertex).norm() <= duplicate_tolerance; }))
+                result.vertices.push_back(vertex);
+        if (result.vertices.size() < 3)
+        {
+            result.vertices.clear();
+            return result;
+        }
+
+        Vec3 normal = Vec3::Zero();
+        for (std::size_t second = 1;
+             second + 1 < result.vertices.size() &&
+             normal.norm() <= duplicate_tolerance * duplicate_tolerance;
+             ++second)
+            for (std::size_t third = second + 1;
+                 third < result.vertices.size(); ++third)
+            {
+                normal = (result.vertices[second] - result.vertices[0]).cross(
+                    result.vertices[third] - result.vertices[0]);
+                if (normal.norm() >
+                    duplicate_tolerance * duplicate_tolerance)
+                    break;
+            }
+        if (normal.norm() <= duplicate_tolerance * duplicate_tolerance)
+        {
+            result.vertices.clear();
+            return result;
         }
         Mat3 basis = orthonormalFrame(normal.normalized());
         Mat3 frame;
@@ -2975,14 +3008,14 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
         frame.col(1) = static_cast<Vec3>(basis.col(2));
         frame.col(2) = normal.normalized();
         std::vector<Vec2> boundary;
-        boundary.reserve(primitive.polygon.size());
-        for (const Vec3& vertex : primitive.polygon)
+        boundary.reserve(result.vertices.size());
+        for (const Vec3& vertex : result.vertices)
         {
-            const Vec3 local = frame.transposeMultiply(vertex - primitive.polygon.front());
+            const Vec3 local = frame.transposeMultiply(vertex - result.vertices.front());
             boundary.emplace_back(local.x(), local.y());
         }
         const auto indices = triangulatePolygon(std::move(boundary));
-        if (indices.size() + 2 != primitive.polygon.size())
+        if (indices.size() + 2 != result.vertices.size())
         {
             std::ostringstream message;
             message << "simple polygon triangulation did not produce n-2 triangles; vertices=";
@@ -15091,6 +15124,14 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         adjacent_envelope_group_merges,
         output_directory / "adjacent_envelope_group_profile.json");
     stats.merged_spatial_primitive_groups += adjacent_envelope_group_merges;
+    // Boolean clipping may leave a zero-area loop that carries duplicate or
+    // collinear coordinates. It has no collision surface and cannot cover a
+    // nondegenerate source triangle, so remove it before the occlusion passes;
+    // the final responsibility audit remains authoritative.
+    output.erase(std::remove_if(output.begin(), output.end(),
+        [](const OutputPrimitive& item)
+        { return triangulatePrimitive(item.primitive).faces.empty(); }),
+        output.end());
     requireSurfaceCandidates(output, "phase 3 closed envelope merging");
 
     // Preserve the exact responsibility owners produced by the fixed-point

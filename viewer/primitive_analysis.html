@@ -256,7 +256,7 @@
     import { OrbitControls } from './lib/OrbitControls.js';
 
     const params = new URLSearchParams(location.search);
-    const manifestUrl = new URL(params.get('manifest') || '/outputs/analytic_surface_only_full_v1/viewer_manifest.json', location.href);
+    const manifestUrl = new URL(params.get('manifest') || '/outputs/analytic_surface_only_full_v2/viewer_manifest.json', location.href);
     const viewport = document.querySelector('#viewport');
     const loading = document.querySelector('#loading');
     const loadingText = document.querySelector('#loadingText');

@@ -106,6 +106,10 @@ configured circumferential segment count.
    combined into extrusions; doing so is quadratic on large CAD soups and can
    erase surfaces without a closed-envelope ownership proof.
 8. Canonicalize the final outer surface and triangulate each semantic patch.
+   Boolean-clipping fragments are deduplicated at model-relative tolerance;
+   loops with fewer than three unique non-collinear points are zero-area
+   artifacts and are discarded before occlusion. The final source-coverage
+   audit remains authoritative after this cleanup.
 
 The approach combines the face-based hierarchical framework of Attene,
 Falcidieno, and Spagnuolo (2006), *Hierarchical Mesh Segmentation Based on
