@@ -4114,6 +4114,20 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
         std::array<PrimitiveMesh, 2> current_surfaces{
             triangulatePrimitive(items[first].output.primitive),
             triangulatePrimitive(items[second].output.primitive)};
+        const auto first_normal = representativeNormal(
+            items[first].output, current_surfaces[0]);
+        const auto second_normal = representativeNormal(
+            items[second].output, current_surfaces[1]);
+        // This pass merges planar layers. Flattening differently oriented
+        // surfaces onto an arbitrary support plane creates large crossing
+        // panels. Non-planar unions must be recognized later as a certified
+        // analytic surface or remain unchanged.
+        if (!first_normal || !second_normal ||
+            first_normal->dot(*second_normal) < 1.0 - 1.0e-8)
+        {
+            ++profile.unsupported_rejections;
+            return std::nullopt;
+        }
         struct ExternalNeighborSurface
         {
             std::size_t id = 0;
@@ -4140,13 +4154,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 continue;
             external_neighbors.push_back({neighbor, std::move(neighbor_surface)});
         }
-        const auto first_normal = representativeNormal(
-            items[first].output, current_surfaces[0]);
-        const auto second_normal = representativeNormal(
-            items[second].output, current_surfaces[1]);
-        const bool isolated_non_coplanar_pair =
-            external_neighbors.empty() && first_normal && second_normal &&
-            std::abs(first_normal->dot(*second_normal)) < 1.0 - 1.0e-8;
         std::vector<Vec3> points;
         // The current primitives are the geometry being replaced. Always add
         // their vertices so a fitted surface cannot silently drop a stage-2 cap
@@ -4183,10 +4190,8 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             if (first_normal) directions.push_back(*first_normal);
             if (second_normal) directions.push_back(*second_normal);
         }
-        // Non-planar surface candidates still receive a real merge attempt.
-        // Their triangulated face normals provide supported planar replacement
-        // directions; the Hausdorff limit, rather than a primitive-kind or
-        // normal-angle rule, decides whether flattening them is acceptable.
+        // All face directions below are parallel for a certified planar pair;
+        // retaining them preserves deterministic direction ordering.
         for (const PrimitiveMesh& surface : current_surfaces)
         {
             struct FaceDirection
@@ -4217,11 +4222,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             for (std::size_t index = 0; index < limit; ++index)
                 directions.push_back(face_directions[index].normal);
         }
-        Vec3 centroid = Vec3::Zero();
-        for (const Vec3& point : points) centroid += point;
-        centroid /= static_cast<double>(points.size());
-        if ((centroid - model_center).norm() > tolerance)
-            directions.push_back((centroid - model_center).normalized());
         std::vector<Vec3> unique_directions;
         for (const Vec3& direction : directions)
         {
@@ -4263,11 +4263,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 maximum_open_error_distance + tolerance)
             {
                 ++profile.error_rejections;
-                continue;
-            }
-            if (isolated_non_coplanar_pair)
-            {
-                ++profile.connectivity_rejections;
                 continue;
             }
             std::vector<Vec3> candidate_points = points;

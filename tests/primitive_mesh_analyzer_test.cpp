@@ -255,7 +255,8 @@ int main()
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
                     group_loose_stats.primitive_count > 6 &&
-                    group_loose_stats.merged_spatial_primitive_groups == 0,
+                    group_loose_stats.merged_spatial_primitive_groups == 0 &&
+                    group_loose_stats.merged_local_planar_primitives == 0,
                 "a loose error must not replace non-analytic adjacent surfaces with a solid envelope");
         require(readText(root / "spatial_group_loose" /
                          "adjacent_envelope_group_profile.json").find(

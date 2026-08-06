@@ -53,7 +53,10 @@ configured circumferential segment count.
    its own volume ratio and may be bridged without consuming a global budget.
 5. Merge every adjacent patch that has the same certified analytic surface;
    clipped patches retain their parameter-domain boundary, while a certified
-   original complete surface may be restored.
+   original complete surface may be restored. The planar layer pass accepts
+   only same-facing parallel patches. It may flatten a shallow parallel step
+   within the directed-error limit, but it never projects differently oriented
+   faces onto one support plane.
 6. Build the stage-3 adjacency graph from both source-responsibility edges and
    the actual boundaries of the current stage-2 patches. Boundary contact is
    tested between line segments, so T junctions, partially overlapping edges,
