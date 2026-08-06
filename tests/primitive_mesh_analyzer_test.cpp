@@ -89,6 +89,34 @@ void appendCylinderBandObj(std::ostringstream& obj, std::size_t& next_vertex,
     next_vertex += 2 * segments;
 }
 
+void appendCylinderArcObj(std::ostringstream& obj, std::size_t& next_vertex,
+                          const std::size_t full_segments,
+                          const std::size_t arc_segments,
+                          const double radius, const double height)
+{
+    const std::size_t base = next_vertex;
+    constexpr double pi = 3.14159265358979323846;
+    for (std::size_t index = 0; index <= arc_segments; ++index)
+    {
+        const double angle = 2.0 * pi * static_cast<double>(index) /
+                             static_cast<double>(full_segments);
+        const double x = radius * std::cos(angle);
+        const double y = radius * std::sin(angle);
+        obj << "v " << x << ' ' << y << " 0\n"
+            << "v " << x << ' ' << y << ' ' << height << '\n';
+    }
+    for (std::size_t index = 0; index < arc_segments; ++index)
+    {
+        const std::size_t lower = base + 2 * index;
+        const std::size_t upper = lower + 1;
+        const std::size_t next_lower = lower + 2;
+        const std::size_t next_upper = next_lower + 1;
+        obj << "f " << lower << ' ' << next_lower << ' ' << next_upper << '\n'
+            << "f " << lower << ' ' << next_upper << ' ' << upper << '\n';
+    }
+    next_vertex += 2 * (arc_segments + 1);
+}
+
 bool hasLargeFaceOnX(const std::filesystem::path& path, const double x)
 {
     std::ifstream stream(path);
@@ -202,6 +230,24 @@ int main()
                     cylinder_stats.primitive_count == 1 &&
                     cylinder_stats.proxy_triangles == 48,
                 "a complete cylinder side must remain one certified surface");
+
+        // An exposed cylindrical arc is still one analytic surface. It must
+        // not be completed into a closed cylinder or replaced by rectangular
+        // box faces merely because caps or neighboring walls are absent.
+        const auto cylinder_arc = root / "cylinder_arc.obj";
+        std::ostringstream cylinder_arc_obj;
+        std::size_t cylinder_arc_vertex = 1;
+        appendCylinderArcObj(
+            cylinder_arc_obj, cylinder_arc_vertex, 96, 24, 1.0, 2.0);
+        writeText(cylinder_arc, cylinder_arc_obj.str());
+        const auto cylinder_arc_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                cylinder_arc, root / "cylinder_arc", analytic);
+        require(cylinder_arc_stats.containment_validation_passed &&
+                    cylinder_arc_stats.cylindrical_band_count == 1 &&
+                    cylinder_arc_stats.primitive_count == 1 &&
+                    cylinder_arc_stats.proxy_triangles < 48,
+                "a partial cylinder must remain one trimmed analytic surface");
 
         // Error tolerance does not create adjacency. Three disconnected
         // coplanar rectangles remain independent stage-3 surfaces.

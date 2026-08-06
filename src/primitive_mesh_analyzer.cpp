@@ -244,6 +244,11 @@ struct Primitive
     // surface clipped in (angle, axial-distance) parameter space.  Entry i is
     // the conservative lower/upper axial boundary at angle 2*pi*i/N.
     std::vector<std::array<double, 2>> band_axial_ranges;
+    // Entry i says whether the angular interval [i,i+1] is part of a trimmed
+    // band.  Inactive intervals emit no triangles, so a quarter-round or an
+    // exposed cylindrical strip stays an open surface instead of becoming a
+    // misleading complete cylinder.
+    std::vector<std::uint8_t> band_active_segments;
     double volume = 0.0;
 };
 
@@ -1631,6 +1636,115 @@ std::vector<std::vector<std::uint32_t>> boundaryLoops(
     return loops;
 }
 
+std::vector<std::vector<std::uint32_t>> boundaryLoopsApproximate(
+    const Mesh& mesh,
+    const std::vector<std::uint32_t>& faces,
+    const double tolerance)
+{
+    if (tolerance <= 0.0) return boundaryLoops(mesh, faces);
+    struct CellKey
+    {
+        std::array<std::int64_t, 3> value{};
+        bool operator<(const CellKey& other) const { return value < other.value; }
+    };
+    const auto cellFor = [&](const Vec3& point)
+    {
+        CellKey key;
+        for (int axis = 0; axis < 3; ++axis)
+            key.value[axis] = static_cast<std::int64_t>(
+                std::floor(point[axis] / tolerance));
+        return key;
+    };
+    std::map<CellKey, std::vector<std::uint32_t>> cells;
+    std::vector<Vec3> canonical_points;
+    std::vector<std::uint32_t> representatives;
+    std::unordered_map<std::uint32_t, std::uint32_t> remap;
+    remap.reserve(faces.size() * 3);
+    for (const auto face_id : faces)
+        for (const auto vertex : mesh.faces[face_id])
+        {
+            if (remap.contains(vertex)) continue;
+            const CellKey center = cellFor(mesh.vertices[vertex]);
+            std::uint32_t selected = std::numeric_limits<std::uint32_t>::max();
+            for (int dx = -1; dx <= 1 && selected ==
+                     std::numeric_limits<std::uint32_t>::max(); ++dx)
+                for (int dy = -1; dy <= 1 && selected ==
+                         std::numeric_limits<std::uint32_t>::max(); ++dy)
+                    for (int dz = -1; dz <= 1 && selected ==
+                             std::numeric_limits<std::uint32_t>::max(); ++dz)
+                    {
+                        CellKey neighbor = center;
+                        neighbor.value[0] += dx;
+                        neighbor.value[1] += dy;
+                        neighbor.value[2] += dz;
+                        const auto found = cells.find(neighbor);
+                        if (found == cells.end()) continue;
+                        for (const auto candidate : found->second)
+                            if ((canonical_points[candidate] -
+                                 mesh.vertices[vertex]).norm() <= tolerance)
+                            {
+                                selected = candidate;
+                                break;
+                            }
+                    }
+            if (selected == std::numeric_limits<std::uint32_t>::max())
+            {
+                selected = static_cast<std::uint32_t>(canonical_points.size());
+                canonical_points.push_back(mesh.vertices[vertex]);
+                representatives.push_back(vertex);
+                cells[center].push_back(selected);
+            }
+            remap.emplace(vertex, selected);
+        }
+
+    std::unordered_map<std::uint64_t, int> counts;
+    for (const auto face_id : faces)
+    {
+        const Face& face = mesh.faces[face_id];
+        for (int edge = 0; edge < 3; ++edge)
+            ++counts[edgeKey(remap.at(face[edge]),
+                             remap.at(face[(edge + 1) % 3]))];
+    }
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> adjacency;
+    for (const auto& [key, count] : counts)
+    {
+        if (count != 1) continue;
+        const auto first = static_cast<std::uint32_t>(key >> 32U);
+        const auto second = static_cast<std::uint32_t>(key);
+        if (first == second) continue;
+        adjacency[first].push_back(second);
+        adjacency[second].push_back(first);
+    }
+    std::unordered_set<std::uint64_t> visited;
+    std::vector<std::vector<std::uint32_t>> loops;
+    for (const auto& [start, neighbors] : adjacency)
+        for (const auto initial_next : neighbors)
+        {
+            if (visited.contains(edgeKey(start, initial_next))) continue;
+            std::vector<std::uint32_t> loop{representatives[start]};
+            std::uint32_t previous = start;
+            std::uint32_t current = initial_next;
+            while (current != start && loop.size() <= adjacency.size() + 1)
+            {
+                loop.push_back(representatives[current]);
+                visited.insert(edgeKey(previous, current));
+                const auto& next_candidates = adjacency[current];
+                const auto iterator = std::find_if(
+                    next_candidates.begin(), next_candidates.end(),
+                    [&](const auto candidate) { return candidate != previous; });
+                if (iterator == next_candidates.end()) break;
+                previous = current;
+                current = *iterator;
+            }
+            if (current == start && loop.size() >= 3)
+            {
+                visited.insert(edgeKey(previous, current));
+                loops.push_back(std::move(loop));
+            }
+        }
+    return loops;
+}
+
 std::size_t faceComponentCount(const Mesh& mesh,
                                const std::vector<std::uint32_t>& faces)
 {
@@ -2250,11 +2364,9 @@ std::vector<OutputPrimitive> classifyFinalRegion(
                   <= planar_tolerance;
     if (!planar) return exactTrianglePrimitives(mesh, faces);
 
-    // Spatially merged planar islands are separate objects, not holes in one patch.
-    if (faceComponentCount(mesh, faces) > 1)
-        return exactTrianglePrimitives(mesh, faces);
-
-    auto loops = boundaryLoops(mesh, faces);
+    // coplanarClusters already returns geometrically connected regions. Do not
+    // rebuild a full-mesh weld table for every cluster here.
+    auto loops = boundaryLoopsApproximate(mesh, faces, planar_tolerance);
     if (loops.empty()) return exactTrianglePrimitives(mesh, faces);
     const Mat3 frame = [&]
     {
@@ -2615,7 +2727,10 @@ std::vector<std::vector<std::uint32_t>> approximatePlanarRegions(
         {
             if (plane_group.size() >= 6)
             {
-                auto connected = faceComponentsFromList(mesh, plane_group);
+                std::vector<bool> plane_mask(mesh.faces.size(), false);
+                for (const auto face : plane_group) plane_mask[face] = true;
+                auto connected = faceComponentsApproximate(
+                    mesh, plane_mask, distance_tolerance);
                 for (auto& component : connected)
                     if (component.size() >= 6) result.push_back(std::move(component));
             }
@@ -2644,7 +2759,7 @@ std::vector<OutputPrimitive> classifyApproximatePlanarSurface(
     const Vec3& model_center, const double model_diagonal,
     const PrimitiveMeshAnalysisOptions& options)
 {
-    if (faces.size() < 6 || faceComponentCount(mesh, faces) != 1) return {};
+    if (faces.size() < 6) return {};
     Vec3 reference = Vec3::Zero();
     Vec3 normal_sum = Vec3::Zero();
     for (const auto face_id : faces)
@@ -2675,7 +2790,7 @@ std::vector<OutputPrimitive> classifyApproximatePlanarSurface(
     }
     if (upper - lower > 2.0 * tolerance) return {};
 
-    const auto loops = boundaryLoops(mesh, faces);
+    const auto loops = boundaryLoopsApproximate(mesh, faces, tolerance);
     if (loops.size() != 1 || loops.front().size() < 3) return {};
     if ((center - model_center).dot(normal) < 0.0) normal *= -1.0;
     const Mat3 basis = orthonormalFrame(normal);
@@ -2725,8 +2840,7 @@ std::vector<OutputPrimitive> classifyApproximateCircularSurface(
     std::size_t& filled_holes,
     double& filled_volume)
 {
-    if (!options.allow_round_surfaces || faces.size() < 6 ||
-        faceComponentCount(mesh, faces) != 1) return {};
+    if (!options.allow_round_surfaces || faces.size() < 6) return {};
 
     Vec3 reference = Vec3::Zero();
     Vec3 normal_sum = Vec3::Zero();
@@ -2761,7 +2875,7 @@ std::vector<OutputPrimitive> classifyApproximateCircularSurface(
         return {};
     }
 
-    auto loops3 = boundaryLoops(mesh, faces);
+    auto loops3 = boundaryLoopsApproximate(mesh, faces, planar_tolerance);
     if (loops3.empty())
     {
         return {};
@@ -2951,6 +3065,402 @@ void appendRevolvedSurfacePatches(std::vector<OutputPrimitive>& output,
                 fit.top_radius, std::move(top_faces));
 }
 
+struct CylindricalRegionExtractionStats
+{
+    std::size_t candidate_axes = 0;
+    std::size_t smooth_components = 0;
+    std::size_t rejected_small = 0;
+    std::size_t rejected_circle = 0;
+    std::size_t rejected_angular_coverage = 0;
+    std::size_t rejected_workload = 0;
+    std::size_t accepted_regions = 0;
+    std::size_t accepted_source_faces = 0;
+};
+
+std::vector<std::vector<std::uint32_t>> smoothFaceComponentsApproximate(
+    const Mesh& mesh,
+    const std::vector<bool>& included_faces,
+    double tolerance,
+    double minimum_normal_dot,
+    std::vector<std::vector<std::uint32_t>>* adjacency_output);
+
+// Extract complete cylindrical side patches before planar clustering.  The old
+// pipeline tested one whole connected model at a time; a cap, rib, or attached
+// bracket then made the end-ring certificate fail and every curved strip fell
+// through as an unrelated planar polygon.  This routine grows only smooth
+// lateral regions around edge-supported axis hypotheses.  It emits a surface,
+// never a closed solid and never a box fallback.
+std::vector<OutputPrimitive> extractCylindricalSurfaceRegions(
+    const Mesh& mesh,
+    const std::vector<bool>& included_faces,
+    const PrimitiveMeshAnalysisOptions& options,
+    const double geometric_tolerance,
+    CylindricalRegionExtractionStats& stats)
+{
+    struct AxisBucket
+    {
+        Vec3 sum = Vec3::Zero();
+        std::size_t count = 0;
+    };
+    std::map<std::array<int, 3>, AxisBucket> histogram;
+    const auto canonicalAxis = [](Vec3 direction)
+    {
+        direction = direction.normalized();
+        for (int axis = 0; axis < 3; ++axis)
+            if (std::abs(direction[axis]) > 1.0e-12)
+            {
+                if (direction[axis] < 0.0) direction *= -1.0;
+                break;
+            }
+        return direction;
+    };
+    for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+    {
+        if (!included_faces[face_id]) continue;
+        const Face& face = mesh.faces[face_id];
+        for (int edge = 0; edge < 3; ++edge)
+        {
+            Vec3 direction = mesh.vertices[face[(edge + 1) % 3]] -
+                             mesh.vertices[face[edge]];
+            if (direction.norm() <= geometric_tolerance) continue;
+            direction = canonicalAxis(direction);
+            constexpr double quantization = 32.0;
+            std::array<int, 3> key{};
+            for (int axis = 0; axis < 3; ++axis)
+                key[axis] = static_cast<int>(
+                    std::llround(direction[axis] * quantization));
+            AxisBucket& bucket = histogram[key];
+            bucket.sum += direction;
+            ++bucket.count;
+        }
+    }
+    std::vector<std::pair<std::size_t, Vec3>> ranked_axes;
+    ranked_axes.reserve(histogram.size() + 6);
+    for (const auto& [key, bucket] : histogram)
+    {
+        (void)key;
+        if (bucket.count < 4 || bucket.sum.norm() <= 1.0e-30) continue;
+        ranked_axes.emplace_back(bucket.count,
+                                 canonicalAxis(bucket.sum));
+    }
+    std::sort(ranked_axes.begin(), ranked_axes.end(),
+        [](const auto& first, const auto& second)
+        { return first.first > second.first; });
+    std::vector<Vec3> axes{
+        Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, Vec3{0.0, 0.0, 1.0}};
+    const std::size_t maximum_histogram_axes = 24;
+    for (std::size_t index = 0;
+         index < std::min(ranked_axes.size(), maximum_histogram_axes); ++index)
+    {
+        const Vec3 axis = ranked_axes[index].second;
+        if (std::none_of(axes.begin(), axes.end(), [&](const Vec3& existing)
+            { return std::abs(existing.dot(axis)) >= 0.9995; }))
+            axes.push_back(axis);
+    }
+    stats.candidate_axes = axes.size();
+
+    struct Candidate
+    {
+        Primitive surface;
+        std::vector<std::uint32_t> faces;
+        std::size_t output_triangles = 0;
+    };
+    std::vector<Candidate> candidates;
+    const double maximum_axial_normal = 0.20;
+    const double minimum_smooth_normal_dot =
+        std::cos(50.0 * std::numbers::pi / 180.0);
+    for (const Vec3& axis : axes)
+    {
+        std::vector<bool> lateral_faces(mesh.faces.size(), false);
+        for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+        {
+            if (!included_faces[face_id]) continue;
+            const Face& face = mesh.faces[face_id];
+            Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+                .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+            if (normal.norm() <= geometric_tolerance * geometric_tolerance)
+                continue;
+            normal = normal.normalized();
+            if (std::abs(normal.dot(axis)) > maximum_axial_normal) continue;
+            lateral_faces[face_id] = true;
+        }
+        std::vector<std::vector<std::uint32_t>> smooth_adjacency;
+        auto broad_components = smoothFaceComponentsApproximate(
+            mesh, lateral_faces, geometric_tolerance,
+            minimum_smooth_normal_dot, &smooth_adjacency);
+        // Remove the interiors of large planar patches before circle fitting.
+        // A tessellated cylinder has a small but persistent normal rotation
+        // between neighboring strips; a flat wall does not.  Include the
+        // coplanar triangle mate of every curved seed so split quads remain
+        // complete, then rebuild components in the same geometric adjacency.
+        std::vector<Vec3> face_normals(mesh.faces.size(), Vec3::Zero());
+        for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+        {
+            if (!lateral_faces[face_id]) continue;
+            const Face& face = mesh.faces[face_id];
+            Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+                .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+            if (normal.norm() > 1.0e-30)
+                face_normals[face_id] = normal.normalized();
+        }
+        std::vector<bool> curved_faces(mesh.faces.size(), false);
+        constexpr double planar_neighbor_dot = 0.99995;
+        for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+        {
+            if (!lateral_faces[face_id]) continue;
+            const bool curved_seed = std::any_of(
+                smooth_adjacency[face_id].begin(),
+                smooth_adjacency[face_id].end(),
+                [&](const auto neighbor)
+                {
+                    return std::abs(face_normals[face_id].dot(
+                        face_normals[neighbor])) < planar_neighbor_dot;
+                });
+            if (!curved_seed) continue;
+            curved_faces[face_id] = true;
+            for (const auto neighbor : smooth_adjacency[face_id])
+                curved_faces[neighbor] = true;
+        }
+        std::vector<std::vector<std::uint32_t>> components;
+        std::vector<bool> visited(mesh.faces.size(), false);
+        for (std::uint32_t seed = 0; seed < mesh.faces.size(); ++seed)
+        {
+            if (!curved_faces[seed] || visited[seed]) continue;
+            components.emplace_back();
+            std::queue<std::uint32_t> queue;
+            queue.push(seed);
+            visited[seed] = true;
+            while (!queue.empty())
+            {
+                const auto current = queue.front();
+                queue.pop();
+                components.back().push_back(current);
+                for (const auto neighbor : smooth_adjacency[current])
+                    if (curved_faces[neighbor] && !visited[neighbor])
+                    {
+                        visited[neighbor] = true;
+                        queue.push(neighbor);
+                    }
+            }
+        }
+        (void)broad_components;
+        stats.smooth_components += components.size();
+        for (auto& component : components)
+        {
+            if (component.size() < 8)
+            {
+                ++stats.rejected_small;
+                continue;
+            }
+            const auto vertices = uniqueVertices(mesh, component);
+            if (vertices.size() < 8)
+            {
+                ++stats.rejected_small;
+                continue;
+            }
+            const Mat3 frame = orthonormalFrame(axis);
+            Vec3 origin = Vec3::Zero();
+            for (const auto vertex : vertices) origin += mesh.vertices[vertex];
+            origin /= static_cast<double>(vertices.size());
+            std::vector<Vec2> projected;
+            projected.reserve(vertices.size());
+            double lower = std::numeric_limits<double>::infinity();
+            double upper = -std::numeric_limits<double>::infinity();
+            for (const auto vertex : vertices)
+            {
+                const Vec3 local = frame.transposeMultiply(
+                    mesh.vertices[vertex] - origin);
+                lower = std::min(lower, local.x());
+                upper = std::max(upper, local.x());
+                projected.emplace_back(local.y(), local.z());
+            }
+            const auto center = leastSquaresCircleCenter(projected);
+            if (!center)
+            {
+                ++stats.rejected_circle;
+                continue;
+            }
+            double minimum_radius = std::numeric_limits<double>::infinity();
+            double maximum_radius = 0.0;
+            double mean_radius = 0.0;
+            std::vector<double> angles;
+            angles.reserve(projected.size());
+            for (Vec2 point : projected)
+            {
+                point = point - *center;
+                const double radius = point.norm();
+                minimum_radius = std::min(minimum_radius, radius);
+                maximum_radius = std::max(maximum_radius, radius);
+                mean_radius += radius;
+                double angle = std::atan2(point.y(), point.x());
+                if (angle < 0.0) angle += 2.0 * std::numbers::pi;
+                angles.push_back(angle);
+            }
+            mean_radius /= static_cast<double>(projected.size());
+            const double allowed_radial_spread = std::max(
+                2.0 * options.circle_radial_tolerance,
+                4.0 * geometric_tolerance /
+                    std::max(mean_radius, geometric_tolerance));
+            if (mean_radius <= geometric_tolerance ||
+                (maximum_radius - minimum_radius) / mean_radius >
+                    allowed_radial_spread)
+            {
+                ++stats.rejected_circle;
+                continue;
+            }
+            const Vec3 fitted_axis_origin = origin +
+                frame.col(1) * center->x() + frame.col(2) * center->y();
+            bool radial_normals = true;
+            const double minimum_radial_normal_dot =
+                std::cos(20.0 * std::numbers::pi / 180.0);
+            for (const auto face_id : component)
+            {
+                const Face& face = mesh.faces[face_id];
+                const Vec3 centroid = (mesh.vertices[face[0]] +
+                    mesh.vertices[face[1]] + mesh.vertices[face[2]]) / 3.0;
+                Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+                    .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+                if (normal.norm() <= 1.0e-30) continue;
+                normal = normal.normalized();
+                Vec3 radial = centroid - fitted_axis_origin;
+                radial = radial - axis * radial.dot(axis);
+                if (radial.norm() <= geometric_tolerance ||
+                    std::abs(normal.dot(radial.normalized())) <
+                        minimum_radial_normal_dot)
+                {
+                    radial_normals = false;
+                    break;
+                }
+            }
+            if (!radial_normals)
+            {
+                ++stats.rejected_circle;
+                continue;
+            }
+            std::sort(angles.begin(), angles.end());
+            angles.erase(std::unique(angles.begin(), angles.end(),
+                [](const double first, const double second)
+                { return std::abs(first - second) <= 1.0e-5; }), angles.end());
+            double maximum_gap = angles.empty()
+                ? 2.0 * std::numbers::pi
+                : angles.front() + 2.0 * std::numbers::pi - angles.back();
+            for (std::size_t index = 1; index < angles.size(); ++index)
+                maximum_gap = std::max(maximum_gap,
+                                       angles[index] - angles[index - 1]);
+            const double covered_angle = 2.0 * std::numbers::pi - maximum_gap;
+            if (angles.size() < 3 || covered_angle <
+                    20.0 * std::numbers::pi / 180.0)
+            {
+                ++stats.rejected_angular_coverage;
+                continue;
+            }
+            const double height = upper - lower;
+            if (height <= geometric_tolerance)
+            {
+                ++stats.rejected_small;
+                continue;
+            }
+            Primitive surface;
+            surface.kind = Kind::CylindricalBand;
+            surface.axes = frame;
+            surface.center = origin + frame.col(0) * lower +
+                frame.col(1) * center->x() + frame.col(2) * center->y();
+            surface.height = height;
+            const double polygon_expansion = options.round_surface_segments >= 3
+                ? 1.0 / std::cos(std::numbers::pi /
+                    static_cast<double>(options.round_surface_segments))
+                : std::numeric_limits<double>::infinity();
+            surface.base_radius = surface.top_radius = maximum_radius *
+                polygon_expansion * (1.0 + 1.0e-12);
+            surface.segments = options.round_surface_segments;
+            surface.band_axial_ranges.assign(
+                surface.segments, std::array<double, 2>{0.0, height});
+            surface.band_active_segments.assign(surface.segments, 0);
+            const double angular_step = 2.0 * std::numbers::pi /
+                static_cast<double>(surface.segments);
+            bool spans_too_wide = false;
+            for (const auto face_id : component)
+            {
+                std::array<double, 3> face_angles{};
+                for (int corner = 0; corner < 3; ++corner)
+                {
+                    const Vec3 local = frame.transposeMultiply(
+                        mesh.vertices[mesh.faces[face_id][corner]] -
+                        fitted_axis_origin);
+                    face_angles[corner] = std::atan2(local.z(), local.y());
+                }
+                for (int corner = 1; corner < 3; ++corner)
+                {
+                    while (face_angles[corner] - face_angles[0] >
+                           std::numbers::pi)
+                        face_angles[corner] -= 2.0 * std::numbers::pi;
+                    while (face_angles[corner] - face_angles[0] <
+                          -std::numbers::pi)
+                        face_angles[corner] += 2.0 * std::numbers::pi;
+                }
+                const auto [minimum_angle, maximum_angle] =
+                    std::minmax_element(face_angles.begin(), face_angles.end());
+                if (*maximum_angle - *minimum_angle > angular_step * 1.05)
+                {
+                    spans_too_wide = true;
+                    break;
+                }
+                const int first_segment = static_cast<int>(std::floor(
+                    (*minimum_angle - 1.0e-9) / angular_step));
+                const int last_segment = static_cast<int>(std::floor(
+                    (*maximum_angle + 1.0e-9) / angular_step));
+                for (int segment = first_segment; segment <= last_segment;
+                     ++segment)
+                {
+                    const int cyclic = (segment %
+                        static_cast<int>(surface.segments) +
+                        static_cast<int>(surface.segments)) %
+                        static_cast<int>(surface.segments);
+                    surface.band_active_segments[cyclic] = 1;
+                }
+            }
+            if (spans_too_wide)
+            {
+                ++stats.rejected_angular_coverage;
+                continue;
+            }
+            const std::size_t output_triangles =
+                triangulatePrimitive(surface).faces.size();
+            if (output_triangles > component.size())
+            {
+                ++stats.rejected_workload;
+                continue;
+            }
+            candidates.push_back(
+                {std::move(surface), std::move(component), output_triangles});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const Candidate& first, const Candidate& second)
+        {
+            const std::size_t first_gain =
+                first.faces.size() - first.output_triangles;
+            const std::size_t second_gain =
+                second.faces.size() - second.output_triangles;
+            if (first_gain != second_gain) return first_gain > second_gain;
+            return first.faces.size() > second.faces.size();
+        });
+    std::vector<bool> claimed(mesh.faces.size(), false);
+    std::vector<OutputPrimitive> result;
+    for (Candidate& candidate : candidates)
+    {
+        if (std::any_of(candidate.faces.begin(), candidate.faces.end(),
+            [&](const auto face) { return claimed[face]; }))
+            continue;
+        for (const auto face : candidate.faces) claimed[face] = true;
+        stats.accepted_source_faces += candidate.faces.size();
+        ++stats.accepted_regions;
+        result.push_back(
+            {std::move(candidate.surface), std::move(candidate.faces)});
+    }
+    return result;
+}
+
 PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
 {
     PrimitiveMesh result;
@@ -3112,6 +3622,10 @@ PrimitiveMesh triangulatePrimitive(const Primitive& primitive)
         for (std::uint32_t index = 0; index < range_count; ++index)
         {
             const std::uint32_t next = (index + 1) % range_count;
+            if (!primitive.band_active_segments.empty() &&
+                (index >= primitive.band_active_segments.size() ||
+                 primitive.band_active_segments[index] == 0))
+                continue;
             result.faces.push_back(
                 {2 * index, 2 * next, 2 * next + 1});
             result.faces.push_back(
@@ -3236,6 +3750,9 @@ bool trimmedAnalyticBandContainsTriangle(
         ? primitive.band_axial_ranges.size()
         : static_cast<std::size_t>(primitive.segments);
     if (segments < 3) return false;
+    if (!primitive.band_active_segments.empty() &&
+        primitive.band_active_segments.size() != segments)
+        return false;
     const double step = 2.0 * std::numbers::pi /
                         static_cast<double>(segments);
     std::array<double, 3> angles{};
@@ -3271,6 +3788,9 @@ bool trimmedAnalyticBandContainsTriangle(
         const std::size_t first = static_cast<std::size_t>(
             std::floor(sample)) % segments;
         const std::size_t second = (first + 1) % segments;
+        if (!primitive.band_active_segments.empty() &&
+            primitive.band_active_segments[first] == 0)
+            return false;
         const double fraction = sample - std::floor(sample);
         const double lower = trimmed
             ? primitive.band_axial_ranges[first][0] * (1.0 - fraction) +
@@ -6881,6 +7401,126 @@ std::vector<OutputPrimitive> clipAdjacentFaceTrianglesAtOcclusionPlanes(
         stats.output_fragments += emitted;
         (void)input_triangles;
     }
+    return result;
+}
+
+// Build geometric face components while refusing sharp creases.  This is used
+// for analytic-surface region growing: a cylindrical side must be allowed to
+// cross the small angle between adjacent tessellation strips, but it must not
+// absorb an attached cap, rib, or box wall merely because the OBJ happens to be
+// one connected mesh.  OBJ indices are not authoritative here because CAD
+// exporters commonly duplicate vertices at every patch boundary.
+std::vector<std::vector<std::uint32_t>> smoothFaceComponentsApproximate(
+    const Mesh& mesh,
+    const std::vector<bool>& included_faces,
+    const double tolerance,
+    const double minimum_normal_dot,
+    std::vector<std::vector<std::uint32_t>>* adjacency_output)
+{
+    struct CellKey
+    {
+        std::array<std::int64_t, 3> value{};
+        bool operator<(const CellKey& other) const { return value < other.value; }
+    };
+    const double weld_tolerance = std::max(tolerance, 1.0e-12);
+    const auto cellFor = [&](const Vec3& point)
+    {
+        CellKey key;
+        for (int axis = 0; axis < 3; ++axis)
+            key.value[axis] = static_cast<std::int64_t>(
+                std::floor(point[axis] / weld_tolerance));
+        return key;
+    };
+    std::map<CellKey, std::vector<std::uint32_t>> cells;
+    std::vector<Vec3> canonical_points;
+    std::vector<std::uint32_t> remap(mesh.vertices.size());
+    for (std::uint32_t vertex = 0; vertex < mesh.vertices.size(); ++vertex)
+    {
+        const CellKey center = cellFor(mesh.vertices[vertex]);
+        std::uint32_t selected = std::numeric_limits<std::uint32_t>::max();
+        for (int dx = -1; dx <= 1 && selected ==
+                 std::numeric_limits<std::uint32_t>::max(); ++dx)
+            for (int dy = -1; dy <= 1 && selected ==
+                     std::numeric_limits<std::uint32_t>::max(); ++dy)
+                for (int dz = -1; dz <= 1 && selected ==
+                         std::numeric_limits<std::uint32_t>::max(); ++dz)
+                {
+                    CellKey neighbor = center;
+                    neighbor.value[0] += dx;
+                    neighbor.value[1] += dy;
+                    neighbor.value[2] += dz;
+                    const auto found = cells.find(neighbor);
+                    if (found == cells.end()) continue;
+                    for (const auto candidate : found->second)
+                        if ((canonical_points[candidate] -
+                             mesh.vertices[vertex]).norm() <= weld_tolerance)
+                        {
+                            selected = candidate;
+                            break;
+                        }
+                }
+        if (selected == std::numeric_limits<std::uint32_t>::max())
+        {
+            selected = static_cast<std::uint32_t>(canonical_points.size());
+            canonical_points.push_back(mesh.vertices[vertex]);
+            cells[center].push_back(selected);
+        }
+        remap[vertex] = selected;
+    }
+
+    std::vector<Vec3> normals(mesh.faces.size(), Vec3::Zero());
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edge_faces;
+    edge_faces.reserve(mesh.faces.size() * 3);
+    for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+    {
+        if (!included_faces[face_id]) continue;
+        const Face& face = mesh.faces[face_id];
+        Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+            .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+        if (normal.norm() > 1.0e-30) normals[face_id] = normal.normalized();
+        for (int edge = 0; edge < 3; ++edge)
+            edge_faces[edgeKey(remap[face[edge]],
+                               remap[face[(edge + 1) % 3]])].push_back(face_id);
+    }
+    std::vector<std::vector<std::uint32_t>> adjacency(mesh.faces.size());
+    for (const auto& [key, incident] : edge_faces)
+    {
+        (void)key;
+        for (std::size_t first = 0; first < incident.size(); ++first)
+            for (std::size_t second = first + 1; second < incident.size(); ++second)
+            {
+                const auto a = incident[first];
+                const auto b = incident[second];
+                if (std::abs(normals[a].dot(normals[b])) < minimum_normal_dot)
+                    continue;
+                adjacency[a].push_back(b);
+                adjacency[b].push_back(a);
+            }
+    }
+    std::vector<bool> visited(mesh.faces.size(), false);
+    std::vector<std::vector<std::uint32_t>> result;
+    for (std::uint32_t seed = 0; seed < mesh.faces.size(); ++seed)
+    {
+        if (!included_faces[seed] || visited[seed]) continue;
+        result.emplace_back();
+        std::queue<std::uint32_t> queue;
+        queue.push(seed);
+        visited[seed] = true;
+        while (!queue.empty())
+        {
+            const auto current = queue.front();
+            queue.pop();
+            result.back().push_back(current);
+            for (const auto neighbor : adjacency[current])
+                if (!visited[neighbor])
+                {
+                    visited[neighbor] = true;
+                    queue.push(neighbor);
+                }
+        }
+    }
+    if (adjacency_output != nullptr)
+        *adjacency_output = std::move(adjacency);
     return result;
 }
 
@@ -14913,6 +15553,36 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             if (output.size() == previous_size) continue;
             for (const auto face : component)
                 responsibility_faces[face] = false;
+        }
+        CylindricalRegionExtractionStats cylindrical_stats;
+        auto cylindrical_regions = extractCylindricalSurfaceRegions(
+            mesh, responsibility_faces, effective_options,
+            std::max(analytic_tolerance, 1.0e-10), cylindrical_stats);
+        for (const OutputPrimitive& region : cylindrical_regions)
+            for (const auto face : region.source_faces)
+                responsibility_faces[face] = false;
+        output.insert(output.end(),
+            std::make_move_iterator(cylindrical_regions.begin()),
+            std::make_move_iterator(cylindrical_regions.end()));
+        {
+            std::ofstream profile(output_directory /
+                                  "cylindrical_region_profile.json");
+            profile << "{\"candidate_axes\":"
+                    << cylindrical_stats.candidate_axes
+                    << ",\"smooth_components\":"
+                    << cylindrical_stats.smooth_components
+                    << ",\"rejected_small\":"
+                    << cylindrical_stats.rejected_small
+                    << ",\"rejected_circle\":"
+                    << cylindrical_stats.rejected_circle
+                    << ",\"rejected_angular_coverage\":"
+                    << cylindrical_stats.rejected_angular_coverage
+                    << ",\"rejected_workload\":"
+                    << cylindrical_stats.rejected_workload
+                    << ",\"accepted_regions\":"
+                    << cylindrical_stats.accepted_regions
+                    << ",\"accepted_source_faces\":"
+                    << cylindrical_stats.accepted_source_faces << "}\n";
         }
         // Surface recognition precedes exact coplanar clustering. It sees the
         // complete connected CAD patch, including all of its inner boundary
