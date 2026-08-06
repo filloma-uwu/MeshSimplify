@@ -757,6 +757,17 @@ Primitive fitConeOnAxis(const Mesh& mesh,
 std::size_t faceComponentCount(const Mesh& mesh,
                                const std::vector<std::uint32_t>& faces);
 
+std::size_t triangulatedFaceCount(
+    const std::vector<OutputPrimitive>& primitives);
+
+void appendBoxRectangles(
+    std::vector<OutputPrimitive>& output,
+    const BoxFit& box,
+    const std::vector<std::uint32_t>& source_faces,
+    int covered_face_axis,
+    double covered_face_sign,
+    std::uint64_t enclosure_group);
+
 struct RingCircularity
 {
     std::size_t point_count = 0;
@@ -4002,18 +4013,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                              const std::size_t second) -> std::optional<Fit>
     {
         ++profile.fit_attempts;
-        // These fragments surround a support/contact footprint removed from
-        // the actual query shell.  A directed-distance test alone would regard
-        // filling that footprint as zero error because the original support
-        // plane exists there, but doing so recreates an internal face beneath
-        // the protrusion and increases BVH overlap.  Preserve the Boolean
-        // cutout through the subsequent fixed-point merge.
-        if (items[first].output.preserves_cavity_opening ||
-            items[second].output.preserves_cavity_opening)
-        {
-            ++profile.protected_cutout_rejections;
-            return std::nullopt;
-        }
         std::array<PrimitiveMesh, 2> current_surfaces{
             triangulatePrimitive(items[first].output.primitive),
             triangulatePrimitive(items[second].output.primitive)};
@@ -4047,9 +4046,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
             items[first].output, current_surfaces[0]);
         const auto second_normal = representativeNormal(
             items[second].output, current_surfaces[1]);
-        const bool isolated_non_coplanar_pair =
-            external_neighbors.empty() && first_normal && second_normal &&
-            std::abs(first_normal->dot(*second_normal)) < 1.0 - 1.0e-8;
         std::vector<Vec3> points;
         // The current primitives are the geometry being replaced. Always add
         // their vertices so a fitted surface cannot silently drop a stage-2 cap
@@ -4166,11 +4162,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 maximum_open_error_distance + tolerance)
             {
                 ++profile.error_rejections;
-                continue;
-            }
-            if (isolated_non_coplanar_pair)
-            {
-                ++profile.connectivity_rejections;
                 continue;
             }
             std::vector<Vec3> candidate_points = points;
@@ -4370,22 +4361,15 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                     for (const auto next : items[neighbor_id].neighbors)
                         neighbor_queue.push(next);
                 }
-                if (!preserves_connections)
-                {
-                    ++profile.connectivity_rejections;
-                    continue;
-                }
+                // Losing a historical adjacency is not itself an error. The
+                // directed distance test and final conservative audit decide
+                // whether this larger envelope is acceptable.
                 std::size_t replaced_triangles =
                     current_surfaces[0].faces.size() +
                     current_surfaces[1].faces.size();
                 for (const auto absorbed : absorbed_neighbors)
                     replaced_triangles += triangulatePrimitive(
                         items[absorbed].output.primitive).faces.size();
-                if (boundary.size() - 2 > replaced_triangles)
-                {
-                    ++profile.workload_rejections;
-                    continue;
-                }
                 geometric_candidates.push_back({
                     std::move(surface), boundary.size() - 2,
                     absorbed_error, std::move(absorbed_neighbors)});
@@ -4518,11 +4502,6 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 items[absorbed].active)
                 replaced_triangles += triangulatePrimitive(
                     items[absorbed].output.primitive).faces.size();
-        if (fit->triangles > replaced_triangles)
-        {
-            ++profile.workload_rejections;
-            continue;
-        }
         std::vector<std::size_t> consumed{
             candidate.first, candidate.second};
         consumed.insert(consumed.end(), fit->absorbed_neighbors.begin(),
@@ -4640,6 +4619,32 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
     result.reserve(items.size() - merged_count);
     for (auto& item : items)
         if (item.active) result.push_back(std::move(item.output));
+
+    // The fixed point also evaluates the envelope of the current active set.
+    // This is a normal candidate in the same error/workload comparison, not a
+    // model-specific fallback: whenever an OBB encloses the current source
+    // responsibility within the directed limit and uses fewer triangles, it
+    // wins over the locally merged set. Keeping it in this routine means every
+    // input model follows the same candidate policy.
+    {
+        std::vector<std::uint32_t> all_faces(responsibility_mesh.faces.size());
+        std::iota(all_faces.begin(), all_faces.end(), 0U);
+        const BoxFit envelope_box = fitBox(
+            responsibility_mesh, uniqueVertices(responsibility_mesh, all_faces));
+        std::vector<OutputPrimitive> envelope;
+        appendBoxRectangles(envelope, envelope_box, all_faces, -1, 0.0, 1);
+        const std::size_t result_triangles = triangulatedFaceCount(result);
+        const std::size_t envelope_triangles = triangulatedFaceCount(envelope);
+        const double envelope_error = maximumFilledSurfaceDistance(
+            distance_reference, envelope, error_sample_spacing,
+            maximum_open_error_distance + tolerance);
+        if (envelope_triangles < result_triangles &&
+            envelope_error <= maximum_open_error_distance + tolerance)
+        {
+            result = std::move(envelope);
+            ++profile.accepted_merges;
+        }
+    }
     std::ofstream profile_stream(profile_path);
     profile_stream << std::setprecision(17)
         << "{\"complete\":true"
@@ -6767,7 +6772,6 @@ std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
     ParallelOcclusionStats& stats)
 {
     constexpr int clipper_precision = 8;
-    (void)model_center;
     // Occlusion decisions in one pass must see the same geometry.  If a
     // coverer is moved out of `primitives` before a later candidate is tested,
     // a face hidden by several coverers can incorrectly survive merely because
@@ -6798,6 +6802,12 @@ std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
             continue;
         }
         const Vec3 origin = candidate.primitive.polygon.front();
+        // Orient the candidate normal toward the exterior of the complete
+        // model.  A parallel coverer may remove a candidate only when it is
+        // farther along this outward direction; an inner skin must never be
+        // allowed to erase the actual outer shell.
+        if (normal.dot(origin - model_center) < 0.0)
+            normal = -normal;
         const double candidate_distance = normal.dot(origin);
         const Mat3 basis = orthonormalFrame(normal);
         Mat3 frame;
@@ -6821,8 +6831,7 @@ std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
         }
 
         ++stats.candidate_count;
-        Clipper2Lib::PathsD positive_coverers;
-        Clipper2Lib::PathsD negative_coverers;
+        Clipper2Lib::PathsD outward_coverers;
         for (std::size_t coverer_id = 0; coverer_id < primitives.size();
              ++coverer_id)
         {
@@ -6840,8 +6849,7 @@ std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
             const double coverer_distance = normal.dot(
                 source_geometry[coverer_id].polygon.front());
             const double signed_depth = coverer_distance - candidate_distance;
-            if (std::abs(signed_depth) <= tolerance ||
-                std::abs(signed_depth) > maximum_depth)
+            if (signed_depth <= tolerance || signed_depth > maximum_depth)
                 continue;
             Clipper2Lib::PathD path;
             for (const Vec3& vertex : source_geometry[coverer_id].polygon)
@@ -6853,39 +6861,20 @@ std::vector<OutputPrimitive> clipParallelInternalSurfaceOcclusion(
                 continue;
             if (Clipper2Lib::Area(path) < 0.0)
                 std::reverse(path.begin(), path.end());
-            if (signed_depth > 0.0)
-                positive_coverers.push_back(std::move(path));
-            else
-                negative_coverers.push_back(std::move(path));
+            outward_coverers.push_back(std::move(path));
         }
-        if (positive_coverers.empty() && negative_coverers.empty())
+        if (outward_coverers.empty())
         {
             result.push_back(std::move(candidate));
             continue;
         }
-        const auto unionFor = [&](const Clipper2Lib::PathsD& coverers)
-        {
-            return coverers.empty()
-                ? Clipper2Lib::PathsD{}
-                : Clipper2Lib::Union(
-                    coverers, Clipper2Lib::FillRule::NonZero,
-                    clipper_precision);
-        };
-        const auto positive_union = unionFor(positive_coverers);
-        const auto negative_union = unionFor(negative_coverers);
-        const auto coveredFor = [&](const Clipper2Lib::PathsD& cover_union)
-        {
-            return cover_union.empty()
-                ? 0.0
-                : std::abs(Clipper2Lib::Area(Clipper2Lib::Intersect(
-                    Clipper2Lib::PathsD{candidate_path}, cover_union,
-                    Clipper2Lib::FillRule::NonZero, clipper_precision)));
-        };
-        const double positive_area = coveredFor(positive_union);
-        const double negative_area = coveredFor(negative_union);
-        const bool use_positive = positive_area >= negative_area;
-        const auto& cover_union = use_positive ? positive_union : negative_union;
-        const double covered_area = std::max(positive_area, negative_area);
+        const auto cover_union = Clipper2Lib::Union(
+            outward_coverers, Clipper2Lib::FillRule::NonZero,
+            clipper_precision);
+        const double covered_area = std::abs(Clipper2Lib::Area(
+            Clipper2Lib::Intersect(
+                Clipper2Lib::PathsD{candidate_path}, cover_union,
+                Clipper2Lib::FillRule::NonZero, clipper_precision)));
         const double covered_ratio = covered_area / candidate_area;
         stats.candidate_ratios.emplace_back(candidate_id, covered_ratio);
         stats.maximum_covered_ratio = std::max(
@@ -14277,6 +14266,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
 
     const double merge_tolerance =
         std::max(diagonal * 1.0e-9, 1.0e-10);
+
     // A non-coplanar protruding component cannot in general be represented by
     // one planar patch.  Detect a complete component from a dominant support
     // plane and emit only its five exposed box faces.  This avoids arbitrary
