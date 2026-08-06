@@ -1745,6 +1745,109 @@ std::vector<std::vector<std::uint32_t>> boundaryLoopsApproximate(
     return loops;
 }
 
+std::vector<std::vector<std::uint32_t>> faceComponentsFromList(
+    const Mesh& mesh, const std::vector<std::uint32_t>& faces);
+
+std::vector<std::vector<std::uint32_t>> faceComponentsFromListApproximate(
+    const Mesh& mesh,
+    const std::vector<std::uint32_t>& faces,
+    const double tolerance)
+{
+    if (faces.empty()) return {};
+    if (tolerance <= 0.0) return faceComponentsFromList(mesh, faces);
+    struct CellKey
+    {
+        std::array<std::int64_t, 3> value{};
+        bool operator<(const CellKey& other) const { return value < other.value; }
+    };
+    const auto cellFor = [&](const Vec3& point)
+    {
+        CellKey key;
+        for (int axis = 0; axis < 3; ++axis)
+            key.value[axis] = static_cast<std::int64_t>(
+                std::floor(point[axis] / tolerance));
+        return key;
+    };
+    std::map<CellKey, std::vector<std::uint32_t>> cells;
+    std::vector<Vec3> canonical_points;
+    std::unordered_map<std::uint32_t, std::uint32_t> remap;
+    remap.reserve(faces.size() * 3);
+    for (const auto face_id : faces)
+        for (const auto vertex : mesh.faces[face_id])
+        {
+            if (remap.contains(vertex)) continue;
+            const CellKey center = cellFor(mesh.vertices[vertex]);
+            std::uint32_t selected = std::numeric_limits<std::uint32_t>::max();
+            for (int dx = -1; dx <= 1 && selected ==
+                     std::numeric_limits<std::uint32_t>::max(); ++dx)
+                for (int dy = -1; dy <= 1 && selected ==
+                         std::numeric_limits<std::uint32_t>::max(); ++dy)
+                    for (int dz = -1; dz <= 1 && selected ==
+                             std::numeric_limits<std::uint32_t>::max(); ++dz)
+                    {
+                        CellKey neighbor = center;
+                        neighbor.value[0] += dx;
+                        neighbor.value[1] += dy;
+                        neighbor.value[2] += dz;
+                        const auto found = cells.find(neighbor);
+                        if (found == cells.end()) continue;
+                        for (const auto candidate : found->second)
+                            if ((canonical_points[candidate] -
+                                 mesh.vertices[vertex]).norm() <= tolerance)
+                            {
+                                selected = candidate;
+                                break;
+                            }
+                    }
+            if (selected == std::numeric_limits<std::uint32_t>::max())
+            {
+                selected = static_cast<std::uint32_t>(canonical_points.size());
+                canonical_points.push_back(mesh.vertices[vertex]);
+                cells[center].push_back(selected);
+            }
+            remap.emplace(vertex, selected);
+        }
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> edge_faces;
+    edge_faces.reserve(faces.size() * 3);
+    for (const auto face_id : faces)
+    {
+        const Face& face = mesh.faces[face_id];
+        for (int edge = 0; edge < 3; ++edge)
+            edge_faces[edgeKey(remap.at(face[edge]),
+                remap.at(face[(edge + 1) % 3]))].push_back(face_id);
+    }
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> adjacency;
+    adjacency.reserve(faces.size());
+    for (const auto& [edge, incident] : edge_faces)
+    {
+        (void)edge;
+        for (const auto first : incident)
+            for (const auto second : incident)
+                if (first != second) adjacency[first].push_back(second);
+    }
+    std::unordered_set<std::uint32_t> remaining(faces.begin(), faces.end());
+    std::vector<std::vector<std::uint32_t>> result;
+    while (!remaining.empty())
+    {
+        const auto seed = *remaining.begin();
+        remaining.erase(seed);
+        result.emplace_back();
+        std::queue<std::uint32_t> queue;
+        queue.push(seed);
+        while (!queue.empty())
+        {
+            const auto current = queue.front();
+            queue.pop();
+            result.back().push_back(current);
+            const auto found = adjacency.find(current);
+            if (found == adjacency.end()) continue;
+            for (const auto neighbor : found->second)
+                if (remaining.erase(neighbor) != 0) queue.push(neighbor);
+        }
+    }
+    return result;
+}
+
 std::size_t faceComponentCount(const Mesh& mesh,
                                const std::vector<std::uint32_t>& faces)
 {
@@ -2727,10 +2830,8 @@ std::vector<std::vector<std::uint32_t>> approximatePlanarRegions(
         {
             if (plane_group.size() >= 6)
             {
-                std::vector<bool> plane_mask(mesh.faces.size(), false);
-                for (const auto face : plane_group) plane_mask[face] = true;
-                auto connected = faceComponentsApproximate(
-                    mesh, plane_mask, distance_tolerance);
+                auto connected = faceComponentsFromListApproximate(
+                    mesh, plane_group, distance_tolerance);
                 for (auto& component : connected)
                     if (component.size() >= 6) result.push_back(std::move(component));
             }
@@ -3169,40 +3270,41 @@ std::vector<OutputPrimitive> extractCylindricalSurfaceRegions(
     const double maximum_axial_normal = 0.20;
     const double minimum_smooth_normal_dot =
         std::cos(50.0 * std::numbers::pi / 180.0);
+    // Geometric welding and edge adjacency are independent of the candidate
+    // axis. Build them once; rebuilding the same CAD topology for every one of
+    // roughly two dozen axes dominated runtime on the real 4/5/16 models.
+    std::vector<Vec3> face_normals(mesh.faces.size(), Vec3::Zero());
+    for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
+    {
+        if (!included_faces[face_id]) continue;
+        const Face& face = mesh.faces[face_id];
+        Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
+            .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
+        if (normal.norm() > 1.0e-30)
+            face_normals[face_id] = normal.normalized();
+    }
+    std::vector<std::vector<std::uint32_t>> smooth_adjacency;
+    const auto ignored_smooth_components = smoothFaceComponentsApproximate(
+        mesh, included_faces, geometric_tolerance,
+        minimum_smooth_normal_dot, &smooth_adjacency);
+    (void)ignored_smooth_components;
     for (const Vec3& axis : axes)
     {
         std::vector<bool> lateral_faces(mesh.faces.size(), false);
         for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
         {
             if (!included_faces[face_id]) continue;
-            const Face& face = mesh.faces[face_id];
-            Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
-                .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
-            if (normal.norm() <= geometric_tolerance * geometric_tolerance)
+            if (face_normals[face_id].norm() <= 1.0e-30)
                 continue;
-            normal = normal.normalized();
-            if (std::abs(normal.dot(axis)) > maximum_axial_normal) continue;
+            if (std::abs(face_normals[face_id].dot(axis)) >
+                maximum_axial_normal) continue;
             lateral_faces[face_id] = true;
         }
-        std::vector<std::vector<std::uint32_t>> smooth_adjacency;
-        auto broad_components = smoothFaceComponentsApproximate(
-            mesh, lateral_faces, geometric_tolerance,
-            minimum_smooth_normal_dot, &smooth_adjacency);
         // Remove the interiors of large planar patches before circle fitting.
         // A tessellated cylinder has a small but persistent normal rotation
         // between neighboring strips; a flat wall does not.  Include the
         // coplanar triangle mate of every curved seed so split quads remain
         // complete, then rebuild components in the same geometric adjacency.
-        std::vector<Vec3> face_normals(mesh.faces.size(), Vec3::Zero());
-        for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
-        {
-            if (!lateral_faces[face_id]) continue;
-            const Face& face = mesh.faces[face_id];
-            Vec3 normal = (mesh.vertices[face[1]] - mesh.vertices[face[0]])
-                .cross(mesh.vertices[face[2]] - mesh.vertices[face[0]]);
-            if (normal.norm() > 1.0e-30)
-                face_normals[face_id] = normal.normalized();
-        }
         std::vector<bool> curved_faces(mesh.faces.size(), false);
         constexpr double planar_neighbor_dot = 0.99995;
         for (std::uint32_t face_id = 0; face_id < mesh.faces.size(); ++face_id)
@@ -3213,13 +3315,14 @@ std::vector<OutputPrimitive> extractCylindricalSurfaceRegions(
                 smooth_adjacency[face_id].end(),
                 [&](const auto neighbor)
                 {
-                    return std::abs(face_normals[face_id].dot(
+                    return lateral_faces[neighbor] &&
+                        std::abs(face_normals[face_id].dot(
                         face_normals[neighbor])) < planar_neighbor_dot;
                 });
             if (!curved_seed) continue;
             curved_faces[face_id] = true;
             for (const auto neighbor : smooth_adjacency[face_id])
-                curved_faces[neighbor] = true;
+                if (lateral_faces[neighbor]) curved_faces[neighbor] = true;
         }
         std::vector<std::vector<std::uint32_t>> components;
         std::vector<bool> visited(mesh.faces.size(), false);
@@ -3243,7 +3346,6 @@ std::vector<OutputPrimitive> extractCylindricalSurfaceRegions(
                     }
             }
         }
-        (void)broad_components;
         stats.smooth_components += components.size();
         for (auto& component : components)
         {
@@ -12189,7 +12291,7 @@ StructuralCleanup identifyStructuralRedundantFaces(
     closure_options.maximum_open_error_distance =
         options.maximum_open_error_distance >= 0.0
             ? options.maximum_open_error_distance
-            : model_diagonal * 0.08;
+            : model_diagonal * 0.02;
     std::vector<std::unordered_set<std::uint32_t>> ignored_neighbors;
     const auto clusters = coplanarClusters(
         mesh, model_diagonal * options.coplanar_relative_tolerance, ignored_neighbors);
@@ -15501,7 +15603,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double maximum_open_error_distance =
         effective_options.maximum_open_error_distance >= 0.0
             ? effective_options.maximum_open_error_distance
-            : diagonal * 0.08;
+            : diagonal * 0.02;
     stats.maximum_open_error_distance_limit = maximum_open_error_distance;
 
     // There is deliberately no enclosing-volume candidate phase.  Every
