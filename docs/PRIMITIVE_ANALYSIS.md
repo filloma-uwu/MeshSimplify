@@ -61,6 +61,8 @@ configured circumferential segment count.
    the two OBJ patches lack an identical vertex. For every adjacent pair, fit
    supported surface replacements from the union of their unique
    responsibility vertices. Coplanar work remains a single polygon surface.
+   Certified disks, annuli, cylindrical bands, and conical bands are atomic at
+   this stage: a lower-fidelity planar or box-shell fit cannot replace them.
    A non-coplanar merge is represented by a group of six polygon surfaces that
    form one closed oriented bounding shell; it is never flattened into one
    plane. The group inherits every adjacency of its two children, so subsequent

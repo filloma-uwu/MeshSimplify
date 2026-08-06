@@ -277,6 +277,12 @@ bool isSurfaceCandidateKind(const Kind kind)
            kind == Kind::ConicalBand;
 }
 
+bool isCertifiedRoundSurfaceKind(const Kind kind)
+{
+    return kind == Kind::Disk || kind == Kind::Annulus ||
+           kind == Kind::CylindricalBand || kind == Kind::ConicalBand;
+}
+
 void requireSurfaceCandidates(const std::vector<OutputPrimitive>& primitives,
                               const char* stage)
 {
@@ -4013,6 +4019,18 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                              const std::size_t second) -> std::optional<Fit>
     {
         ++profile.fit_attempts;
+        // A certified analytic round surface is already a tighter and cheaper
+        // representation than an arbitrary planar support replacement. Keep it
+        // atomic here; otherwise a correctly recognized disk or cylinder can be
+        // flattened and later rebuilt as a visibly looser collection of boxes.
+        if (isCertifiedRoundSurfaceKind(
+                items[first].output.primitive.kind) ||
+            isCertifiedRoundSurfaceKind(
+                items[second].output.primitive.kind))
+        {
+            ++profile.unsupported_rejections;
+            return std::nullopt;
+        }
         // A directed candidate-to-reference distance cannot detect geometry
         // deleted behind another source surface. Preserve explicitly restored
         // openings until a complete enclosure candidate replaces the whole
@@ -6960,6 +6978,13 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         for (const auto group : {first, second})
             for (const auto& primitive : groups[group].shell)
             {
+                if (isCertifiedRoundSurfaceKind(primitive.primitive.kind))
+                {
+                    ++profile.degenerate_rejections;
+                    cache[key] = {
+                        groups[first].version, groups[second].version, true};
+                    return std::nullopt;
+                }
                 const PrimitiveMesh surface = triangulatePrimitive(primitive.primitive);
                 for (const Vec3& vertex : surface.vertices)
                 {
