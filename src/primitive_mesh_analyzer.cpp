@@ -3945,14 +3945,19 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 maximum_removed_surface_distance = std::max(
                     maximum_removed_surface_distance,
                     support - (point - model_center).dot(normal));
-            // This support depth is only a deterministic ordering hint. It is
-            // not the directed phase-3-to-phase-1 Hausdorff error: a deep
-            // source point may sit behind a candidate that coincides exactly
-            // with another part of the filled reference surface. Rejecting on
-            // support depth would therefore skip a geometrically valid
-            // adjacent merge before evaluating the user-defined error. Every
-            // contained surface candidate proceeds to the real distance audit
-            // below; only that audit may reject it for exceeding the limit.
+            // A local replacement may not move either current patch farther
+            // behind its support plane than the permitted open-surface error.
+            // The one-sided candidate-to-reference audit below cannot detect a
+            // dropped face when the candidate happens to coincide with some
+            // other source surface; this symmetric local bound prevents that
+            // false certificate and keeps the proxy shell near the geometry it
+            // replaces.
+            if (maximum_removed_surface_distance >
+                maximum_open_error_distance + tolerance)
+            {
+                ++profile.error_rejections;
+                continue;
+            }
             const Mat3 basis = orthonormalFrame(normal);
             Mat3 frame;
             frame.col(0) = basis.col(1);
@@ -3969,54 +3974,7 @@ std::vector<OutputPrimitive> mergeAdjacentSurfacePrimitives(
                 convexHull(std::move(projected), tolerance), tolerance);
             if (hull.size() < 3 || !simplePolygon(hull, tolerance)) continue;
             std::vector<std::vector<Vec2>> enclosing_boundaries;
-            // The exact hull is always a candidate. Also try the minimum-area
-            // enclosing rectangle. It is still only a polygon surface, but it
-            // lets the real Hausdorff limit trade a small permitted expansion
-            // for two triangles instead of preserving dozens of hull corners.
-            // This candidate is generic and is accepted by the same coverage
-            // and distance checks as every other adjacent merge.
-            double best_rectangle_area =
-                std::numeric_limits<double>::infinity();
-            std::vector<Vec2> best_rectangle;
-            for (std::size_t edge = 0; edge < hull.size(); ++edge)
-            {
-                Vec2 first_axis =
-                    hull[(edge + 1) % hull.size()] - hull[edge];
-                if (first_axis.norm() <= tolerance) continue;
-                first_axis = first_axis.normalized();
-                const Vec2 second_axis(-first_axis.y(), first_axis.x());
-                double first_min = std::numeric_limits<double>::infinity();
-                double first_max = -std::numeric_limits<double>::infinity();
-                double second_min = std::numeric_limits<double>::infinity();
-                double second_max = -std::numeric_limits<double>::infinity();
-                for (const Vec2& point : hull)
-                {
-                    const double first_coordinate = point.dot(first_axis);
-                    const double second_coordinate = point.dot(second_axis);
-                    first_min = std::min(first_min, first_coordinate);
-                    first_max = std::max(first_max, first_coordinate);
-                    second_min = std::min(second_min, second_coordinate);
-                    second_max = std::max(second_max, second_coordinate);
-                }
-                const double area =
-                    (first_max - first_min) * (second_max - second_min);
-                if (area >= best_rectangle_area) continue;
-                best_rectangle_area = area;
-                best_rectangle = {
-                    first_axis * first_min + second_axis * second_min,
-                    first_axis * first_max + second_axis * second_min,
-                    first_axis * first_max + second_axis * second_max,
-                    first_axis * first_min + second_axis * second_max};
-            }
-            if (!best_rectangle.empty())
-                enclosing_boundaries.push_back(std::move(best_rectangle));
-            const double hull_area = std::abs(signedArea(hull));
-            const bool rectangle_matches_hull =
-                hull.size() == 4 && !enclosing_boundaries.empty() &&
-                std::abs(best_rectangle_area - hull_area) <=
-                    tolerance * std::max(1.0, hull_area);
-            if (!rectangle_matches_hull)
-                enclosing_boundaries.push_back(std::move(hull));
+            enclosing_boundaries.push_back(std::move(hull));
             for (auto& boundary : enclosing_boundaries)
             {
                 Primitive surface = polygonPrimitive(boundary, origin, frame);

@@ -60,11 +60,12 @@ configured circumferential segment count.
    and an endpoint lying inside another edge do not disappear merely because
    the two OBJ patches lack an identical vertex. For every adjacent pair, fit
    supported surface replacements from the union of their unique
-   responsibility vertices. Both the exact enclosing hull and a minimum-area
-   enclosing rectangle are surface candidates. There is no normal-angle,
-   primitive-count, support-depth, or per-merge triangle-reduction error gate:
-   after conservative coverage is checked, the measured user-directed error
-   limit alone decides whether the candidate is accepted. Failed candidates
+   responsibility vertices. The exact enclosing hull is the surface candidate.
+   There is no normal-angle, primitive-count, or per-merge triangle-reduction
+   gate. A symmetric local support-distance bound first prevents either source
+   patch from being dropped onto an unrelated remote source surface; the
+   measured user-directed distance then decides whether the surviving candidate
+   is accepted. Failed candidates
    are cached by the two endpoint versions. The work list is streaming and
    greedy: a pair is fitted only when it reaches the front, an accepted result
    is applied immediately, and no global queue of already-fitted candidates is
@@ -130,7 +131,7 @@ exact duplicate triangles, containment, error limits, timings, and peak memory:
 
 ```powershell
 python tools/audit_staged_surface_outputs.py `
-  outputs/surface_adjacent_fixed_point_full_v6/viewer_manifest.json
+  outputs/surface_adjacent_fixed_point_full_v4/viewer_manifest.json
 ```
 
 The output root contains `viewer_manifest.json`. Group names use matching IDs:

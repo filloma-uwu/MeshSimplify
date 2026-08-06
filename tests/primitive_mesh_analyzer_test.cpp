@@ -204,9 +204,8 @@ int main()
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
                     group_loose_stats.primitive_count > 0 &&
-                    group_loose_stats.merged_spatial_primitive_groups == 0 &&
-                    group_loose_stats.merged_local_planar_primitives > 0,
-                "a loose error may merge adjacent surface faces but must not create a solid candidate");
+                    group_loose_stats.merged_spatial_primitive_groups == 0,
+                "a loose error must retain surface candidates and never create a solid candidate");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=
