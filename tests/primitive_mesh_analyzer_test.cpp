@@ -422,6 +422,26 @@ int main()
                     "\"repair_face_count\":0") != std::string::npos,
                 "pre-canonicalization responsibility certificates must avoid safety repair");
 
+        // A detached surface can overlap a candidate hull's AABB while lying
+        // wholly outside one of its oblique supporting planes.  The stage-3
+        // intrusion index must prove that separation in its hierarchy and
+        // leave the detached responsibility untouched.
+        const auto spatial_group_with_external =
+            root / "spatial_group_with_external.obj";
+        writeText(spatial_group_with_external,
+            readText(spatial_group) +
+            "v 1.85 2.80 0.40\n"
+            "v 1.95 2.80 0.40\n"
+            "v 1.90 2.90 0.40\n"
+            "f 13 14 15\n");
+        const auto spatial_external_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                spatial_group_with_external,
+                root / "spatial_group_with_external", group_loose);
+        require(spatial_external_stats.containment_validation_passed &&
+                    spatial_external_stats.coverage_failed_source_faces == 0,
+                "hierarchical halfspace pruning must preserve detached source responsibility");
+
         // Geometric adjacency is edge-to-edge, not vertex-to-vertex. The
         // vertical rectangle starts in the interior of the horizontal
         // rectangle's boundary edge, so the pair forms a T junction without a

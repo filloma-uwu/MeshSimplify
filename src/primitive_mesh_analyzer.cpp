@@ -7940,6 +7940,13 @@ struct ConvexHullFitProfile
     double output_seconds = 0.0;
 };
 
+struct SeparatingPlaneHint
+{
+    Vec3 normal = Vec3::Zero();
+    double offset = 0.0;
+    bool valid = false;
+};
+
 std::optional<ConvexHullSurface> fitConvexHullSurface(
     std::vector<Vec3> points,
     const std::vector<std::uint32_t>& responsibility,
@@ -8194,6 +8201,8 @@ bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
                             const Bounds& mesh_bounds,
                             const double tolerance,
                             bool* halfspace_rejected = nullptr,
+                            SeparatingPlaneHint* separating_plane_hint = nullptr,
+                            bool* cached_plane_rejected = nullptr,
                             const Vec3* mesh_plane_normal = nullptr,
                             const double mesh_plane_offset = 0.0,
                             bool* mesh_plane_rejected = nullptr,
@@ -8201,10 +8210,38 @@ bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
                             bool* projection_rejected = nullptr)
 {
     if (halfspace_rejected) *halfspace_rejected = false;
+    if (cached_plane_rejected) *cached_plane_rejected = false;
     if (mesh_plane_rejected) *mesh_plane_rejected = false;
     if (projection_rejected) *projection_rejected = false;
     if (!convexBoundsOverlap(hull.bounds, mesh_bounds, tolerance))
         return false;
+    // A separating plane found for this surface on a previous, nearby hull
+    // can be reused without requiring that it remain one of the new hull's
+    // faces.  It is a valid certificate whenever the current hull AABB is on
+    // one side and every surface vertex is on the other side.  The checks are
+    // conservative (strictly separated, no tolerance relaxation), so a miss
+    // simply falls through to the original exact test.
+    if (separating_plane_hint != nullptr &&
+        separating_plane_hint->valid)
+    {
+        const Vec3& normal = separating_plane_hint->normal;
+        double minimum_surface_projection =
+            std::numeric_limits<double>::infinity();
+        for (const Vec3& vertex : mesh.vertices)
+            minimum_surface_projection = std::min(
+                minimum_surface_projection, normal.dot(vertex));
+        double maximum_hull_projection = 0.0;
+        for (int axis = 0; axis < 3; ++axis)
+            maximum_hull_projection += normal[axis] >= 0.0
+                ? normal[axis] * hull.bounds.upper[axis]
+                : normal[axis] * hull.bounds.lower[axis];
+        if (minimum_surface_projection >= separating_plane_hint->offset &&
+            maximum_hull_projection <= separating_plane_hint->offset)
+        {
+            if (cached_plane_rejected) *cached_plane_rejected = true;
+            return false;
+        }
+    }
     // A hull face plane that places every mesh vertex on its exterior side is
     // a separating plane for every triangle in the mesh. This proves that the
     // surface cannot enter the strict hull interior and avoids the much more
@@ -8212,16 +8249,32 @@ bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
     for (std::size_t plane = 0; plane < hull.faces.size(); ++plane)
     {
         bool all_outside = true;
+        double minimum_surface_projection =
+            std::numeric_limits<double>::infinity();
         for (const Vec3& vertex : mesh.vertices)
-            if (hull.plane_normals[plane].dot(vertex) -
-                    hull.plane_offsets[plane] < -tolerance)
+        {
+            const double vertex_projection =
+                hull.plane_normals[plane].dot(vertex);
+            minimum_surface_projection = std::min(
+                minimum_surface_projection, vertex_projection);
+            if (vertex_projection - hull.plane_offsets[plane] < -tolerance)
             {
                 all_outside = false;
                 break;
             }
+        }
         if (all_outside)
         {
             if (halfspace_rejected) *halfspace_rejected = true;
+            if (separating_plane_hint != nullptr &&
+                minimum_surface_projection > hull.plane_offsets[plane])
+            {
+                separating_plane_hint->normal = hull.plane_normals[plane];
+                separating_plane_hint->offset =
+                    0.5 * (minimum_surface_projection +
+                            hull.plane_offsets[plane]);
+                separating_plane_hint->valid = true;
+            }
             return false;
         }
     }
@@ -8880,6 +8933,7 @@ struct EnvelopeMergeGroup
         Vec3 plane_normal = Vec3::Zero();
         double plane_offset = 0.0;
         PlanarProjectionBounds projection;
+        SeparatingPlaneHint separating_plane_hint;
         bool planar = false;
     };
     std::vector<OutputPrimitive> shell;
@@ -8951,6 +9005,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t error_rejections = 0;
         std::size_t certified_round_candidates = 0;
         std::size_t accepted_round_groups = 0;
+        std::size_t round_fit_attempts = 0;
         std::size_t conservative_round_component_attempts = 0;
         std::size_t accepted_conservative_round_components = 0;
         std::size_t convex_component_attempts = 0;
@@ -8977,11 +9032,15 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t intrusion_index_inside_nodes = 0;
         std::size_t intrusion_index_inside_entries = 0;
         std::size_t intrusion_halfspace_rejections = 0;
+        std::size_t intrusion_cached_plane_rejections = 0;
         std::size_t intrusion_surface_plane_rejections = 0;
         std::size_t intrusion_planar_projection_rejections = 0;
         std::size_t certificate_samples = 0;
         std::size_t fine_distance_evaluations = 0;
         double coarse_distance_seconds = 0.0;
+        double candidate_evaluation_seconds = 0.0;
+        double round_fit_seconds = 0.0;
+        double closure_assembly_seconds = 0.0;
         double convex_hull_seconds = 0.0;
         double intrusion_seconds = 0.0;
         double distance_seconds = 0.0;
@@ -9035,6 +9094,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.intrusion_index_inside_entries
                << ",\"intrusion_halfspace_rejections\":"
                << profile.intrusion_halfspace_rejections
+               << ",\"intrusion_cached_plane_rejections\":"
+               << profile.intrusion_cached_plane_rejections
                << ",\"intrusion_surface_plane_rejections\":"
                << profile.intrusion_surface_plane_rejections
                << ",\"intrusion_planar_projection_rejections\":"
@@ -9043,6 +9104,14 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.certificate_samples
                << ",\"coarse_distance_seconds\":"
                << profile.coarse_distance_seconds
+               << ",\"candidate_evaluation_seconds\":"
+               << profile.candidate_evaluation_seconds
+               << ",\"round_fit_attempts\":"
+               << profile.round_fit_attempts
+               << ",\"round_fit_seconds\":"
+               << profile.round_fit_seconds
+               << ",\"closure_assembly_seconds\":"
+               << profile.closure_assembly_seconds
                << ",\"convex_hull_seconds\":"
                << profile.convex_hull_seconds
                << ",\"convex_hull_sort_seconds\":"
@@ -10146,9 +10215,14 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         // surfaces. An arbitrary 3-D convex hull is a solid fallback, not a
         // recognized surface, and it creates the large overlapping shells
         // that are particularly harmful to PQSS traversal.
-        if (const auto revolved = fitCertifiedRevolvedSurface(
-                responsibility_mesh, responsibility, options,
-                tolerance * 8.0))
+        ++profile.round_fit_attempts;
+        const auto round_fit_started = std::chrono::steady_clock::now();
+        const auto revolved = fitCertifiedRevolvedSurface(
+            responsibility_mesh, responsibility, options,
+            tolerance * 8.0);
+        profile.round_fit_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - round_fit_started).count();
+        if (revolved)
         {
             ++profile.certified_round_candidates;
             std::vector<OutputPrimitive> round_candidate;
@@ -10255,6 +10329,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     cached_transition->second.size();
                 closure_transitions.erase(cached_transition);
             }
+            const auto closure_assembly_started =
+                std::chrono::steady_clock::now();
             responsibility.clear();
             source_vertices.clear();
             input_triangle_workload = 0;
@@ -10294,6 +10370,9 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             source_vertices.erase(
                 std::unique(source_vertices.begin(), source_vertices.end()),
                 source_vertices.end());
+            profile.closure_assembly_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                closure_assembly_started).count();
             ++profile.convex_hull_fits;
             const auto hull_started = std::chrono::steady_clock::now();
             convex_candidate = fitConvexHullSurface(
@@ -10338,7 +10417,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     intruded_groups.insert(group);
                     return;
                 }
-                const auto& surface =
+                auto& surface =
                     groups[group].intrusion_surfaces[indexed.surface];
                 if (!convexBoundsOverlap(
                         convex_candidate->bounds, groups[group].bounds,
@@ -10346,17 +10425,22 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     return;
                 ++profile.intrusion_tests;
                 bool halfspace_rejected = false;
+                bool cached_plane_rejected = false;
                 bool surface_plane_rejected = false;
                 bool planar_projection_rejected = false;
                 const bool intrudes = meshIntrudesConvexHull(
                     *convex_candidate, surface.mesh, surface.bounds,
                     tolerance * 8.0, &halfspace_rejected,
+                    &surface.separating_plane_hint,
+                    &cached_plane_rejected,
                     surface.planar ? &surface.plane_normal : nullptr,
                     surface.plane_offset, &surface_plane_rejected,
                     surface.planar ? &surface.projection : nullptr,
                     &planar_projection_rejected);
                 if (halfspace_rejected)
                     ++profile.intrusion_halfspace_rejections;
+                if (cached_plane_rejected)
+                    ++profile.intrusion_cached_plane_rejections;
                 if (surface_plane_rejected)
                     ++profile.intrusion_surface_plane_rejections;
                 if (planar_projection_rejected)
@@ -10544,7 +10628,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             continue;
         }
         attempted_pairs.insert(key);
+        const auto candidate_evaluation_started =
+            std::chrono::steady_clock::now();
         auto candidate = fitPair(pair.first, pair.second);
+        profile.candidate_evaluation_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            candidate_evaluation_started).count();
         if (!candidate)
         {
             enqueueBestNeighbor(pair.first);
@@ -10681,6 +10770,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.intrusion_index_inside_entries
            << ",\"intrusion_halfspace_rejections\":"
            << profile.intrusion_halfspace_rejections
+           << ",\"intrusion_cached_plane_rejections\":"
+           << profile.intrusion_cached_plane_rejections
            << ",\"intrusion_surface_plane_rejections\":"
            << profile.intrusion_surface_plane_rejections
            << ",\"intrusion_planar_projection_rejections\":"
@@ -10690,6 +10781,14 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.fine_distance_evaluations
            << ",\"coarse_distance_seconds\":"
            << profile.coarse_distance_seconds
+           << ",\"candidate_evaluation_seconds\":"
+           << profile.candidate_evaluation_seconds
+           << ",\"round_fit_attempts\":"
+           << profile.round_fit_attempts
+           << ",\"round_fit_seconds\":"
+           << profile.round_fit_seconds
+           << ",\"closure_assembly_seconds\":"
+           << profile.closure_assembly_seconds
            << ",\"convex_hull_seconds\":" << profile.convex_hull_seconds
            << ",\"convex_hull_sort_seconds\":"
            << profile.convex_hull_kernel.sort_deduplicate_seconds
