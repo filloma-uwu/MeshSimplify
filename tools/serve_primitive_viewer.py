@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/unified_surface_fix_full_parallel_v2/viewer_manifest.json"),
+        default=Path("outputs/audit_owner_geometry_full_v1/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",

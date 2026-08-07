@@ -172,6 +172,12 @@ directed from phase 3/4 to phase 1. Strict conservative coverage is still
 audited independently against `source.obj`. Exact source-triangle safety
 repairs are not approximation error and remain exact surface triangles.
 
+Coverage audit is geometric first. A source triangle with no surviving
+per-face owner is not repaired immediately: the audit first checks whether the
+current proxy surfaces or active closed-volume certificates already cover it.
+Only genuinely uncovered triangles enter the exact repair path. This keeps
+top-down simplification from being undone by bookkeeping-only owner loss.
+
 Audit a completed batch, including finite coordinates, zero-area triangles,
 exact duplicate triangles, containment, error limits, timings, and peak memory:
 

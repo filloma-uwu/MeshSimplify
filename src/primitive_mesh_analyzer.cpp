@@ -12416,12 +12416,8 @@ FinalCoverageAudit auditFinalConservativeCoverage(
         const std::array<Vec3, 3> triangle{{
             source_mesh.vertices[face[0]], source_mesh.vertices[face[1]],
             source_mesh.vertices[face[2]]}};
-        if (owners[face_id].empty() && !responsibility_certified[face_id])
-        {
-            ++audit.unassigned_source_faces;
-            audit.failed_face_ids.push_back(static_cast<std::uint32_t>(face_id));
-            continue;
-        }
+        const bool has_direct_responsibility =
+            !owners[face_id].empty() || responsibility_certified[face_id];
         ++audit.assigned_source_faces;
 
         Bounds triangle_bounds;
@@ -12663,6 +12659,19 @@ FinalCoverageAudit auditFinalConservativeCoverage(
         if (!covered && owners[face_id].size() != primitives.size())
             covered = coveredByPlanarPrimitives(all_primitives);
         if (covered) ++audit.planar_source_faces;
+        else if (!has_direct_responsibility)
+        {
+            // Top-down surface replacement and later occlusion clipping are
+            // allowed to transfer responsibility from individual source faces
+            // to a geometric certificate.  Treat a missing owner as a failure
+            // only after the actual conservative coverage checks above have
+            // been tried against the full proxy set.  Otherwise a covered CAD
+            // sheet is repaired back into hundreds of exact source triangles,
+            // which preserves containment but destroys collision workload.
+            ++audit.unassigned_source_faces;
+            audit.failed_face_ids.push_back(
+                static_cast<std::uint32_t>(face_id));
+        }
         else
         {
             ++audit.failed_source_faces;
@@ -12729,8 +12738,12 @@ std::vector<OutputPrimitive> buildNonOverlappingPlanarCoverageRepair(
         std::vector<std::uint32_t> faces;
         Clipper2Lib::PathsD source_paths;
     };
-    const double angular_quantum = 1.0e-8;
-    const double distance_quantum = std::max(tolerance, 1.0e-12);
+    // Repair faces often come from nearly coplanar CAD sheets that were split
+    // only because an earlier conservative pass could not prove coverage. Use
+    // a slightly looser bucket here so those sheets become one residual region
+    // before the exact-triangle fallback has a chance to fragment them.
+    const double angular_quantum = 5.0e-8;
+    const double distance_quantum = std::max(tolerance * 16.0, 1.0e-12);
     const auto canonicalNormal = [](Vec3 normal)
     {
         int dominant = 0;
@@ -12934,15 +12947,38 @@ std::vector<OutputPrimitive> buildNonOverlappingPlanarCoverageRepair(
         if (std::any_of(remaining.begin(), remaining.end(),
             [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
         {
-            Clipper2Lib::PathsD triangles;
-            if (Clipper2Lib::Triangulate(
-                    remaining, clipper_precision, triangles, false) !=
-                Clipper2Lib::TriangulateResult::success)
+            // A negative path is a hole in an otherwise valid planar residual.
+            // Repair surfaces are used for conservative collision coverage, so
+            // retaining every hole boundary is counterproductive: Clipper's
+            // triangulator fans the whole outer sheet into hundreds of tiny
+            // triangles.  Keep the positive outer paths and intentionally fill
+            // those planar holes.  This can only add false-positive surface;
+            // the final directed-distance audit remains authoritative for the
+            // user supplied error limit.  If there is no positive path (or a
+            // malformed multi-ring result), retain the exact triangulation
+            // fallback instead of dropping coverage.
+            Clipper2Lib::PathsD positive_paths;
+            for (const auto& path : remaining)
+                if (Clipper2Lib::IsPositive(path) &&
+                    std::abs(Clipper2Lib::Area(path)) >
+                        tolerance * tolerance)
+                    positive_paths.push_back(path);
+            if (!positive_paths.empty())
             {
-                appendPerFaceResidual();
-                continue;
+                output_paths = std::move(positive_paths);
             }
-            output_paths = std::move(triangles);
+            else
+            {
+                Clipper2Lib::PathsD triangles;
+                if (Clipper2Lib::Triangulate(
+                        remaining, clipper_precision, triangles, false) !=
+                    Clipper2Lib::TriangulateResult::success)
+                {
+                    appendPerFaceResidual();
+                    continue;
+                }
+                output_paths = std::move(triangles);
+            }
         }
 
         struct RepairPiece
@@ -19740,7 +19776,9 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     {
         std::ofstream profile(output_directory /
                               "adjacent_envelope_group_profile.json");
-        profile << "{\"skipped\":true,\"reason\":\"top_down_surface_decomposition\"}\n";
+        profile << "{\"skipped\":true,\"reason\":\"top_down_surface_decomposition\""
+                << ",\"top_down_used\":" << (top_down_used ? "true" : "false")
+                << ",\"input_primitives\":" << output.size() << "}\n";
     }
     stats.merged_spatial_primitive_groups += adjacent_envelope_group_merges;
     // Boolean clipping may leave a zero-area loop that carries duplicate or
@@ -20126,9 +20164,11 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
                 repair_output.push_back({std::move(triangle), {face_id}});
             }
         if (repair_output.empty()) break;
+        const double repair_merge_tolerance =
+            std::max(final_tolerance * 16.0, 1.0e-10);
         CoplanarCanonicalizationStats repair_coplanar_stats;
         repair_output = canonicalizeCoplanarPrimitiveUnion(
-            mesh, std::move(repair_output), final_tolerance,
+            mesh, std::move(repair_output), repair_merge_tolerance,
             repair_coplanar_stats);
         repair_merged_groups += repair_coplanar_stats.groups;
         // Repair the union of failed coplanar source faces, subtracting the
@@ -20166,7 +20206,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         {
             CoplanarCanonicalizationStats post_repair_coplanar_stats;
             output = canonicalizeCoplanarPrimitiveUnion(
-                mesh, std::move(output), final_tolerance,
+                mesh, std::move(output), repair_merge_tolerance,
                 post_repair_coplanar_stats);
             repair_merged_groups += post_repair_coplanar_stats.groups;
             if (post_repair_coplanar_stats.groups == 0) break;
