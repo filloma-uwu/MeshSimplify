@@ -2,6 +2,12 @@ param(
     [string]$Executable = "$PSScriptRoot\..\build\Release\pqss-primitive-mesh-analyze.exe",
     [string]$InputRoot = "$PSScriptRoot\..\test_data\real_scene\source_pool",
     [string]$OutputRoot = "$PSScriptRoot\..\outputs\primitive_mesh_cpp_uniform_official_scope_001",
+    [ValidateScript({
+        -not [double]::IsNaN($_) -and
+        -not [double]::IsInfinity($_) -and
+        $_ -ge 0.0
+    })]
+    [double]$MaximumOpenErrorDistance = 100.0,
     [int]$MaxParallel = 1
 )
 
@@ -31,6 +37,9 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
             "--output-dir", $directory,
             "--primitive-types", "polygon,surface",
             "--round-surface-segments", "24",
+            "--maximum-open-error-distance",
+                $MaximumOpenErrorDistance.ToString(
+                    "R", [Globalization.CultureInfo]::InvariantCulture),
             "--maximum-process-memory-gb", "2"
         ) -RedirectStandardOutput (Join-Path $directory "analysis.stdout.txt") `
           -RedirectStandardError (Join-Path $directory "analysis.stderr.txt") `
@@ -82,6 +91,8 @@ $models = foreach ($modelId in $modelIds) {
 }
 $manifest = [ordered]@{
     algorithm = "CppAdjacentClosedEnvelopeV1"
+    maximum_open_error_distance = $MaximumOpenErrorDistance
+    error_distance_units = "OBJ model units"
     complete = $true
     model_count = $modelIds.Count
     models = @($models)
