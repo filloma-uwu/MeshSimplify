@@ -8822,6 +8822,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t convex_face_cache_hits = 0;
         std::size_t convex_hull_fits = 0;
         std::size_t convex_growth_iterations = 0;
+        std::size_t convex_debt_growth_steps = 0;
+        std::size_t convex_debt_rejections = 0;
         std::size_t intrusion_tests = 0;
         std::size_t intrusion_halfspace_rejections = 0;
         std::size_t certificate_samples = 0;
@@ -8858,6 +8860,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << ",\"convex_hull_fits\":" << profile.convex_hull_fits
                << ",\"convex_growth_iterations\":"
                << profile.convex_growth_iterations
+               << ",\"convex_debt_growth_steps\":"
+               << profile.convex_debt_growth_steps
+               << ",\"convex_debt_rejections\":"
+               << profile.convex_debt_rejections
                << ",\"intrusion_tests\":" << profile.intrusion_tests
                << ",\"intrusion_halfspace_rejections\":"
                << profile.intrusion_halfspace_rejections
@@ -9408,13 +9414,34 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         profile.initial_adjacencies += group.neighbors.size();
     profile.initial_adjacencies /= 2;
 
-    using GroupBoundsIndex = std::multimap<double, std::size_t>;
-    GroupBoundsIndex group_bounds_index;
-    std::vector<GroupBoundsIndex::iterator> group_bounds_entries;
-    group_bounds_entries.reserve(groups.size());
+    struct IndexedSurface
+    {
+        std::size_t group = 0;
+        std::size_t surface = 0;
+        std::uint64_t version = 0;
+    };
+    using SurfaceBoundsIndex = std::multimap<double, IndexedSurface>;
+    SurfaceBoundsIndex surface_bounds_index;
+    std::vector<std::vector<SurfaceBoundsIndex::iterator>>
+        surface_bounds_entries(groups.size());
+    const auto indexGroupSurfaces = [&](const std::size_t group)
+    {
+        auto& entries = surface_bounds_entries[group];
+        entries.reserve(groups[group].intrusion_surfaces.size());
+        for (std::size_t surface = 0;
+             surface < groups[group].intrusion_surfaces.size(); ++surface)
+            entries.push_back(surface_bounds_index.emplace(
+                groups[group].intrusion_surfaces[surface].bounds.lower.x(),
+                IndexedSurface{group, surface, groups[group].version}));
+    };
+    const auto eraseGroupSurfaces = [&](const std::size_t group)
+    {
+        for (const auto entry : surface_bounds_entries[group])
+            surface_bounds_index.erase(entry);
+        surface_bounds_entries[group].clear();
+    };
     for (std::size_t group = 0; group < groups.size(); ++group)
-        group_bounds_entries.push_back(group_bounds_index.emplace(
-            groups[group].bounds.lower.x(), group));
+        indexGroupSurfaces(group);
 
     struct FaceVertexKey
     {
@@ -9685,30 +9712,53 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             bool expanded = false;
             const auto intrusion_scan_started =
                 std::chrono::steady_clock::now();
-            const auto broad_phase_end = group_bounds_index.upper_bound(
+            const auto broad_phase_end = surface_bounds_index.upper_bound(
                 convex_candidate->bounds.upper.x() + tolerance * 8.0);
-            for (auto broad_phase = group_bounds_index.begin();
+            std::unordered_set<std::size_t> intruded_groups;
+            for (auto broad_phase = surface_bounds_index.begin();
                  broad_phase != broad_phase_end; ++broad_phase)
             {
-                const std::size_t group = broad_phase->second;
-                if (!groups[group].active || consumed_set.contains(group) ||
+                const IndexedSurface indexed = broad_phase->second;
+                const std::size_t group = indexed.group;
+                if (!groups[group].active ||
+                    groups[group].version != indexed.version ||
+                    consumed_set.contains(group) ||
+                    intruded_groups.contains(group) ||
+                    indexed.surface >= groups[group].intrusion_surfaces.size())
+                    continue;
+                const auto& surface =
+                    groups[group].intrusion_surfaces[indexed.surface];
+                if (!convexBoundsOverlap(
+                        convex_candidate->bounds, surface.bounds,
+                        tolerance * 8.0) ||
                     !convexBoundsOverlap(
                         convex_candidate->bounds, groups[group].bounds,
                         tolerance * 8.0))
                     continue;
-                bool intrudes = false;
-                for (const auto& surface : groups[group].intrusion_surfaces)
-                {
-                    ++profile.intrusion_tests;
-                    bool halfspace_rejected = false;
-                    intrudes = meshIntrudesConvexHull(
-                        *convex_candidate, surface.mesh, surface.bounds,
-                        tolerance * 8.0, &halfspace_rejected);
-                    if (halfspace_rejected)
-                        ++profile.intrusion_halfspace_rejections;
-                    if (intrudes) break;
-                }
+                ++profile.intrusion_tests;
+                bool halfspace_rejected = false;
+                const bool intrudes = meshIntrudesConvexHull(
+                    *convex_candidate, surface.mesh, surface.bounds,
+                    tolerance * 8.0, &halfspace_rejected);
+                if (halfspace_rejected)
+                    ++profile.intrusion_halfspace_rejections;
                 if (!intrudes) continue;
+                intruded_groups.insert(group);
+            }
+            std::vector<std::size_t> ordered_intruded_groups(
+                intruded_groups.begin(), intruded_groups.end());
+            std::sort(ordered_intruded_groups.begin(),
+                      ordered_intruded_groups.end(),
+                [&](const std::size_t left, const std::size_t right)
+                {
+                    if (groups[left].bounds.lower.x() !=
+                        groups[right].bounds.lower.x())
+                        return groups[left].bounds.lower.x() <
+                               groups[right].bounds.lower.x();
+                    return left < right;
+                });
+            for (const auto group : ordered_intruded_groups)
+            {
                 consumed_set.insert(group);
                 consumed.push_back(group);
                 expanded = true;
@@ -9716,6 +9766,46 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             profile.intrusion_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() -
                 intrusion_scan_started).count();
+            if (!expanded &&
+                triangulatedFaceCount(convex_candidate->shell) >
+                    input_triangle_workload)
+            {
+                // A pair of non-coplanar surface patches often needs closure
+                // faces before it can grow into a useful envelope. Do not
+                // commit that temporary triangle increase. Continue the same
+                // adjacent-growth sequence until the candidate repays its
+                // triangle debt, or reject it if no adjacent continuation is
+                // available. Every intermediate hull has already passed the
+                // same directed-distance audit above.
+                std::vector<std::size_t> frontier;
+                for (const auto group : consumed)
+                    for (const auto neighbor : groups[group].neighbors)
+                        if (groups[neighbor].active &&
+                            !consumed_set.contains(neighbor))
+                            frontier.push_back(neighbor);
+                std::sort(frontier.begin(), frontier.end());
+                frontier.erase(std::unique(frontier.begin(), frontier.end()),
+                               frontier.end());
+                std::sort(frontier.begin(), frontier.end(),
+                    [&](const std::size_t left, const std::size_t right)
+                    {
+                        if (groups[left].triangle_workload !=
+                            groups[right].triangle_workload)
+                            return groups[left].triangle_workload >
+                                   groups[right].triangle_workload;
+                        return left < right;
+                    });
+                if (frontier.empty())
+                {
+                    ++profile.convex_debt_rejections;
+                    ++profile.convex_workload_rejections;
+                    return std::nullopt;
+                }
+                consumed_set.insert(frontier.front());
+                consumed.push_back(frontier.front());
+                ++profile.convex_debt_growth_steps;
+                expanded = true;
+            }
             if (!expanded) break;
         }
         const std::size_t convex_workload =
@@ -9772,7 +9862,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                             groups[consumed].neighbors.end());
         std::sort(affected.begin(), affected.end());
         affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
-        group_bounds_index.erase(group_bounds_entries[pair.first]);
+        for (const auto consumed : candidate->consumed_groups)
+            eraseGroupSurfaces(consumed);
         groups[pair.first].shell = std::move(candidate->shell);
         groups[pair.first].intrusion_surfaces.clear();
         groups[pair.first].intrusion_surfaces.reserve(
@@ -9788,14 +9879,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         groups[pair.first].contains_round_surface =
             candidate->contains_round_surface;
         groups[pair.first].triangle_workload = candidate->triangle_workload;
-        group_bounds_entries[pair.first] = group_bounds_index.emplace(
-            groups[pair.first].bounds.lower.x(), pair.first);
         groups[pair.first].neighbors.clear();
         ++groups[pair.first].version;
+        indexGroupSurfaces(pair.first);
         for (const auto consumed : candidate->consumed_groups)
             if (consumed != pair.first)
             {
-                group_bounds_index.erase(group_bounds_entries[consumed]);
                 groups[consumed].active = false;
                 ++groups[consumed].version;
             }
@@ -9866,6 +9955,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << ",\"convex_hull_fits\":" << profile.convex_hull_fits
            << ",\"convex_growth_iterations\":"
            << profile.convex_growth_iterations
+           << ",\"convex_debt_growth_steps\":"
+           << profile.convex_debt_growth_steps
+           << ",\"convex_debt_rejections\":"
+           << profile.convex_debt_rejections
            << ",\"intrusion_tests\":" << profile.intrusion_tests
            << ",\"intrusion_halfspace_rejections\":"
            << profile.intrusion_halfspace_rejections
