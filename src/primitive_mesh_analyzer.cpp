@@ -2,9 +2,11 @@
 
 #include "clipper2/clipper.h"
 #include "clipper2/clipper.triangulation.h"
+#include "QuickHull.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -765,6 +767,131 @@ Primitive fitConeOnAxis(const Mesh& mesh,
     return result;
 }
 
+double conservativeConeProfileSlack(
+    const Mesh& mesh, const std::vector<std::uint32_t>& vertex_ids,
+    const Primitive& cone)
+{
+    constexpr std::size_t bin_count = 128;
+    std::array<double, bin_count> outer_radii;
+    std::array<double, bin_count> outer_fractions{};
+    outer_radii.fill(-std::numeric_limits<double>::infinity());
+    for (const auto vertex : vertex_ids)
+    {
+        const Vec3 local = cone.axes.transposeMultiply(
+            mesh.vertices[vertex] - cone.center);
+        const double fraction = std::clamp(
+            local.x() / std::max(cone.height, 1.0e-30), 0.0, 1.0);
+        const double radius = std::hypot(local.y(), local.z());
+        const std::size_t bin = std::min(
+            bin_count - 1,
+            static_cast<std::size_t>(fraction * bin_count));
+        if (radius > outer_radii[bin])
+        {
+            outer_radii[bin] = radius;
+            outer_fractions[bin] = fraction;
+        }
+    }
+    double maximum_slack = 0.0;
+    for (std::size_t bin = 0; bin < bin_count; ++bin)
+    {
+        if (!std::isfinite(outer_radii[bin])) continue;
+        const double expected =
+            cone.base_radius * (1.0 - outer_fractions[bin]) +
+            cone.top_radius * outer_fractions[bin];
+        maximum_slack = std::max(
+            maximum_slack, expected - outer_radii[bin]);
+    }
+    return maximum_slack;
+}
+
+double refitConservativeConeProfile(
+    const Mesh& mesh, const std::vector<std::uint32_t>& vertex_ids,
+    const Vec2& projected_center_offset, Primitive& cone)
+{
+    cone.center += cone.axes.col(1) * projected_center_offset.x() +
+                   cone.axes.col(2) * projected_center_offset.y();
+    struct Sample
+    {
+        double fraction = 0.0;
+        double radius = 0.0;
+    };
+    std::vector<Sample> samples;
+    samples.reserve(vertex_ids.size());
+    double maximum_radius = 0.0;
+    for (const auto vertex : vertex_ids)
+    {
+        const Vec3 local = cone.axes.transposeMultiply(
+            mesh.vertices[vertex] - cone.center);
+        const double radius = std::hypot(local.y(), local.z());
+        maximum_radius = std::max(maximum_radius, radius);
+        samples.push_back({
+            std::clamp(local.x() / std::max(cone.height, 1.0e-30),
+                       0.0, 1.0),
+            radius});
+    }
+    constexpr std::size_t bin_count = 128;
+    std::array<double, bin_count> outer_radii;
+    std::array<double, bin_count> outer_fractions{};
+    outer_radii.fill(-std::numeric_limits<double>::infinity());
+    for (const auto& sample : samples)
+    {
+        const std::size_t bin = std::min(
+            bin_count - 1,
+            static_cast<std::size_t>(sample.fraction * bin_count));
+        if (sample.radius > outer_radii[bin])
+        {
+            outer_radii[bin] = sample.radius;
+            outer_fractions[bin] = sample.fraction;
+        }
+    }
+    const auto radiiForSlope = [&](const double radius_difference)
+    {
+        double base_radius = std::max(0.0, -radius_difference);
+        for (const auto& sample : samples)
+            base_radius = std::max(
+                base_radius,
+                sample.radius - sample.fraction * radius_difference);
+        return std::array<double, 2>{
+            base_radius, base_radius + radius_difference};
+    };
+    const auto objective = [&](const double radius_difference)
+    {
+        const auto radii = radiiForSlope(radius_difference);
+        double maximum_slack = 0.0;
+        for (std::size_t bin = 0; bin < bin_count; ++bin)
+        {
+            if (!std::isfinite(outer_radii[bin])) continue;
+            const double expected =
+                radii[0] + outer_fractions[bin] * radius_difference;
+            maximum_slack = std::max(
+                maximum_slack, expected - outer_radii[bin]);
+        }
+        return maximum_slack +
+            1.0e-12 * (radii[0] + radii[1]);
+    };
+    double lower = -2.0 * maximum_radius;
+    double upper = 2.0 * maximum_radius;
+    for (int iteration = 0; iteration < 96; ++iteration)
+    {
+        const double first = lower + (upper - lower) / 3.0;
+        const double second = upper - (upper - lower) / 3.0;
+        if (objective(first) <= objective(second)) upper = second;
+        else lower = first;
+    }
+    const auto radii = radiiForSlope(0.5 * (lower + upper));
+    const double polygon_expansion = cone.segments >= 3
+        ? 1.0 / std::cos(
+            std::numbers::pi / static_cast<double>(cone.segments))
+        : std::numeric_limits<double>::infinity();
+    cone.base_radius = radii[0] * polygon_expansion * (1.0 + 1.0e-12);
+    cone.top_radius = radii[1] * polygon_expansion * (1.0 + 1.0e-12);
+    cone.kind = std::abs(cone.base_radius - cone.top_radius) <=
+            1.0e-8 * std::max(
+                {cone.base_radius, cone.top_radius, cone.height})
+        ? Kind::CylindricalBand : Kind::ConicalBand;
+    return conservativeConeProfileSlack(mesh, vertex_ids, cone);
+}
+
 std::size_t faceComponentCount(const Mesh& mesh,
                                const std::vector<std::uint32_t>& faces);
 
@@ -1005,6 +1132,7 @@ std::optional<Primitive> fitConservativeRevolvedEnvelope(
     if (!options.allow_round_surfaces || faces.empty()) return std::nullopt;
     const auto vertices = uniqueVertices(mesh, faces);
     std::optional<Primitive> best;
+    double best_profile_slack = std::numeric_limits<double>::infinity();
     double best_surface_area = std::numeric_limits<double>::infinity();
     for (const Mat3& frame : candidateFrames(mesh, vertices))
         for (int axis = 0; axis < 3; ++axis)
@@ -1029,8 +1157,15 @@ std::optional<Primitive> fitConservativeRevolvedEnvelope(
                 projected.emplace_back(local.y(), local.z());
             }
             projected = convexHull(std::move(projected), analytic_tolerance);
-            const bool circular_silhouette = projected.size() >= 6 &&
-                ringLooksCircular(projected,
+            const auto silhouette_center =
+                leastSquaresCircleCenter(projected);
+            std::vector<Vec2> centered_projection = projected;
+            if (silhouette_center)
+                for (Vec2& point : centered_projection)
+                    point = point - *silhouette_center;
+            const bool circular_silhouette = silhouette_center &&
+                centered_projection.size() >= 6 &&
+                ringLooksCircular(centered_projection,
                                   2.0 * options.circle_radial_tolerance);
             // Normal and radial failures occur after both end silhouettes have
             // passed their circular-ring certificates. They indicate interior
@@ -1044,11 +1179,20 @@ std::optional<Primitive> fitConservativeRevolvedEnvelope(
             if (diagnostics && !exact) ++diagnostics->relaxed_candidates;
             if (diagnostics && circular_silhouette)
                 ++diagnostics->circular_silhouette_candidates;
+            const double profile_slack =
+                !exact && circular_silhouette
+                ? refitConservativeConeProfile(
+                    mesh, vertices, *silhouette_center, candidate)
+                : conservativeConeProfileSlack(mesh, vertices, candidate);
             const double surface_area =
                 primitiveSurfaceArea(candidate, 1.0e-12);
-            if (!best || surface_area < best_surface_area)
+            if (!best || profile_slack < best_profile_slack - analytic_tolerance ||
+                (std::abs(profile_slack - best_profile_slack) <=
+                     analytic_tolerance &&
+                 surface_area < best_surface_area))
             {
                 best = std::move(candidate);
+                best_profile_slack = profile_slack;
                 best_surface_area = surface_area;
             }
         }
@@ -2601,15 +2745,18 @@ std::vector<OutputPrimitive> classifyFinalRegion(
         source_area += 0.5 * std::abs(edge_first.x() * edge_second.y() -
                                       edge_first.y() * edge_second.x());
     }
-    const std::vector<Vec2> hull = simplifyPolygon(convexHull(polygon, planar_tolerance),
-                                                    planar_tolerance);
     const std::size_t hole_count = loops.size() > 1 ? loops.size() - 1 : 0;
     const double effective_source_area = hole_count > 0 ? largest_area : source_area;
-    if (options.allow_polygon && hull.size() == 4)
+    // Phase 1 is the hole-filled reference, not an approximation stage.  An
+    // inner boundary loop may be sealed here, but an outer concavity must stay
+    // in the reference and compete under the user's directed-distance limit in
+    // phase 3.  Fitting the convex hull here turned every U-shaped or notched
+    // planar patch with a rectangular hull into a free oversized rectangle.
+    if (options.allow_polygon && polygon.size() == 4)
     {
-        const Vec2 first = hull[1] - hull[0];
-        const Vec2 second = hull[3] - hull[0];
-        const double rectangle_area = std::abs(signedArea(hull));
+        const Vec2 first = polygon[1] - polygon[0];
+        const Vec2 second = polygon[3] - polygon[0];
+        const double rectangle_area = std::abs(signedArea(polygon));
         const double rectangle_excess_ratio =
             std::max(rectangle_area - effective_source_area, 0.0) /
             std::max(model_surface_area, 1.0e-30);
@@ -2624,7 +2771,7 @@ std::vector<OutputPrimitive> classifyFinalRegion(
             rectangle.axes.col(1) = frame.col(0) * second_axis.x() + frame.col(1) * second_axis.y();
             rectangle.axes.col(2) = normal;
             rectangle.half_size = Vec3(first.norm() * 0.5, second.norm() * 0.5, 0.0);
-            const Vec2 center = (hull[0] + hull[2]) * 0.5;
+            const Vec2 center = (polygon[0] + polygon[2]) * 0.5;
             rectangle.center = origin + frame.col(0) * center.x() + frame.col(1) * center.y();
             filled_holes += hole_count;
             return {{rectangle, faces}};
@@ -6295,6 +6442,7 @@ std::vector<OutputPrimitive> canonicalizeCoplanarPrimitiveUnion(
         const double union_area = std::abs(Clipper2Lib::Area(covered));
         const double overlap_area = std::max(input_area - union_area, 0.0);
         std::vector<OutputPrimitive> replacements;
+        bool invalid_simple_union = false;
         // A connected Boolean-union component is one semantic polygon. Its
         // triangulation belongs to the later collision-mesh stage.
         if (!covered.empty())
@@ -6360,6 +6508,7 @@ std::vector<OutputPrimitive> canonicalizeCoplanarPrimitiveUnion(
                     triangulatePolygon(polygon).size() + 2 != polygon.size())
                 {
                     replacements.clear();
+                    invalid_simple_union = true;
                     break;
                 }
                 Primitive replacement = polygonPrimitive(polygon, origin, frame);
@@ -6372,6 +6521,37 @@ std::vector<OutputPrimitive> canonicalizeCoplanarPrimitiveUnion(
                 if (doubled_area.norm() <= tolerance * tolerance) continue;
                 replacements.push_back({std::move(replacement), {}});
             }
+        }
+        if (invalid_simple_union)
+        {
+            // A self-touching Boolean boundary can be a valid planar union even
+            // though it is not representable as one simple Polygon primitive.
+            // Keeping the overlapping inputs in that case defeats the purpose
+            // of canonicalization. Use Clipper's constrained triangulation as
+            // the non-overlapping surface partition, exactly as for a union
+            // with holes.
+            Clipper2Lib::PathsD triangles;
+            if (Clipper2Lib::Triangulate(
+                    covered, clipper_precision, triangles, false) ==
+                Clipper2Lib::TriangulateResult::success)
+                for (const auto& triangle : triangles)
+                {
+                    std::vector<Vec2> polygon;
+                    for (const auto& point : triangle)
+                        polygon.emplace_back(point.x, point.y);
+                    if (polygon.size() != 3) continue;
+                    Primitive replacement =
+                        polygonPrimitive(polygon, origin, frame);
+                    const Vec3 doubled_area =
+                        (replacement.polygon[1] -
+                         replacement.polygon[0]).cross(
+                            replacement.polygon[2] -
+                            replacement.polygon[0]);
+                    if (doubled_area.norm() <= tolerance * tolerance)
+                        continue;
+                    replacements.push_back(
+                        {std::move(replacement), {}});
+                }
         }
         for (auto& replacement : replacements)
         {
@@ -6399,20 +6579,59 @@ std::vector<OutputPrimitive> canonicalizeCoplanarPrimitiveUnion(
         result.insert(result.end(), std::make_move_iterator(replacements.begin()),
                       std::make_move_iterator(replacements.end()));
 
+        struct ReplacementProjection
+        {
+            Bounds2 bounds;
+        };
+        std::vector<ReplacementProjection> replacement_projections(
+            result.size() - replacement_begin);
+        for (std::size_t index = replacement_begin; index < result.size(); ++index)
+        {
+            const PrimitiveMesh replacement_mesh =
+                triangulatePrimitive(result[index].primitive);
+            Bounds2& bounds = replacement_projections[
+                index - replacement_begin].bounds;
+            for (const Vec3& vertex : replacement_mesh.vertices)
+            {
+                const Vec3 local = frame.transposeMultiply(vertex - origin);
+                bounds.lower = bounds.lower.cwiseMin({local.x(), local.y()});
+                bounds.upper = bounds.upper.cwiseMax({local.x(), local.y()});
+            }
+        }
+
         for (const auto face_id : source_faces)
         {
             const Face& face = source_mesh.faces[face_id];
-            const Vec3 centroid3 = (source_mesh.vertices[face[0]] +
-                                    source_mesh.vertices[face[1]] +
-                                    source_mesh.vertices[face[2]]) / 3.0;
-            std::size_t selected = replacement_begin;
+            Bounds2 source_bounds;
+            for (const auto vertex : face)
+            {
+                const Vec3 local = frame.transposeMultiply(
+                    source_mesh.vertices[vertex] - origin);
+                source_bounds.lower = source_bounds.lower.cwiseMin(
+                    {local.x(), local.y()});
+                source_bounds.upper = source_bounds.upper.cwiseMax(
+                    {local.x(), local.y()});
+            }
+
+            // A source triangle can straddle several polygons created by the
+            // planar Boolean union.  Assigning it only to the polygon that
+            // contains its centroid loses the other pieces; worse, when no
+            // polygon contains the (slightly offset) centroid the old code
+            // silently assigned it to the first, unrelated replacement.  Give
+            // every locally overlapping replacement responsibility instead.
+            // The final union audit then proves coverage jointly and no full
+            // source triangle has to be appended over an already-covered area.
             for (std::size_t index = replacement_begin; index < result.size(); ++index)
-                if (containsPoint(result[index].primitive, centroid3, tolerance * 8.0))
-                {
-                    selected = index;
-                    break;
-                }
-            result[selected].source_faces.push_back(face_id);
+            {
+                const Bounds2& candidate = replacement_projections[
+                    index - replacement_begin].bounds;
+                if (candidate.upper.x() + tolerance < source_bounds.lower.x() ||
+                    source_bounds.upper.x() + tolerance < candidate.lower.x() ||
+                    candidate.upper.y() + tolerance < source_bounds.lower.y() ||
+                    source_bounds.upper.y() + tolerance < candidate.lower.y())
+                    continue;
+                result[index].source_faces.push_back(face_id);
+            }
         }
         for (const auto index : group) consumed[index] = true;
         ++stats.groups;
@@ -7700,10 +7919,834 @@ std::vector<std::vector<std::uint32_t>> smoothFaceComponentsApproximate(
     return result;
 }
 
-struct EnvelopeMergeGroup
+struct ConvexHullSurface
 {
     std::vector<OutputPrimitive> shell;
+    std::vector<Vec3> vertices;
+    std::vector<Face> faces;
+    std::vector<Vec3> plane_normals;
+    std::vector<double> plane_offsets;
+    Bounds bounds;
+};
+
+std::optional<ConvexHullSurface> fitConvexHullSurface(
+    std::vector<Vec3> points,
+    const std::vector<std::uint32_t>& responsibility,
+    const std::uint64_t enclosure_group,
+    const double tolerance)
+{
+    std::sort(points.begin(), points.end(),
+        [](const Vec3& first, const Vec3& second)
+        {
+            if (first.x() != second.x()) return first.x() < second.x();
+            if (first.y() != second.y()) return first.y() < second.y();
+            return first.z() < second.z();
+        });
+    points.erase(std::unique(points.begin(), points.end(),
+        [&](const Vec3& first, const Vec3& second)
+        { return (first - second).norm() <= tolerance; }), points.end());
+    if (points.size() < 4) return std::nullopt;
+
+    Mesh point_mesh;
+    point_mesh.vertices = points;
+    std::vector<std::uint32_t> point_ids(points.size());
+    std::iota(point_ids.begin(), point_ids.end(), 0);
+    const BoxFit dimensionality = fitBox(point_mesh, point_ids);
+    if (std::min({dimensionality.half_size.x(), dimensionality.half_size.y(),
+                  dimensionality.half_size.z()}) <= tolerance)
+        return std::nullopt;
+
+    Bounds input_bounds;
+    std::vector<quickhull::Vector3<double>> cloud;
+    cloud.reserve(points.size());
+    for (const Vec3& point : points)
+    {
+        input_bounds.lower = input_bounds.lower.cwiseMin(point);
+        input_bounds.upper = input_bounds.upper.cwiseMax(point);
+        cloud.emplace_back(point.x(), point.y(), point.z());
+    }
+    const double scale = std::max(
+        (input_bounds.upper - input_bounds.lower).norm(), tolerance);
+    quickhull::QuickHull<double> builder;
+    const auto hull = builder.getConvexHull(
+        cloud, true, false, std::max(tolerance / scale, 1.0e-12));
+    if (hull.getVertexBuffer().size() < 4 ||
+        hull.getIndexBuffer().size() < 12 ||
+        hull.getIndexBuffer().size() % 3 != 0)
+        return std::nullopt;
+
+    ConvexHullSurface result;
+    result.vertices.reserve(hull.getVertexBuffer().size());
+    Vec3 center = Vec3::Zero();
+    for (const auto& vertex : hull.getVertexBuffer())
+    {
+        const Vec3 converted(vertex.x, vertex.y, vertex.z);
+        result.vertices.push_back(converted);
+        result.bounds.lower = result.bounds.lower.cwiseMin(converted);
+        result.bounds.upper = result.bounds.upper.cwiseMax(converted);
+        center += converted;
+    }
+    center /= static_cast<double>(result.vertices.size());
+    const auto& indices = hull.getIndexBuffer();
+    result.faces.reserve(indices.size() / 3);
+    result.shell.reserve(indices.size() / 3);
+    for (std::size_t offset = 0; offset < indices.size(); offset += 3)
+    {
+        Face face{
+            static_cast<std::uint32_t>(indices[offset]),
+            static_cast<std::uint32_t>(indices[offset + 1]),
+            static_cast<std::uint32_t>(indices[offset + 2])};
+        Vec3 normal = (result.vertices[face[1]] - result.vertices[face[0]])
+                          .cross(result.vertices[face[2]] -
+                                 result.vertices[face[0]]);
+        if (normal.norm() <= tolerance * tolerance) continue;
+        if (normal.dot(result.vertices[face[0]] - center) < 0.0)
+            std::swap(face[1], face[2]);
+        normal = (result.vertices[face[1]] - result.vertices[face[0]])
+                     .cross(result.vertices[face[2]] - result.vertices[face[0]])
+                     .normalized();
+        result.faces.push_back(face);
+        result.plane_normals.push_back(normal);
+        result.plane_offsets.push_back(
+            normal.dot(result.vertices[face[0]]));
+        Primitive triangle;
+        triangle.kind = Kind::Polygon;
+        triangle.polygon = {result.vertices[face[0]], result.vertices[face[1]],
+                            result.vertices[face[2]]};
+        OutputPrimitive item;
+        item.primitive = std::move(triangle);
+        item.source_faces = responsibility;
+        item.enclosure_group = enclosure_group;
+        result.shell.push_back(std::move(item));
+    }
+    if (result.faces.size() < 4) return std::nullopt;
+    return result;
+}
+
+bool convexBoundsOverlap(const Bounds& first, const Bounds& second,
+                         const double tolerance)
+{
+    for (int axis = 0; axis < 3; ++axis)
+        if (first.upper[axis] < second.lower[axis] - tolerance ||
+            second.upper[axis] < first.lower[axis] - tolerance)
+            return false;
+    return true;
+}
+
+bool pointStrictlyInsideHull(const ConvexHullSurface& hull,
+                             const Vec3& point,
+                             const double tolerance)
+{
+    for (std::size_t face = 0; face < hull.faces.size(); ++face)
+        if (hull.plane_normals[face].dot(point) -
+                hull.plane_offsets[face] > -tolerance)
+            return false;
+    return true;
+}
+
+bool segmentIntersectsHullInterior(const ConvexHullSurface& hull,
+                                   const Vec3& first,
+                                   const Vec3& second,
+                                   const double tolerance)
+{
+    double lower = 0.0;
+    double upper = 1.0;
+    for (std::size_t face = 0; face < hull.faces.size(); ++face)
+    {
+        const Vec3& normal = hull.plane_normals[face];
+        const double first_distance =
+            normal.dot(first) - hull.plane_offsets[face];
+        const double delta = normal.dot(second - first);
+        const double limit = -tolerance;
+        if (std::abs(delta) <= 1.0e-30)
+        {
+            if (first_distance > limit) return false;
+            continue;
+        }
+        const double crossing = (limit - first_distance) / delta;
+        if (delta > 0.0) upper = std::min(upper, crossing);
+        else lower = std::max(lower, crossing);
+        if (lower > upper) return false;
+    }
+    return upper >= 0.0 && lower <= 1.0 &&
+           std::max(lower, 0.0) <= std::min(upper, 1.0);
+}
+
+bool segmentIntersectsTriangleInterior(
+    const Vec3& first,
+    const Vec3& second,
+    const std::array<Vec3, 3>& triangle,
+    const double tolerance)
+{
+    const Vec3 direction = second - first;
+    const Vec3 edge1 = triangle[1] - triangle[0];
+    const Vec3 edge2 = triangle[2] - triangle[0];
+    const Vec3 cross = direction.cross(edge2);
+    const double determinant = edge1.dot(cross);
+    const double scale = std::max(
+        {direction.norm(), edge1.norm(), edge2.norm(), 1.0});
+    if (std::abs(determinant) <= tolerance * scale * scale) return false;
+    const double inverse = 1.0 / determinant;
+    const Vec3 relative = first - triangle[0];
+    const double first_barycentric = relative.dot(cross) * inverse;
+    const Vec3 second_cross = relative.cross(edge1);
+    const double second_barycentric =
+        direction.dot(second_cross) * inverse;
+    const double segment_parameter = edge2.dot(second_cross) * inverse;
+    const double barycentric_tolerance = tolerance / scale;
+    return first_barycentric > barycentric_tolerance &&
+           second_barycentric > barycentric_tolerance &&
+           first_barycentric + second_barycentric <
+               1.0 - barycentric_tolerance &&
+           segment_parameter > barycentric_tolerance &&
+           segment_parameter < 1.0 - barycentric_tolerance;
+}
+
+bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
+                            const PrimitiveMesh& mesh,
+                            const Bounds& mesh_bounds,
+                            const double tolerance,
+                            bool* halfspace_rejected = nullptr)
+{
+    if (halfspace_rejected) *halfspace_rejected = false;
+    if (!convexBoundsOverlap(hull.bounds, mesh_bounds, tolerance))
+        return false;
+    // A hull face plane that places every mesh vertex on its exterior side is
+    // a separating plane for every triangle in the mesh. This proves that the
+    // surface cannot enter the strict hull interior and avoids the much more
+    // expensive edge/triangle intersection tests below.
+    for (std::size_t plane = 0; plane < hull.faces.size(); ++plane)
+    {
+        bool all_outside = true;
+        for (const Vec3& vertex : mesh.vertices)
+            if (hull.plane_normals[plane].dot(vertex) -
+                    hull.plane_offsets[plane] < -tolerance)
+            {
+                all_outside = false;
+                break;
+            }
+        if (all_outside)
+        {
+            if (halfspace_rejected) *halfspace_rejected = true;
+            return false;
+        }
+    }
+    for (const Vec3& vertex : mesh.vertices)
+        if (pointStrictlyInsideHull(hull, vertex, tolerance)) return true;
+    for (const Face& face : mesh.faces)
+        for (int edge = 0; edge < 3; ++edge)
+            if (segmentIntersectsHullInterior(
+                    hull, mesh.vertices[face[edge]],
+                    mesh.vertices[face[(edge + 1) % 3]], tolerance))
+                return true;
+    for (const Face& hull_face : hull.faces)
+        for (int edge = 0; edge < 3; ++edge)
+        {
+            const Vec3& first = hull.vertices[hull_face[edge]];
+            const Vec3& second =
+                hull.vertices[hull_face[(edge + 1) % 3]];
+            for (const Face& face : mesh.faces)
+            {
+                const std::array<Vec3, 3> triangle{
+                    mesh.vertices[face[0]], mesh.vertices[face[1]],
+                    mesh.vertices[face[2]]};
+                if (segmentIntersectsTriangleInterior(
+                        first, second, triangle, tolerance))
+                    return true;
+            }
+        }
+    return false;
+}
+
+bool primitiveIntrudesConvexHull(const ConvexHullSurface& hull,
+                                 const OutputPrimitive& primitive,
+                                 const double tolerance)
+{
+    const PrimitiveMesh mesh = triangulatePrimitive(primitive.primitive);
+    return meshIntrudesConvexHull(
+        hull, mesh, primitiveBounds(primitive.primitive), tolerance);
+}
+
+std::vector<Vec3> clipPolygonInsideConvexHull(
+    std::vector<Vec3> polygon,
+    const ConvexHullSurface& hull,
+    const double tolerance)
+{
+    for (const Face& face : hull.faces)
+    {
+        const Vec3& plane_point = hull.vertices[face[0]];
+        Vec3 normal = (hull.vertices[face[1]] - plane_point).cross(
+            hull.vertices[face[2]] - plane_point);
+        const double length = normal.norm();
+        if (length <= 1.0e-30) continue;
+        normal /= length;
+        std::vector<Vec3> clipped;
+        if (polygon.empty()) break;
+        clipped.reserve(polygon.size() + 2);
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3& first = polygon[index];
+            const Vec3& second = polygon[(index + 1) % polygon.size()];
+            const double first_distance = normal.dot(first - plane_point);
+            const double second_distance = normal.dot(second - plane_point);
+            const bool first_inside = first_distance <= tolerance;
+            const bool second_inside = second_distance <= tolerance;
+            if (first_inside) clipped.push_back(first);
+            if (first_inside == second_inside) continue;
+            const double denominator = first_distance - second_distance;
+            if (std::abs(denominator) <= 1.0e-30) continue;
+            clipped.push_back(first + (second - first) *
+                std::clamp(first_distance / denominator, 0.0, 1.0));
+        }
+        polygon = std::move(clipped);
+    }
+    return polygon;
+}
+
+std::vector<OutputPrimitive> convexHullUnionOuterSurface(
+    const std::vector<ConvexHullSurface>& hulls,
+    const double tolerance)
+{
+    constexpr int clipper_precision = 8;
+    std::vector<OutputPrimitive> result;
+    for (std::size_t hull_index = 0; hull_index < hulls.size(); ++hull_index)
+    {
+        const ConvexHullSurface& hull = hulls[hull_index];
+        for (std::size_t face_index = 0;
+             face_index < hull.faces.size(); ++face_index)
+        {
+            const Face& face = hull.faces[face_index];
+            const Vec3& origin = hull.vertices[face[0]];
+            Vec3 normal = (hull.vertices[face[1]] - origin).cross(
+                hull.vertices[face[2]] - origin);
+            const double normal_length = normal.norm();
+            if (normal_length <= tolerance * tolerance) continue;
+            normal /= normal_length;
+            const Mat3 basis = orthonormalFrame(normal);
+            Mat3 frame;
+            frame.col(0) = basis.col(1);
+            frame.col(1) = basis.col(2);
+            frame.col(2) = normal;
+            Clipper2Lib::PathD original_path;
+            for (const auto vertex : face)
+            {
+                const Vec3 local = frame.transposeMultiply(
+                    hull.vertices[vertex] - origin);
+                original_path.emplace_back(local.x(), local.y());
+            }
+            if (Clipper2Lib::Area(original_path) < 0.0)
+                std::reverse(original_path.begin(), original_path.end());
+            Clipper2Lib::PathsD remaining{original_path};
+
+            for (std::size_t other_index = 0;
+                 other_index < hulls.size() && !remaining.empty();
+                 ++other_index)
+            {
+                if (other_index == hull_index ||
+                    !convexBoundsOverlap(
+                        hull.bounds, hulls[other_index].bounds,
+                        tolerance * 8.0))
+                    continue;
+                const ConvexHullSurface& other = hulls[other_index];
+                bool same_facing_coplanar_boundary = false;
+                for (const Face& other_face : other.faces)
+                {
+                    const Vec3& other_point = other.vertices[other_face[0]];
+                    Vec3 other_normal =
+                        (other.vertices[other_face[1]] - other_point).cross(
+                            other.vertices[other_face[2]] - other_point);
+                    const double length = other_normal.norm();
+                    if (length <= 1.0e-30) continue;
+                    other_normal /= length;
+                    if (normal.dot(other_normal) < 1.0 - 1.0e-8 ||
+                        std::abs(normal.dot(other_point - origin)) >
+                            tolerance * 8.0)
+                        continue;
+                    same_facing_coplanar_boundary = true;
+                    break;
+                }
+                // Coincident external faces are a duplicate, not an internal
+                // interface. Keep the lower-index owner and subtract it from
+                // later hulls; opposite-facing contact faces are removed from
+                // both sides by the ordinary inside clipping below.
+                if (same_facing_coplanar_boundary &&
+                    hull_index < other_index)
+                    continue;
+
+                std::vector<Vec3> intersection = clipPolygonInsideConvexHull(
+                    {hull.vertices[face[0]], hull.vertices[face[1]],
+                     hull.vertices[face[2]]},
+                    other, tolerance * 8.0);
+                if (intersection.size() < 3) continue;
+                Clipper2Lib::PathD clip_path;
+                for (const Vec3& point : intersection)
+                {
+                    const Vec3 local =
+                        frame.transposeMultiply(point - origin);
+                    clip_path.emplace_back(local.x(), local.y());
+                }
+                if (std::abs(Clipper2Lib::Area(clip_path)) <=
+                    tolerance * tolerance)
+                    continue;
+                if (Clipper2Lib::Area(clip_path) < 0.0)
+                    std::reverse(clip_path.begin(), clip_path.end());
+                remaining = Clipper2Lib::Difference(
+                    remaining, Clipper2Lib::PathsD{clip_path},
+                    Clipper2Lib::FillRule::NonZero, clipper_precision);
+            }
+            if (remaining.empty()) continue;
+            Clipper2Lib::PathsD triangles;
+            if (Clipper2Lib::Triangulate(
+                    remaining, clipper_precision, triangles, false) !=
+                Clipper2Lib::TriangulateResult::success)
+                continue;
+            for (const auto& triangle_path : triangles)
+            {
+                if (triangle_path.size() != 3) continue;
+                std::vector<Vec2> polygon;
+                polygon.reserve(3);
+                for (const auto& point : triangle_path)
+                    polygon.emplace_back(point.x, point.y);
+                Primitive surface = polygonPrimitive(polygon, origin, frame);
+                if (primitiveSurfaceArea(surface, tolerance) <=
+                    tolerance * tolerance)
+                    continue;
+                OutputPrimitive item;
+                item.primitive = std::move(surface);
+                item.source_faces = hull.shell[face_index].source_faces;
+                result.push_back(std::move(item));
+            }
+        }
+    }
+    return result;
+}
+
+struct ConvexPartitionDiagnostics
+{
+    std::size_t levels_tested = 0;
+    std::size_t degenerate_levels = 0;
+    std::size_t workload_rejections = 0;
+    std::size_t overlap_rejections = 0;
+    std::size_t error_rejections = 0;
+    std::size_t accepted_parts = 0;
+    std::size_t accepted_triangles = 0;
+    double accepted_error = 0.0;
+    std::vector<std::size_t> tested_triangles;
+    std::vector<double> tested_errors;
+};
+
+struct ConvexPartitionResult
+{
+    std::vector<ConvexHullSurface> hulls;
+    std::vector<OutputPrimitive> outer_surface;
+};
+
+struct ConvexPartitionFragment
+{
+    std::vector<Vec3> polygon;
+    std::uint32_t source_face = 0;
+};
+
+struct ConvexPartitionCell
+{
+    std::vector<ConvexPartitionFragment> fragments;
+};
+
+std::vector<Vec3> clipPolygonToAxisHalfspace(
+    const std::vector<Vec3>& polygon, const int axis,
+    const double coordinate, const bool keep_lower)
+{
+    std::vector<Vec3> clipped;
+    clipped.reserve(polygon.size() + 2);
+    const auto inside = [&](const Vec3& point)
+    {
+        return keep_lower ? point[axis] <= coordinate
+                          : point[axis] >= coordinate;
+    };
+    for (std::size_t index = 0; index < polygon.size(); ++index)
+    {
+        const Vec3& first = polygon[index];
+        const Vec3& second = polygon[(index + 1) % polygon.size()];
+        const bool first_inside = inside(first);
+        const bool second_inside = inside(second);
+        if (first_inside) clipped.push_back(first);
+        if (first_inside == second_inside) continue;
+        const double denominator = second[axis] - first[axis];
+        if (std::abs(denominator) <= 1.0e-30) continue;
+        const double parameter =
+            std::clamp((coordinate - first[axis]) / denominator, 0.0, 1.0);
+        Vec3 intersection = first + (second - first) * parameter;
+        intersection[axis] = coordinate;
+        clipped.push_back(intersection);
+    }
+    return clipped;
+}
+
+std::optional<std::array<ConvexPartitionCell, 2>> splitConvexPartitionCell(
+    const ConvexPartitionCell& cell, const int axis, const double coordinate,
+    const double tolerance)
+{
+    std::array<ConvexPartitionCell, 2> children;
+    children[0].fragments.reserve(cell.fragments.size());
+    children[1].fragments.reserve(cell.fragments.size());
+    for (const auto& fragment : cell.fragments)
+    {
+        double lower = std::numeric_limits<double>::infinity();
+        double upper = -std::numeric_limits<double>::infinity();
+        for (const Vec3& point : fragment.polygon)
+        {
+            lower = std::min(lower, point[axis]);
+            upper = std::max(upper, point[axis]);
+        }
+        if (upper <= coordinate + tolerance)
+        {
+            children[0].fragments.push_back(fragment);
+            continue;
+        }
+        if (lower >= coordinate - tolerance)
+        {
+            children[1].fragments.push_back(fragment);
+            continue;
+        }
+        auto lower_polygon = clipPolygonToAxisHalfspace(
+            fragment.polygon, axis, coordinate, true);
+        auto upper_polygon = clipPolygonToAxisHalfspace(
+            fragment.polygon, axis, coordinate, false);
+        if (lower_polygon.size() >= 3)
+            children[0].fragments.push_back(
+                {std::move(lower_polygon), fragment.source_face});
+        if (upper_polygon.size() >= 3)
+            children[1].fragments.push_back(
+                {std::move(upper_polygon), fragment.source_face});
+    }
+    if (children[0].fragments.empty() || children[1].fragments.empty())
+        return std::nullopt;
+    return children;
+}
+
+std::optional<ConvexPartitionResult>
+fitNonOverlappingConvexPartition(
+    const Mesh& responsibility_mesh,
+    const Mesh& distance_reference,
+    const std::vector<std::uint32_t>& component,
+    const std::size_t input_workload,
+    const std::uint64_t first_enclosure_group,
+    const double tolerance,
+    const double maximum_error_distance,
+    const double error_sample_spacing,
+    ConvexPartitionDiagnostics& diagnostics)
+{
+    diagnostics = {};
+    if (component.size() < 8) return std::nullopt;
+    ConvexPartitionCell initial;
+    initial.fragments.reserve(component.size());
+    for (const auto face_id : component)
+    {
+        const Face& face = responsibility_mesh.faces[face_id];
+        initial.fragments.push_back({
+            {responsibility_mesh.vertices[face[0]],
+             responsibility_mesh.vertices[face[1]],
+             responsibility_mesh.vertices[face[2]]},
+            face_id});
+    }
+    std::vector<ConvexPartitionCell> partitions;
+    partitions.push_back(std::move(initial));
+
+    const auto fitCells = [&](const std::vector<ConvexPartitionCell>& cells)
+        -> std::optional<ConvexPartitionResult>
+    {
+        ConvexPartitionResult result;
+        result.hulls.reserve(cells.size());
+        for (std::size_t index = 0; index < cells.size(); ++index)
+        {
+            std::vector<Vec3> points;
+            std::vector<std::uint32_t> responsibility;
+            for (const auto& fragment : cells[index].fragments)
+            {
+                points.insert(points.end(), fragment.polygon.begin(),
+                              fragment.polygon.end());
+                responsibility.push_back(fragment.source_face);
+            }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            auto hull = fitConvexHullSurface(
+                std::move(points), responsibility,
+                first_enclosure_group + index, tolerance);
+            if (!hull) return std::nullopt;
+            result.hulls.push_back(std::move(*hull));
+        }
+        result.outer_surface =
+            convexHullUnionOuterSurface(result.hulls, tolerance);
+        if (result.outer_surface.empty()) return std::nullopt;
+        return result;
+    };
+
+    // The first cut determines whether a coarse decomposition becomes a useful
+    // proxy or merely exposes a distant artificial section. Search a bounded,
+    // geometry-only family of axis/quantile cuts instead of committing to one
+    // arbitrary longest-axis median. Later levels refine the best-error cut.
+    std::optional<ConvexPartitionResult> best_accepted;
+    std::vector<ConvexPartitionCell> best_seed_partition;
+    std::size_t best_accepted_workload =
+        std::numeric_limits<std::size_t>::max();
+    double best_accepted_error = std::numeric_limits<double>::infinity();
+    double best_seed_error = std::numeric_limits<double>::infinity();
+    Bounds initial_bounds;
+    std::array<std::vector<double>, 3> centroid_coordinates;
+    for (const auto& fragment : partitions.front().fragments)
+    {
+        Vec3 centroid = Vec3::Zero();
+        for (const Vec3& point : fragment.polygon)
+        {
+            initial_bounds.lower = initial_bounds.lower.cwiseMin(point);
+            initial_bounds.upper = initial_bounds.upper.cwiseMax(point);
+            centroid += point;
+        }
+        centroid /= static_cast<double>(fragment.polygon.size());
+        for (int axis = 0; axis < 3; ++axis)
+            centroid_coordinates[axis].push_back(centroid[axis]);
+    }
+    constexpr std::array<double, 5> quantiles{
+        0.2, 0.35, 0.5, 0.65, 0.8};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        if (initial_bounds.upper[axis] - initial_bounds.lower[axis] <=
+            tolerance * 8.0)
+            continue;
+        auto coordinates = centroid_coordinates[axis];
+        std::sort(coordinates.begin(), coordinates.end());
+        for (const double quantile : quantiles)
+        {
+            const std::size_t coordinate_index = std::min(
+                coordinates.size() - 1,
+                static_cast<std::size_t>(
+                    quantile * static_cast<double>(coordinates.size() - 1)));
+            double coordinate = coordinates[coordinate_index];
+            if (coordinate <= initial_bounds.lower[axis] + tolerance * 8.0 ||
+                coordinate >= initial_bounds.upper[axis] - tolerance * 8.0)
+                continue;
+            auto children = splitConvexPartitionCell(
+                partitions.front(), axis, coordinate, tolerance);
+            if (!children) continue;
+            std::vector<ConvexPartitionCell> cells;
+            cells.push_back(std::move((*children)[0]));
+            cells.push_back(std::move((*children)[1]));
+            auto candidate = fitCells(cells);
+            if (!candidate) continue;
+            const std::size_t workload =
+                triangulatedFaceCount(candidate->outer_surface);
+            if (workload >= input_workload) continue;
+            const double error = maximumFilledSurfaceDistance(
+                distance_reference, candidate->outer_surface,
+                error_sample_spacing,
+                std::numeric_limits<double>::infinity());
+            diagnostics.tested_triangles.push_back(workload);
+            diagnostics.tested_errors.push_back(error);
+            if (error < best_seed_error)
+            {
+                best_seed_error = error;
+                best_seed_partition = cells;
+            }
+            if (error <= maximum_error_distance + tolerance &&
+                (workload < best_accepted_workload ||
+                 (workload == best_accepted_workload &&
+                  error < best_accepted_error)))
+            {
+                best_accepted_workload = workload;
+                best_accepted_error = error;
+                best_accepted = std::move(candidate);
+            }
+        }
+    }
+    if (best_accepted)
+    {
+        diagnostics.levels_tested = 1;
+        diagnostics.accepted_parts = best_accepted->hulls.size();
+        diagnostics.accepted_triangles = best_accepted_workload;
+        diagnostics.accepted_error = best_accepted_error;
+        return best_accepted;
+    }
+    if (best_seed_partition.empty()) return std::nullopt;
+    partitions = std::move(best_seed_partition);
+
+    constexpr std::size_t maximum_levels = 6;
+    for (std::size_t level = 0; level < maximum_levels; ++level)
+    {
+        std::vector<ConvexPartitionCell> split_partitions;
+        split_partitions.reserve(partitions.size() * 2);
+        bool split_any = false;
+        for (auto& cell : partitions)
+        {
+            if (cell.fragments.size() < 8)
+            {
+                split_partitions.push_back(std::move(cell));
+                continue;
+            }
+            Bounds point_bounds;
+            std::vector<Vec3> centroids;
+            centroids.reserve(cell.fragments.size());
+            for (const auto& fragment : cell.fragments)
+            {
+                Vec3 centroid = Vec3::Zero();
+                for (const Vec3& point : fragment.polygon)
+                {
+                    point_bounds.lower = point_bounds.lower.cwiseMin(point);
+                    point_bounds.upper = point_bounds.upper.cwiseMax(point);
+                    centroid += point;
+                }
+                centroid /= static_cast<double>(fragment.polygon.size());
+                centroids.push_back(centroid);
+            }
+            const Vec3 extent = point_bounds.upper - point_bounds.lower;
+            int axis = 0;
+            if (extent.y() > extent.x()) axis = 1;
+            if (extent.z() > extent[axis]) axis = 2;
+            if (extent[axis] <= tolerance * 8.0)
+            {
+                split_partitions.push_back(std::move(cell));
+                continue;
+            }
+            const std::size_t middle = centroids.size() / 2;
+            std::nth_element(
+                centroids.begin(), centroids.begin() + middle,
+                centroids.end(), [&](const Vec3& first, const Vec3& second)
+                { return first[axis] < second[axis]; });
+            double split = centroids[middle][axis];
+            if (split <= point_bounds.lower[axis] + tolerance * 8.0 ||
+                split >= point_bounds.upper[axis] - tolerance * 8.0)
+                split = 0.5 * (point_bounds.lower[axis] +
+                               point_bounds.upper[axis]);
+
+            ConvexPartitionCell lower_cell;
+            ConvexPartitionCell upper_cell;
+            lower_cell.fragments.reserve(cell.fragments.size());
+            upper_cell.fragments.reserve(cell.fragments.size());
+            for (auto& fragment : cell.fragments)
+            {
+                double lower = std::numeric_limits<double>::infinity();
+                double upper = -std::numeric_limits<double>::infinity();
+                for (const Vec3& point : fragment.polygon)
+                {
+                    lower = std::min(lower, point[axis]);
+                    upper = std::max(upper, point[axis]);
+                }
+                if (upper <= split + tolerance)
+                {
+                    lower_cell.fragments.push_back(std::move(fragment));
+                    continue;
+                }
+                if (lower >= split - tolerance)
+                {
+                    upper_cell.fragments.push_back(std::move(fragment));
+                    continue;
+                }
+                auto lower_polygon = clipPolygonToAxisHalfspace(
+                    fragment.polygon, axis, split, true);
+                auto upper_polygon = clipPolygonToAxisHalfspace(
+                    fragment.polygon, axis, split, false);
+                if (lower_polygon.size() >= 3)
+                    lower_cell.fragments.push_back(
+                        {std::move(lower_polygon), fragment.source_face});
+                if (upper_polygon.size() >= 3)
+                    upper_cell.fragments.push_back(
+                        {std::move(upper_polygon), fragment.source_face});
+            }
+            if (lower_cell.fragments.empty() || upper_cell.fragments.empty())
+            {
+                split_partitions.push_back(std::move(cell));
+                continue;
+            }
+            split_partitions.push_back(std::move(lower_cell));
+            split_partitions.push_back(std::move(upper_cell));
+            split_any = true;
+        }
+        partitions = std::move(split_partitions);
+        if (!split_any) break;
+        ++diagnostics.levels_tested;
+
+        std::vector<ConvexHullSurface> hulls;
+        hulls.reserve(partitions.size());
+        bool degenerate = false;
+        for (std::size_t index = 0; index < partitions.size(); ++index)
+        {
+            std::vector<Vec3> points;
+            std::vector<std::uint32_t> responsibility;
+            for (const auto& fragment : partitions[index].fragments)
+            {
+                points.insert(points.end(), fragment.polygon.begin(),
+                              fragment.polygon.end());
+                responsibility.push_back(fragment.source_face);
+            }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            auto hull = fitConvexHullSurface(
+                std::move(points), responsibility,
+                first_enclosure_group + index, tolerance);
+            if (!hull)
+            {
+                degenerate = true;
+                break;
+            }
+            hulls.push_back(std::move(*hull));
+        }
+        if (degenerate)
+        {
+            ++diagnostics.degenerate_levels;
+            continue;
+        }
+        std::vector<OutputPrimitive> candidate =
+            convexHullUnionOuterSurface(hulls, tolerance);
+        const std::size_t candidate_workload =
+            triangulatedFaceCount(candidate);
+        if (candidate.empty() || candidate_workload >= input_workload)
+        {
+            ++diagnostics.workload_rejections;
+            continue;
+        }
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                distance_reference, candidate,
+                maximum_error_distance + tolerance);
+        bool accepted = certificate.certified && !certificate.exceeded;
+        double observed_error = certificate.observed_maximum;
+        if (!accepted && !certificate.exceeded)
+        {
+            observed_error = maximumFilledSurfaceDistance(
+                distance_reference, candidate, error_sample_spacing,
+                maximum_error_distance + tolerance);
+            accepted = observed_error <= maximum_error_distance + tolerance;
+        }
+        diagnostics.tested_triangles.push_back(candidate_workload);
+        diagnostics.tested_errors.push_back(observed_error);
+        if (!accepted)
+        {
+            ++diagnostics.error_rejections;
+            continue;
+        }
+        diagnostics.accepted_parts = hulls.size();
+        diagnostics.accepted_triangles = candidate_workload;
+        diagnostics.accepted_error = observed_error;
+        return ConvexPartitionResult{
+            std::move(hulls), std::move(candidate)};
+    }
+    return std::nullopt;
+}
+
+struct EnvelopeMergeGroup
+{
+    struct IntrusionSurface
+    {
+        PrimitiveMesh mesh;
+        Bounds bounds;
+    };
+    std::vector<OutputPrimitive> shell;
+    std::vector<IntrusionSurface> intrusion_surfaces;
     std::vector<std::uint32_t> responsibility;
+    std::vector<std::uint32_t> source_vertices;
     Bounds bounds;
     bool contains_round_surface = false;
     std::size_t triangle_workload = 0;
@@ -7716,6 +8759,7 @@ struct EnvelopeFitResult
 {
     std::vector<OutputPrimitive> shell;
     std::vector<std::uint32_t> responsibility;
+    std::vector<std::uint32_t> source_vertices;
     Bounds bounds;
     bool contains_round_surface = false;
     std::size_t triangle_workload = 0;
@@ -7731,6 +8775,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     const double maximum_error_distance,
     const double error_sample_spacing,
     std::size_t& merged_group_count,
+    std::vector<OutputPrimitive>& convex_enclosure_certificates,
     const std::filesystem::path& profile_path)
 {
     const auto started = std::chrono::steady_clock::now();
@@ -7741,6 +8786,15 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t second = 0;
         std::uint64_t first_version = 0;
         std::uint64_t second_version = 0;
+        std::size_t priority = 0;
+    };
+    struct CandidateCompare
+    {
+        bool operator()(const Candidate& left,
+                        const Candidate& right) const noexcept
+        {
+            return left.priority < right.priority;
+        }
     };
     using FitResult = EnvelopeFitResult;
     struct Profile
@@ -7755,20 +8809,77 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t accepted_round_groups = 0;
         std::size_t conservative_round_component_attempts = 0;
         std::size_t accepted_conservative_round_components = 0;
+        std::size_t convex_component_attempts = 0;
+        std::size_t accepted_convex_components = 0;
+        std::size_t accepted_convex_partition_components = 0;
+        std::size_t invalid_convex_components = 0;
+        std::size_t convex_workload_rejections = 0;
+        std::size_t convex_error_rejections = 0;
+        std::size_t convex_intersection_rejections = 0;
         std::size_t accepted_groups = 0;
+        std::size_t coarse_distance_evaluations = 0;
+        std::size_t coarse_distance_rejections = 0;
+        std::size_t convex_face_cache_hits = 0;
+        std::size_t convex_hull_fits = 0;
+        std::size_t convex_growth_iterations = 0;
+        std::size_t intrusion_tests = 0;
+        std::size_t intrusion_halfspace_rejections = 0;
         std::size_t certificate_samples = 0;
         std::size_t fine_distance_evaluations = 0;
+        double coarse_distance_seconds = 0.0;
+        double convex_hull_seconds = 0.0;
+        double intrusion_seconds = 0.0;
         double distance_seconds = 0.0;
     } profile;
     profile.input_primitives = primitives.size();
+    auto last_profile_flush = started - std::chrono::seconds(2);
+    const auto flushProfile = [&](const bool force = false)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_profile_flush < std::chrono::seconds(1))
+            return;
+        last_profile_flush = now;
+        std::ofstream stream(profile_path);
+        stream << std::setprecision(17)
+               << "{\"complete\":false"
+               << ",\"input_primitives\":" << profile.input_primitives
+               << ",\"initial_adjacencies\":"
+               << profile.initial_adjacencies
+               << ",\"candidate_evaluations\":"
+               << profile.candidate_evaluations
+               << ",\"accepted_groups\":" << profile.accepted_groups
+               << ",\"error_rejections\":" << profile.error_rejections
+               << ",\"coarse_distance_evaluations\":"
+               << profile.coarse_distance_evaluations
+               << ",\"coarse_distance_rejections\":"
+               << profile.coarse_distance_rejections
+               << ",\"convex_face_cache_hits\":"
+               << profile.convex_face_cache_hits
+               << ",\"convex_hull_fits\":" << profile.convex_hull_fits
+               << ",\"convex_growth_iterations\":"
+               << profile.convex_growth_iterations
+               << ",\"intrusion_tests\":" << profile.intrusion_tests
+               << ",\"intrusion_halfspace_rejections\":"
+               << profile.intrusion_halfspace_rejections
+               << ",\"certificate_samples\":"
+               << profile.certificate_samples
+               << ",\"coarse_distance_seconds\":"
+               << profile.coarse_distance_seconds
+               << ",\"convex_hull_seconds\":"
+               << profile.convex_hull_seconds
+               << ",\"intrusion_seconds\":" << profile.intrusion_seconds
+               << ",\"distance_seconds\":" << profile.distance_seconds
+               << ",\"elapsed_seconds\":"
+               << std::chrono::duration<double>(now - started).count()
+               << "}\n";
+    };
     merged_group_count = 0;
     if (primitives.size() < 2) return primitives;
-    // Candidate certification and the final audit use different deterministic
-    // surface samples. Keep a small internal margin so a candidate that lands
-    // exactly on the user limit cannot exceed it only because the final pass
-    // happens to sample a more adverse point. The public/final limit is not
-    // changed.
-    const double candidate_error_limit = maximum_error_distance * 0.99;
+    // The user-provided directed distance is the sole approximation budget.
+    // Candidate certification and the final full-surface audit both use that
+    // same limit; an undocumented local safety factor must not suppress an
+    // otherwise admissible lower-work candidate.
+    const double candidate_error_limit = maximum_error_distance;
 
     // Test complete geometric components before pairwise growth. A conservative
     // revolved envelope is admissible only when both end silhouettes are
@@ -7804,6 +8915,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     }
     std::vector<bool> consumed_primitives(primitives.size(), false);
     std::vector<OutputPrimitive> component_replacements;
+    std::ofstream convex_component_diagnostics(
+        profile_path.parent_path() / "convex_component_profile.jsonl");
     for (const auto& component : source_components)
     {
         ++profile.conservative_round_component_attempts;
@@ -7955,6 +9068,209 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         ++profile.accepted_conservative_round_components;
         merged_group_count += owners.size() - 1;
     }
+
+    // A complete connected responsibility component may also compete as its
+    // conservative convex surface.  This is deliberately a component-level
+    // candidate only: the former pairwise convex growth greedily produced many
+    // intersecting local hulls on noisy CAD surfaces.  Analytic round surfaces
+    // remain preferred and are never flattened into a polyhedral hull.
+    for (const auto& component : source_components)
+    {
+        std::unordered_set<std::uint32_t> component_faces(
+            component.begin(), component.end());
+        std::vector<std::size_t> owners;
+        std::size_t input_workload = 0;
+        bool partial_owner = false;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed_primitives[index] ||
+                primitives[index].source_faces.empty())
+                continue;
+            const bool touches = std::any_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face)
+                { return component_faces.contains(face); });
+            if (!touches) continue;
+            const bool fully_owned = std::all_of(
+                primitives[index].source_faces.begin(),
+                primitives[index].source_faces.end(),
+                [&](const auto face)
+                { return component_faces.contains(face); });
+            if (!fully_owned)
+            {
+                partial_owner = true;
+                break;
+            }
+            owners.push_back(index);
+            input_workload += triangulatePrimitive(
+                primitives[index].primitive).faces.size();
+        }
+        // A component accepted by the preceding analytic-envelope pass has
+        // already been marked consumed, so it cannot reach this candidate.
+        // Do not veto a genuinely complex component merely because one small
+        // disk or band is among its many current surface patches.
+        if (partial_owner || owners.empty()) continue;
+        ++profile.convex_component_attempts;
+
+        // Convexification must grow from adjacent current primitives. A
+        // complete-component hull is a shortcut that bypasses the merge fixed
+        // point and is therefore not an admissible candidate.
+        continue;
+
+        // The bundled QuickHull implementation becomes quadratic on large,
+        // nearly coplanar CAD point clouds. Do not spend minutes constructing
+        // a global candidate when the already-recognized surface still has an
+        // industrial-scale workload: those candidates overwhelmingly fail the
+        // same directed-error audit and previously produced no output change.
+        // A coarse component whose current proxy is already small (for example
+        // a rail assembly) remains eligible regardless of source face count.
+        constexpr std::size_t maximum_dense_hull_component_faces = 20000;
+        constexpr std::size_t maximum_dense_hull_input_workload = 7000;
+        if (component.size() > maximum_dense_hull_component_faces &&
+            input_workload > maximum_dense_hull_input_workload)
+        {
+            ++profile.convex_workload_rejections;
+            convex_component_diagnostics
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"rejection\":\"dense_hull_cost\"}\n";
+            continue;
+        }
+
+        std::vector<Vec3> points;
+        for (const auto vertex : uniqueVertices(responsibility_mesh, component))
+            points.push_back(responsibility_mesh.vertices[vertex]);
+        auto hull = fitConvexHullSurface(
+            std::move(points), component, next_component_enclosure_group,
+            tolerance);
+        if (!hull)
+        {
+            ++profile.invalid_convex_components;
+            convex_component_diagnostics
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"rejection\":\"degenerate_hull\"}\n";
+            continue;
+        }
+        if (hull->faces.size() >= input_workload)
+        {
+            ++profile.convex_workload_rejections;
+            convex_component_diagnostics
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"hull_triangles\":" << hull->faces.size()
+                << ",\"rejection\":\"workload\"}\n";
+            continue;
+        }
+
+        const FilledSurfaceDistanceCertificate certificate =
+            certifyFilledSurfaceDistance(
+                distance_reference, hull->shell,
+                candidate_error_limit + tolerance);
+        bool accepted = certificate.certified && !certificate.exceeded;
+        double observed_error = certificate.observed_maximum;
+        if (!accepted && !certificate.exceeded)
+        {
+            observed_error = maximumFilledSurfaceDistance(
+                distance_reference, hull->shell, error_sample_spacing,
+                candidate_error_limit + tolerance);
+            accepted = observed_error <= candidate_error_limit + tolerance;
+        }
+
+        std::vector<ConvexHullSurface> accepted_hulls;
+        std::vector<OutputPrimitive> accepted_outer_surface;
+        bool used_partition = false;
+        if (accepted)
+        {
+            accepted_outer_surface = hull->shell;
+            accepted_hulls.push_back(std::move(*hull));
+        }
+        else
+        {
+            ++profile.convex_error_rejections;
+            convex_component_diagnostics << std::setprecision(17)
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"whole_hull_triangles\":" << hull->faces.size()
+                << ",\"whole_hull_observed_distance\":"
+                << observed_error
+                << ",\"limit\":" << candidate_error_limit
+                << ",\"rejection\":\"maximum_error\"}\n";
+            continue;
+        }
+
+        std::unordered_set<std::size_t> owner_set(
+            owners.begin(), owners.end());
+        std::vector<std::size_t> enclosed_generated_primitives;
+        bool intersects_unowned = false;
+        for (std::size_t index = 0; index < primitives.size(); ++index)
+        {
+            if (consumed_primitives[index] || owner_set.contains(index))
+                continue;
+            bool intrudes = false;
+            for (const auto& accepted_hull : accepted_hulls)
+                if (primitiveIntrudesConvexHull(
+                        accepted_hull, primitives[index], tolerance * 8.0))
+                {
+                    intrudes = true;
+                    break;
+                }
+            if (!intrudes) continue;
+            if (primitives[index].source_faces.empty())
+            {
+                enclosed_generated_primitives.push_back(index);
+                continue;
+            }
+            intersects_unowned = true;
+            break;
+        }
+        if (intersects_unowned)
+        {
+            ++profile.convex_intersection_rejections;
+            convex_component_diagnostics
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"hull_parts\":" << accepted_hulls.size()
+                << ",\"rejection\":\"unowned_intersection\"}\n";
+            continue;
+        }
+        for (const auto owner : owners)
+            consumed_primitives[owner] = true;
+        for (const auto enclosed : enclosed_generated_primitives)
+            consumed_primitives[enclosed] = true;
+        const std::size_t accepted_triangle_count =
+            triangulatedFaceCount(accepted_outer_surface);
+        if (used_partition)
+        {
+            for (const auto& accepted_hull : accepted_hulls)
+                convex_enclosure_certificates.insert(
+                    convex_enclosure_certificates.end(),
+                    accepted_hull.shell.begin(), accepted_hull.shell.end());
+            // The clipped union is generally non-convex, so its triangles must
+            // not share a convex enclosure id. The complete per-part hulls
+            // above remain the conservative offline coverage certificates.
+            for (auto& surface : accepted_outer_surface)
+                surface.enclosure_group = 0;
+        }
+        component_replacements.insert(
+            component_replacements.end(),
+            std::make_move_iterator(accepted_outer_surface.begin()),
+            std::make_move_iterator(accepted_outer_surface.end()));
+        next_component_enclosure_group += accepted_hulls.size();
+        ++profile.accepted_convex_components;
+        if (used_partition)
+            ++profile.accepted_convex_partition_components;
+        merged_group_count += owners.size() - 1;
+        if (!used_partition)
+            convex_component_diagnostics << std::setprecision(17)
+                << "{\"component_faces\":" << component.size()
+                << ",\"input_triangles\":" << input_workload
+                << ",\"hull_triangles\":" << accepted_triangle_count
+                << ",\"observed_distance\":" << observed_error
+                << ",\"limit\":" << candidate_error_limit
+                << ",\"accepted\":true}\n";
+    }
     if (!component_replacements.empty())
     {
         std::vector<OutputPrimitive> replaced;
@@ -7974,12 +9290,26 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     {
         Group group;
         group.responsibility = primitive.source_faces;
+        for (const auto face : group.responsibility)
+            if (face < responsibility_mesh.faces.size())
+                group.source_vertices.insert(
+                    group.source_vertices.end(),
+                    responsibility_mesh.faces[face].begin(),
+                    responsibility_mesh.faces[face].end());
+        std::sort(group.source_vertices.begin(), group.source_vertices.end());
+        group.source_vertices.erase(
+            std::unique(group.source_vertices.begin(),
+                        group.source_vertices.end()),
+            group.source_vertices.end());
         group.bounds = primitiveBounds(primitive.primitive);
         group.contains_round_surface =
             isCertifiedRoundSurfaceKind(primitive.primitive.kind);
         group.triangle_workload =
             triangulatePrimitive(primitive.primitive).faces.size();
         group.shell.push_back(std::move(primitive));
+        group.intrusion_surfaces.push_back({
+            triangulatePrimitive(group.shell.front().primitive),
+            group.bounds});
         groups.push_back(std::move(group));
     }
     const auto connect = [&](const std::size_t first, const std::size_t second)
@@ -8078,11 +9408,49 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         profile.initial_adjacencies += group.neighbors.size();
     profile.initial_adjacencies /= 2;
 
+    using GroupBoundsIndex = std::multimap<double, std::size_t>;
+    GroupBoundsIndex group_bounds_index;
+    std::vector<GroupBoundsIndex::iterator> group_bounds_entries;
+    group_bounds_entries.reserve(groups.size());
+    for (std::size_t group = 0; group < groups.size(); ++group)
+        group_bounds_entries.push_back(group_bounds_index.emplace(
+            groups[group].bounds.lower.x(), group));
+
+    struct FaceVertexKey
+    {
+        std::uint64_t x = 0;
+        std::uint64_t y = 0;
+        std::uint64_t z = 0;
+        bool operator==(const FaceVertexKey&) const = default;
+    };
+    struct ConvexFaceKey
+    {
+        std::array<FaceVertexKey, 3> vertices{};
+        bool operator==(const ConvexFaceKey&) const = default;
+    };
+    struct ConvexFaceKeyHash
+    {
+        std::size_t operator()(const ConvexFaceKey& key) const noexcept
+        {
+            std::size_t seed = 0;
+            for (const auto& vertex : key.vertices)
+                for (const auto coordinate : {vertex.x, vertex.y, vertex.z})
+                    seed ^= std::hash<std::uint64_t>{}(coordinate) +
+                        0x9e3779b97f4a7c15ULL +
+                        (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    std::unordered_map<ConvexFaceKey, bool, ConvexFaceKeyHash>
+        convex_face_error_cache;
+    convex_face_error_cache.reserve(16384);
+
     const std::function<std::optional<FitResult>(std::size_t, std::size_t)>
         fitPair = [&](std::size_t first, std::size_t second)
         -> std::optional<FitResult>
     {
         ++profile.candidate_evaluations;
+        flushProfile();
         if (first > second) std::swap(first, second);
         const auto candidatePassesError =
             [&](const std::vector<OutputPrimitive>& candidate)
@@ -8107,21 +9475,108 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 std::chrono::steady_clock::now() - fine_started).count();
             return accepted;
         };
+        const auto convexFaceKey = [&](const OutputPrimitive& face)
+            -> std::optional<ConvexFaceKey>
+        {
+            const PrimitiveMesh surface =
+                triangulatePrimitive(face.primitive);
+            if (surface.faces.size() != 1 || surface.vertices.size() != 3)
+                return std::nullopt;
+            ConvexFaceKey key;
+            for (std::size_t index = 0; index < 3; ++index)
+            {
+                const Vec3& vertex = surface.vertices[index];
+                const auto bits = [](const double value)
+                {
+                    return std::bit_cast<std::uint64_t>(
+                        value == 0.0 ? 0.0 : value);
+                };
+                key.vertices[index] = {
+                    bits(vertex.x()), bits(vertex.y()), bits(vertex.z())};
+            }
+            std::sort(key.vertices.begin(), key.vertices.end(),
+                [](const FaceVertexKey& left, const FaceVertexKey& right)
+                {
+                    if (left.x != right.x) return left.x < right.x;
+                    if (left.y != right.y) return left.y < right.y;
+                    return left.z < right.z;
+                });
+            return key;
+        };
+        const auto convexCandidatePassesError =
+            [&](const std::vector<OutputPrimitive>& candidate)
+        {
+            for (const auto& face : candidate)
+            {
+                const auto key = convexFaceKey(face);
+                if (!key)
+                {
+                    if (!candidatePassesError({face})) return false;
+                    continue;
+                }
+                const auto cached = convex_face_error_cache.find(*key);
+                if (cached != convex_face_error_cache.end())
+                {
+                    ++profile.convex_face_cache_hits;
+                    if (!cached->second) return false;
+                    continue;
+                }
+                // A triangle's vertices and centroid are exact points on the
+                // proposed proxy. Any one of them exceeding the directed
+                // distance limit proves that the whole candidate fails. This
+                // cheap rejection pass never accepts a face; passing faces
+                // still go through the continuous certificate below.
+                ++profile.coarse_distance_evaluations;
+                const auto coarse_started = std::chrono::steady_clock::now();
+                const bool coarse_accepted = maximumFilledSurfaceDistance(
+                    distance_reference, {face},
+                    std::numeric_limits<double>::infinity(),
+                    candidate_error_limit + tolerance) <=
+                    candidate_error_limit + tolerance;
+                const double coarse_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - coarse_started).count();
+                profile.coarse_distance_seconds += coarse_seconds;
+                profile.distance_seconds += coarse_seconds;
+                if (!coarse_accepted)
+                {
+                    ++profile.coarse_distance_rejections;
+                    if (convex_face_error_cache.size() >= 500000)
+                        convex_face_error_cache.clear();
+                    convex_face_error_cache.emplace(*key, false);
+                    return false;
+                }
+                const bool accepted = candidatePassesError({face});
+                if (convex_face_error_cache.size() >= 500000)
+                    convex_face_error_cache.clear();
+                convex_face_error_cache.emplace(*key, accepted);
+                if (!accepted) return false;
+            }
+            return true;
+        };
 
-        const std::vector<std::size_t> consumed{first, second};
+        std::vector<std::size_t> consumed{first, second};
         std::vector<std::uint32_t> responsibility;
+        std::vector<std::uint32_t> source_vertices;
         std::size_t input_triangle_workload = 0;
         for (const auto group : consumed)
         {
             responsibility.insert(
                 responsibility.end(), groups[group].responsibility.begin(),
                 groups[group].responsibility.end());
+            source_vertices.insert(
+                source_vertices.end(),
+                groups[group].source_vertices.begin(),
+                groups[group].source_vertices.end());
             input_triangle_workload += groups[group].triangle_workload;
         }
         std::sort(responsibility.begin(), responsibility.end());
         responsibility.erase(
             std::unique(responsibility.begin(), responsibility.end()),
             responsibility.end());
+        std::sort(source_vertices.begin(), source_vertices.end());
+        source_vertices.erase(
+            std::unique(source_vertices.begin(), source_vertices.end()),
+            source_vertices.end());
 
         // Non-coplanar stage-3 candidates must be certified analytic
         // surfaces. An arbitrary 3-D convex hull is a solid fallback, not a
@@ -8155,6 +9610,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 FitResult result;
                 result.shell = std::move(round_candidate);
                 result.responsibility = std::move(responsibility);
+                result.source_vertices = std::move(source_vertices);
                 result.bounds = bounds;
                 result.contains_round_surface = true;
                 result.triangle_workload = round_workload;
@@ -8162,27 +9618,141 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 return result;
             }
         }
+
+        if (groups[first].contains_round_surface ||
+            groups[second].contains_round_surface)
+        {
+            ++profile.degenerate_rejections;
+            return std::nullopt;
+        }
+
+        // Grow a convex candidate only from an adjacent pair. If the fitted
+        // volume intrudes another active surface, absorb that owner and refit
+        // before acceptance; emitting both shells would leave internal or
+        // intersecting faces for PQSS to traverse.
+        std::unordered_set<std::size_t> consumed_set(consumed.begin(),
+                                                      consumed.end());
+        std::optional<ConvexHullSurface> convex_candidate;
+        for (;;)
+        {
+            ++profile.convex_growth_iterations;
+            responsibility.clear();
+            source_vertices.clear();
+            input_triangle_workload = 0;
+            std::vector<Vec3> points;
+            for (const auto group : consumed)
+            {
+                responsibility.insert(
+                    responsibility.end(), groups[group].responsibility.begin(),
+                    groups[group].responsibility.end());
+                source_vertices.insert(
+                    source_vertices.end(),
+                    groups[group].source_vertices.begin(),
+                    groups[group].source_vertices.end());
+                input_triangle_workload += groups[group].triangle_workload;
+                for (const auto& surface : groups[group].intrusion_surfaces)
+                    points.insert(points.end(), surface.mesh.vertices.begin(),
+                                  surface.mesh.vertices.end());
+            }
+            std::sort(responsibility.begin(), responsibility.end());
+            responsibility.erase(
+                std::unique(responsibility.begin(), responsibility.end()),
+                responsibility.end());
+            std::sort(source_vertices.begin(), source_vertices.end());
+            source_vertices.erase(
+                std::unique(source_vertices.begin(), source_vertices.end()),
+                source_vertices.end());
+            for (const auto vertex : source_vertices)
+                points.push_back(responsibility_mesh.vertices[vertex]);
+            ++profile.convex_hull_fits;
+            const auto hull_started = std::chrono::steady_clock::now();
+            convex_candidate = fitConvexHullSurface(
+                std::move(points), responsibility,
+                next_component_enclosure_group, tolerance);
+            profile.convex_hull_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - hull_started).count();
+            if (!convex_candidate)
+            {
+                ++profile.degenerate_rejections;
+                return std::nullopt;
+            }
+            if (!convexCandidatePassesError(convex_candidate->shell))
+            {
+                ++profile.error_rejections;
+                return std::nullopt;
+            }
+
+            bool expanded = false;
+            const auto intrusion_scan_started =
+                std::chrono::steady_clock::now();
+            const auto broad_phase_end = group_bounds_index.upper_bound(
+                convex_candidate->bounds.upper.x() + tolerance * 8.0);
+            for (auto broad_phase = group_bounds_index.begin();
+                 broad_phase != broad_phase_end; ++broad_phase)
+            {
+                const std::size_t group = broad_phase->second;
+                if (!groups[group].active || consumed_set.contains(group) ||
+                    !convexBoundsOverlap(
+                        convex_candidate->bounds, groups[group].bounds,
+                        tolerance * 8.0))
+                    continue;
+                bool intrudes = false;
+                for (const auto& surface : groups[group].intrusion_surfaces)
+                {
+                    ++profile.intrusion_tests;
+                    bool halfspace_rejected = false;
+                    intrudes = meshIntrudesConvexHull(
+                        *convex_candidate, surface.mesh, surface.bounds,
+                        tolerance * 8.0, &halfspace_rejected);
+                    if (halfspace_rejected)
+                        ++profile.intrusion_halfspace_rejections;
+                    if (intrudes) break;
+                }
+                if (!intrudes) continue;
+                consumed_set.insert(group);
+                consumed.push_back(group);
+                expanded = true;
+            }
+            profile.intrusion_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                intrusion_scan_started).count();
+            if (!expanded) break;
+        }
+        const std::size_t convex_workload =
+            triangulatedFaceCount(convex_candidate->shell);
+        FitResult convex_result;
+        convex_result.shell = std::move(convex_candidate->shell);
+        convex_result.responsibility = std::move(responsibility);
+        convex_result.source_vertices = std::move(source_vertices);
+        convex_result.bounds = convex_candidate->bounds;
+        convex_result.contains_round_surface = false;
+        convex_result.triangle_workload = convex_workload;
+        convex_result.consumed_groups = std::move(consumed);
+        return convex_result;
+
         ++profile.degenerate_rejections;
         return std::nullopt;
     };
 
-    std::queue<Candidate> queue;
+    std::priority_queue<
+        Candidate, std::vector<Candidate>, CandidateCompare> queue;
     const auto enqueue = [&](std::size_t first, std::size_t second)
     {
         if (first > second) std::swap(first, second);
         if (!groups[first].active || !groups[second].active ||
             !groups[first].neighbors.contains(second)) return;
-        queue.push({first, second, groups[first].version, groups[second].version});
+        queue.push({first, second, groups[first].version,
+                    groups[second].version,
+                    groups[first].triangle_workload +
+                        groups[second].triangle_workload});
     };
-    constexpr std::size_t maximum_pairwise_group_count = 512;
-    if (groups.size() <= maximum_pairwise_group_count)
-        for (std::size_t first = 0; first < groups.size(); ++first)
-            for (const auto second : groups[first].neighbors)
-                if (first < second) enqueue(first, second);
+    for (std::size_t first = 0; first < groups.size(); ++first)
+        for (const auto second : groups[first].neighbors)
+            if (first < second) enqueue(first, second);
 
     while (!queue.empty())
     {
-        const Candidate pair = queue.front();
+        const Candidate pair = queue.top();
         queue.pop();
         if (!groups[pair.first].active || !groups[pair.second].active ||
             groups[pair.first].version != pair.first_version ||
@@ -8191,6 +9761,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             continue;
         auto candidate = fitPair(pair.first, pair.second);
         if (!candidate) continue;
+        const bool accepted_convex_enclosure = std::any_of(
+            candidate->shell.begin(), candidate->shell.end(),
+            [&](const OutputPrimitive& item)
+            { return item.enclosure_group == next_component_enclosure_group; });
 
         std::vector<std::size_t> affected;
         for (const auto consumed : candidate->consumed_groups)
@@ -8198,17 +9772,30 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                             groups[consumed].neighbors.end());
         std::sort(affected.begin(), affected.end());
         affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+        group_bounds_index.erase(group_bounds_entries[pair.first]);
         groups[pair.first].shell = std::move(candidate->shell);
+        groups[pair.first].intrusion_surfaces.clear();
+        groups[pair.first].intrusion_surfaces.reserve(
+            groups[pair.first].shell.size());
+        for (const auto& surface : groups[pair.first].shell)
+            groups[pair.first].intrusion_surfaces.push_back({
+                triangulatePrimitive(surface.primitive),
+                primitiveBounds(surface.primitive)});
         groups[pair.first].responsibility = std::move(candidate->responsibility);
+        groups[pair.first].source_vertices =
+            std::move(candidate->source_vertices);
         groups[pair.first].bounds = candidate->bounds;
         groups[pair.first].contains_round_surface =
             candidate->contains_round_surface;
         groups[pair.first].triangle_workload = candidate->triangle_workload;
+        group_bounds_entries[pair.first] = group_bounds_index.emplace(
+            groups[pair.first].bounds.lower.x(), pair.first);
         groups[pair.first].neighbors.clear();
         ++groups[pair.first].version;
         for (const auto consumed : candidate->consumed_groups)
             if (consumed != pair.first)
             {
+                group_bounds_index.erase(group_bounds_entries[consumed]);
                 groups[consumed].active = false;
                 ++groups[consumed].version;
             }
@@ -8223,6 +9810,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             if (consumed != pair.first) groups[consumed].neighbors.clear();
         merged_group_count += candidate->consumed_groups.size() - 1;
         ++profile.accepted_groups;
+        if (accepted_convex_enclosure)
+            ++next_component_enclosure_group;
         for (const auto neighbor : groups[pair.first].neighbors)
             enqueue(pair.first, neighbor);
     }
@@ -8236,7 +9825,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     std::ofstream stream(profile_path);
     stream << std::setprecision(17)
            << "{\"complete\":true"
-           << ",\"strategy\":\"certified_analytic_surface_fixed_point\""
+           << ",\"strategy\":\"certified_component_envelope_fixed_point\""
            << ",\"input_primitives\":" << profile.input_primitives
            << ",\"initial_adjacencies\":" << profile.initial_adjacencies
            << ",\"candidate_evaluations\":" << profile.candidate_evaluations
@@ -8251,12 +9840,42 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.conservative_round_component_attempts
            << ",\"accepted_conservative_round_components\":"
            << profile.accepted_conservative_round_components
+           << ",\"convex_component_attempts\":"
+           << profile.convex_component_attempts
+           << ",\"accepted_convex_components\":"
+           << profile.accepted_convex_components
+           << ",\"accepted_convex_partition_components\":"
+           << profile.accepted_convex_partition_components
+           << ",\"invalid_convex_components\":"
+           << profile.invalid_convex_components
+           << ",\"convex_workload_rejections\":"
+           << profile.convex_workload_rejections
+           << ",\"convex_error_rejections\":"
+           << profile.convex_error_rejections
+           << ",\"convex_intersection_rejections\":"
+           << profile.convex_intersection_rejections
            << ",\"pairwise_enabled\":"
-           << (groups.size() <= maximum_pairwise_group_count ? "true" : "false")
+           << "true"
            << ",\"accepted_groups\":" << profile.accepted_groups
+           << ",\"coarse_distance_evaluations\":"
+           << profile.coarse_distance_evaluations
+           << ",\"coarse_distance_rejections\":"
+           << profile.coarse_distance_rejections
+           << ",\"convex_face_cache_hits\":"
+           << profile.convex_face_cache_hits
+           << ",\"convex_hull_fits\":" << profile.convex_hull_fits
+           << ",\"convex_growth_iterations\":"
+           << profile.convex_growth_iterations
+           << ",\"intrusion_tests\":" << profile.intrusion_tests
+           << ",\"intrusion_halfspace_rejections\":"
+           << profile.intrusion_halfspace_rejections
            << ",\"certificate_samples\":" << profile.certificate_samples
            << ",\"fine_distance_evaluations\":"
            << profile.fine_distance_evaluations
+           << ",\"coarse_distance_seconds\":"
+           << profile.coarse_distance_seconds
+           << ",\"convex_hull_seconds\":" << profile.convex_hull_seconds
+           << ",\"intrusion_seconds\":" << profile.intrusion_seconds
            << ",\"distance_seconds\":" << profile.distance_seconds
            << ",\"output_primitives\":" << result.size()
            << ",\"output_triangles\":" << triangulatedFaceCount(result)
@@ -9430,7 +11049,8 @@ FinalCoverageAudit auditFinalConservativeCoverage(
         if (Clipper2Lib::Area(source_path) < 0.0)
             std::reverse(source_path.begin(), source_path.end());
 
-        const auto coveredByPlanarPrimitives = [&](const std::vector<std::size_t>& candidates)
+        const auto coveredByPlanarPrimitives = [&](
+            const std::vector<std::size_t>& candidates)
         {
             Clipper2Lib::PathsD cover_paths;
             for (const std::size_t index : candidates)
@@ -9438,8 +11058,9 @@ FinalCoverageAudit auditFinalConservativeCoverage(
                 Vec3 candidate_normal;
                 if (!planarNormal(primitives[index].primitive, tolerance,
                                   candidate_normal) ||
-                    std::abs(candidate_normal.dot(normal)) < 1.0 - 1.0e-8 ||
-                    std::abs((planarPoint(primitives[index].primitive) -
+                    std::abs(candidate_normal.dot(normal)) < 1.0 - 1.0e-8)
+                    continue;
+                if (std::abs((planarPoint(primitives[index].primitive) -
                               triangle[0]).dot(normal)) > tolerance)
                     continue;
                 const PrimitiveMesh mesh = triangulatePrimitive(
@@ -9565,6 +11186,322 @@ FinalCoverageAudit auditFinalConservativeCoverage(
         }
     }
     return audit;
+}
+
+std::vector<OutputPrimitive> buildNonOverlappingPlanarCoverageRepair(
+    const Mesh& source_mesh,
+    const std::vector<OutputPrimitive>& retained,
+    const std::vector<std::uint32_t>& failed_face_ids,
+    const double tolerance,
+    std::size_t& merged_plane_groups)
+{
+    merged_plane_groups = 0;
+    constexpr int clipper_precision = 8;
+    struct PlaneKey
+    {
+        std::array<std::int64_t, 4> values{};
+        bool operator<(const PlaneKey& other) const
+        {
+            return values < other.values;
+        }
+    };
+    struct PlaneGroup
+    {
+        Vec3 normal = Vec3::Zero();
+        Vec3 origin = Vec3::Zero();
+        Mat3 frame = Mat3::Identity();
+        std::vector<std::uint32_t> faces;
+        Clipper2Lib::PathsD source_paths;
+    };
+    const double angular_quantum = 1.0e-8;
+    const double distance_quantum = std::max(tolerance, 1.0e-12);
+    const auto canonicalNormal = [](Vec3 normal)
+    {
+        int dominant = 0;
+        for (int axis = 1; axis < 3; ++axis)
+            if (std::abs(normal[axis]) > std::abs(normal[dominant]))
+                dominant = axis;
+        if (normal[dominant] < 0.0) normal *= -1.0;
+        return normal;
+    };
+    const auto planeKey = [&](const Vec3& normal, const Vec3& point)
+    {
+        PlaneKey key;
+        for (int axis = 0; axis < 3; ++axis)
+            key.values[axis] = static_cast<std::int64_t>(
+                std::llround(normal[axis] / angular_quantum));
+        key.values[3] = static_cast<std::int64_t>(
+            std::llround(normal.dot(point) / distance_quantum));
+        return key;
+    };
+
+    std::map<PlaneKey, PlaneGroup> groups;
+    for (const auto face_id : failed_face_ids)
+    {
+        if (face_id >= source_mesh.faces.size()) continue;
+        const Face& face = source_mesh.faces[face_id];
+        const std::array<Vec3, 3> triangle{
+            source_mesh.vertices[face[0]],
+            source_mesh.vertices[face[1]],
+            source_mesh.vertices[face[2]]};
+        Vec3 normal = (triangle[1] - triangle[0]).cross(
+            triangle[2] - triangle[0]);
+        if (normal.norm() <= tolerance * tolerance) continue;
+        normal = canonicalNormal(normal.normalized());
+        const PlaneKey key = planeKey(normal, triangle[0]);
+        auto [iterator, inserted] = groups.try_emplace(key);
+        PlaneGroup& group = iterator->second;
+        if (inserted)
+        {
+            group.normal = normal;
+            group.origin = triangle[0];
+            const Mat3 basis = orthonormalFrame(normal);
+            group.frame.col(0) = basis.col(1);
+            group.frame.col(1) = basis.col(2);
+            group.frame.col(2) = normal;
+        }
+        Clipper2Lib::PathD path;
+        for (const Vec3& vertex : triangle)
+        {
+            const Vec3 local =
+                group.frame.transposeMultiply(vertex - group.origin);
+            path.emplace_back(local.x(), local.y());
+        }
+        if (Clipper2Lib::Area(path) < 0.0)
+            std::reverse(path.begin(), path.end());
+        if (std::abs(Clipper2Lib::Area(path)) <= tolerance * tolerance)
+            continue;
+        group.faces.push_back(face_id);
+        group.source_paths.push_back(std::move(path));
+    }
+
+    struct PlanarRetained
+    {
+        Vec3 normal = Vec3::Zero();
+        Vec3 point = Vec3::Zero();
+        PrimitiveMesh mesh;
+    };
+    std::vector<PlanarRetained> planar_retained;
+    planar_retained.reserve(retained.size());
+    for (const OutputPrimitive& item : retained)
+    {
+        Vec3 normal;
+        if (!planarNormal(item.primitive, tolerance, normal)) continue;
+        normal = canonicalNormal(normal);
+        PrimitiveMesh mesh = triangulatePrimitive(item.primitive);
+        if (mesh.faces.empty()) continue;
+        planar_retained.push_back(
+            {normal, planarPoint(item.primitive), std::move(mesh)});
+    }
+
+    std::vector<OutputPrimitive> result;
+    const auto appendExactFallback = [&](const PlaneGroup& group)
+    {
+        for (const auto face_id : group.faces)
+        {
+            const Face& face = source_mesh.faces[face_id];
+            Primitive triangle;
+            triangle.kind = Kind::Triangle;
+            for (int corner = 0; corner < 3; ++corner)
+                triangle.triangle[corner] =
+                    source_mesh.vertices[face[corner]];
+            result.push_back({std::move(triangle), {face_id}});
+        }
+    };
+
+    for (const auto& [key, group] : groups)
+    {
+        (void)key;
+        if (group.source_paths.empty()) continue;
+        const Clipper2Lib::PathsD source_union = Clipper2Lib::Union(
+            group.source_paths, Clipper2Lib::FillRule::NonZero,
+            clipper_precision);
+        Clipper2Lib::PathsD cover_paths;
+        for (const PlanarRetained& candidate : planar_retained)
+        {
+            if (std::abs(candidate.normal.dot(group.normal)) <
+                    1.0 - 1.0e-8 ||
+                std::abs((candidate.point - group.origin).dot(group.normal)) >
+                    tolerance)
+                continue;
+            for (const Face& face : candidate.mesh.faces)
+            {
+                Clipper2Lib::PathD path;
+                for (const auto vertex : face)
+                {
+                    const Vec3 local = group.frame.transposeMultiply(
+                        candidate.mesh.vertices[vertex] - group.origin);
+                    path.emplace_back(local.x(), local.y());
+                }
+                const double area = Clipper2Lib::Area(path);
+                if (std::abs(area) <= tolerance * tolerance) continue;
+                if (area < 0.0) std::reverse(path.begin(), path.end());
+                cover_paths.push_back(std::move(path));
+            }
+        }
+        const Clipper2Lib::PathsD cover_union = cover_paths.empty()
+            ? Clipper2Lib::PathsD{}
+            : Clipper2Lib::Union(
+                cover_paths, Clipper2Lib::FillRule::NonZero,
+                clipper_precision);
+        Clipper2Lib::PathsD remaining = source_union;
+        if (!cover_union.empty())
+            remaining = Clipper2Lib::Difference(
+                source_union, cover_union,
+                Clipper2Lib::FillRule::NonZero, clipper_precision);
+        if (remaining.empty()) continue;
+
+        const auto appendPerFaceResidual = [&]()
+        {
+            for (std::size_t face_index = 0;
+                 face_index < group.faces.size(); ++face_index)
+            {
+                Clipper2Lib::PathsD residual{
+                    group.source_paths[face_index]};
+                if (!cover_union.empty())
+                    residual = Clipper2Lib::Difference(
+                        residual, cover_union,
+                        Clipper2Lib::FillRule::NonZero,
+                        clipper_precision);
+                if (residual.empty()) continue;
+                Clipper2Lib::PathsD paths = residual;
+                if (std::any_of(residual.begin(), residual.end(),
+                    [](const auto& path)
+                    { return !Clipper2Lib::IsPositive(path); }))
+                {
+                    Clipper2Lib::PathsD triangles;
+                    if (Clipper2Lib::Triangulate(
+                            residual, clipper_precision, triangles, false) !=
+                        Clipper2Lib::TriangulateResult::success)
+                    {
+                        PlaneGroup one_face = group;
+                        one_face.faces = {group.faces[face_index]};
+                        appendExactFallback(one_face);
+                        continue;
+                    }
+                    paths = std::move(triangles);
+                }
+                bool emitted = false;
+                for (const auto& path : paths)
+                {
+                    if (!Clipper2Lib::IsPositive(path) ||
+                        std::abs(Clipper2Lib::Area(path)) <=
+                            tolerance * tolerance)
+                        continue;
+                    std::vector<Vec2> boundary;
+                    for (const auto& point : path)
+                        boundary.emplace_back(point.x, point.y);
+                    boundary = simplifyPolygon(
+                        std::move(boundary), tolerance);
+                    if (boundary.size() < 3 ||
+                        !simplePolygon(boundary, tolerance) ||
+                        triangulatePolygon(boundary).size() + 2 !=
+                            boundary.size())
+                        continue;
+                    OutputPrimitive output;
+                    output.primitive = polygonPrimitive(
+                        boundary, group.origin, group.frame);
+                    output.source_faces = {group.faces[face_index]};
+                    result.push_back(std::move(output));
+                    emitted = true;
+                }
+                if (!emitted)
+                {
+                    PlaneGroup one_face = group;
+                    one_face.faces = {group.faces[face_index]};
+                    appendExactFallback(one_face);
+                }
+            }
+        };
+
+        Clipper2Lib::PathsD output_paths = remaining;
+        if (std::any_of(remaining.begin(), remaining.end(),
+            [](const auto& path) { return !Clipper2Lib::IsPositive(path); }))
+        {
+            Clipper2Lib::PathsD triangles;
+            if (Clipper2Lib::Triangulate(
+                    remaining, clipper_precision, triangles, false) !=
+                Clipper2Lib::TriangulateResult::success)
+            {
+                appendPerFaceResidual();
+                continue;
+            }
+            output_paths = std::move(triangles);
+        }
+
+        struct RepairPiece
+        {
+            OutputPrimitive output;
+            Bounds2 bounds;
+        };
+        std::vector<RepairPiece> pieces;
+        bool conversion_failed = false;
+        for (const auto& path : output_paths)
+        {
+            if (!Clipper2Lib::IsPositive(path) ||
+                std::abs(Clipper2Lib::Area(path)) <=
+                    tolerance * tolerance)
+                continue;
+            std::vector<Vec2> boundary;
+            Bounds2 bounds;
+            boundary.reserve(path.size());
+            for (const auto& point : path)
+            {
+                const Vec2 value(point.x, point.y);
+                boundary.push_back(value);
+                bounds.lower = bounds.lower.cwiseMin(value);
+                bounds.upper = bounds.upper.cwiseMax(value);
+            }
+            boundary = simplifyPolygon(std::move(boundary), tolerance);
+            if (boundary.size() < 3 || !simplePolygon(boundary, tolerance) ||
+                triangulatePolygon(boundary).size() + 2 != boundary.size())
+            {
+                conversion_failed = true;
+                break;
+            }
+            OutputPrimitive output;
+            output.primitive = polygonPrimitive(
+                boundary, group.origin, group.frame);
+            pieces.push_back({std::move(output), bounds});
+        }
+        if (conversion_failed || pieces.empty())
+        {
+            appendPerFaceResidual();
+            continue;
+        }
+
+        for (const auto face_id : group.faces)
+        {
+            Bounds2 face_bounds;
+            for (const auto vertex : source_mesh.faces[face_id])
+            {
+                const Vec3 local = group.frame.transposeMultiply(
+                    source_mesh.vertices[vertex] - group.origin);
+                face_bounds.lower = face_bounds.lower.cwiseMin(
+                    {local.x(), local.y()});
+                face_bounds.upper = face_bounds.upper.cwiseMax(
+                    {local.x(), local.y()});
+            }
+            for (RepairPiece& piece : pieces)
+                if (!(piece.bounds.upper.x() + tolerance <
+                          face_bounds.lower.x() ||
+                      face_bounds.upper.x() + tolerance <
+                          piece.bounds.lower.x() ||
+                      piece.bounds.upper.y() + tolerance <
+                          face_bounds.lower.y() ||
+                      face_bounds.upper.y() + tolerance <
+                          piece.bounds.lower.y()))
+                    piece.output.source_faces.push_back(face_id);
+        }
+        for (RepairPiece& piece : pieces)
+        {
+            if (piece.output.source_faces.empty())
+                piece.output.source_faces = group.faces;
+            result.push_back(std::move(piece.output));
+        }
+        if (pieces.size() < group.faces.size()) ++merged_plane_groups;
+    }
+    return result;
 }
 
 std::vector<OutputPrimitive> removeRedundantEnclosureGroupsByUnionCoverage(
@@ -10410,6 +12347,25 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
     const std::vector<OutputPrimitive>& output,
     const double maximum_distance)
 {
+    struct DistancePointKey
+    {
+        std::uint64_t x = 0;
+        std::uint64_t y = 0;
+        std::uint64_t z = 0;
+        bool operator==(const DistancePointKey&) const = default;
+    };
+    struct DistancePointKeyHash
+    {
+        std::size_t operator()(const DistancePointKey& key) const noexcept
+        {
+            std::size_t seed = std::hash<std::uint64_t>{}(key.x);
+            seed ^= std::hash<std::uint64_t>{}(key.y) +
+                0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            seed ^= std::hash<std::uint64_t>{}(key.z) +
+                0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
     struct CachedReference
     {
         const Vec3* vertices = nullptr;
@@ -10417,6 +12373,8 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
         std::size_t vertex_count = 0;
         std::size_t face_count = 0;
         std::unique_ptr<SourceTriangleBvh> reference;
+        std::unordered_map<DistancePointKey, double, DistancePointKeyHash>
+            point_distances;
     };
     static thread_local CachedReference cache;
     if (cache.vertices != filled_surface_mesh.vertices.data() ||
@@ -10430,6 +12388,8 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
         cache.face_count = filled_surface_mesh.faces.size();
         cache.reference = std::make_unique<SourceTriangleBvh>(
             filled_surface_mesh);
+        cache.point_distances.clear();
+        cache.point_distances.reserve(65536);
     }
 
     FilledSurfaceDistanceCertificate result;
@@ -10446,8 +12406,25 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
     const auto distanceAt = [&](const Vec3& point)
     {
         ++result.samples;
-        const Vec3 closest = cache.reference->closestPoint(point).point;
-        const double distance = (closest - point).norm();
+        const auto bits = [](const double value)
+        {
+            return std::bit_cast<std::uint64_t>(
+                value == 0.0 ? 0.0 : value);
+        };
+        const DistancePointKey key{
+            bits(point.x()), bits(point.y()), bits(point.z())};
+        double distance = 0.0;
+        const auto cached_distance = cache.point_distances.find(key);
+        if (cached_distance != cache.point_distances.end())
+            distance = cached_distance->second;
+        else
+        {
+            const Vec3 closest = cache.reference->closestPoint(point).point;
+            distance = (closest - point).norm();
+            if (cache.point_distances.size() >= 1000000)
+                cache.point_distances.clear();
+            cache.point_distances.emplace(key, distance);
+        }
         result.observed_maximum = std::max(
             result.observed_maximum, distance);
         if (distance > maximum_distance) result.exceeded = true;
@@ -15984,12 +17961,14 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         output_directory / "surface_merge_profile.json");
     requireSurfaceCandidates(output, "phase 3 surface merging");
     std::size_t adjacent_envelope_group_merges = 0;
+    std::vector<OutputPrimitive> convex_enclosure_certificates;
     output = mergeAdjacentEnvelopeGroups(
         mesh, filled_surface_mesh, std::move(output), effective_options,
         merge_tolerance,
         maximum_open_error_distance,
         std::max(diagonal / 192.0, 1.0e-30),
         adjacent_envelope_group_merges,
+        convex_enclosure_certificates,
         output_directory / "adjacent_envelope_group_profile.json");
     stats.merged_spatial_primitive_groups += adjacent_envelope_group_merges;
     // Boolean clipping may leave a zero-area loop that carries duplicate or
@@ -16023,6 +18002,10 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         coverage_certificate_primitives.end(),
         std::make_move_iterator(occluded_support_certificates.begin()),
         std::make_move_iterator(occluded_support_certificates.end()));
+    coverage_certificate_primitives.insert(
+        coverage_certificate_primitives.end(),
+        std::make_move_iterator(convex_enclosure_certificates.begin()),
+        std::make_move_iterator(convex_enclosure_certificates.end()));
 
     // Remove inner parallel layers from the same current surface set before
     // any of their outer coverers are discarded.  Coverage is computed from
@@ -16337,26 +18320,50 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::size_t repair_output_primitives = 0;
     std::size_t repair_output_triangles = 0;
     std::unordered_set<std::uint32_t> repaired_face_set;
+    std::unordered_set<std::uint32_t> exact_repaired_face_set;
+    std::size_t repair_pass = 0;
     while (!coverage.failed_face_ids.empty())
     {
-        std::vector<OutputPrimitive> repair_output;
-        repair_output.reserve(coverage.failed_face_ids.size());
+        std::vector<std::uint32_t> newly_failed_faces;
+        newly_failed_faces.reserve(coverage.failed_face_ids.size());
         for (const auto face_id : coverage.failed_face_ids)
         {
-            if (face_id >= mesh.faces.size() ||
-                !repaired_face_set.insert(face_id).second)
-                continue;
-            Primitive triangle;
-            triangle.kind = Kind::Triangle;
-            for (int corner = 0; corner < 3; ++corner)
-                triangle.triangle[corner] =
-                    mesh.vertices[mesh.faces[face_id][corner]];
-            repair_output.push_back({std::move(triangle), {face_id}});
+            if (face_id >= mesh.faces.size()) continue;
+            repaired_face_set.insert(face_id);
+            newly_failed_faces.push_back(face_id);
         }
+        std::size_t merged_groups = 0;
+        std::vector<OutputPrimitive> repair_output;
+        if (repair_pass++ == 0)
+        {
+            repair_output = buildNonOverlappingPlanarCoverageRepair(
+                mesh, output, newly_failed_faces, final_tolerance,
+                merged_groups);
+            repair_merged_groups += merged_groups;
+        }
+        else
+            for (const auto face_id : newly_failed_faces)
+            {
+                if (!exact_repaired_face_set.insert(face_id).second) continue;
+                const Face& face = mesh.faces[face_id];
+                Primitive triangle;
+                triangle.kind = Kind::Triangle;
+                for (int corner = 0; corner < 3; ++corner)
+                    triangle.triangle[corner] =
+                        mesh.vertices[face[corner]];
+                repair_output.push_back({std::move(triangle), {face_id}});
+            }
         if (repair_output.empty()) break;
-        // Coverage repair is exact surface fallback.  Do not turn failed source
-        // faces into a fitted box shell: that would reintroduce a solid candidate
-        // after the surface-only stage-3 search.
+        CoplanarCanonicalizationStats repair_coplanar_stats;
+        repair_output = canonicalizeCoplanarPrimitiveUnion(
+            mesh, std::move(repair_output), final_tolerance,
+            repair_coplanar_stats);
+        repair_merged_groups += repair_coplanar_stats.groups;
+        // Repair the union of failed coplanar source faces, subtracting the
+        // already retained exact-coplanar surface before emitting the residual.
+        // This is still an exact surface fallback, never a fitted box shell,
+        // but it avoids stacking every complete source triangle over a mostly
+        // covered proxy patch.
 
         std::uint64_t group_offset = 0;
         for (const auto& item : output)
@@ -16379,6 +18386,19 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
         output.insert(output.end(),
             std::make_move_iterator(repair_output.begin()),
             std::make_move_iterator(repair_output.end()));
+        // A union replacement can land in the neighboring quantized plane
+        // bucket of a component already visited in this pass. Iterate the
+        // canonicalizer to a fixed point so those numerically equivalent
+        // groups cannot survive as a second overlapping layer.
+        for (std::size_t pass = 0; pass < 8; ++pass)
+        {
+            CoplanarCanonicalizationStats post_repair_coplanar_stats;
+            output = canonicalizeCoplanarPrimitiveUnion(
+                mesh, std::move(output), final_tolerance,
+                post_repair_coplanar_stats);
+            repair_merged_groups += post_repair_coplanar_stats.groups;
+            if (post_repair_coplanar_stats.groups == 0) break;
+        }
         promoteToSemanticPrimitives(output);
         requireSurfaceCandidates(output, "coverage repair");
         coverage = auditFinalConservativeCoverage(

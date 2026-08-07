@@ -269,6 +269,44 @@ int main()
                     std::string::npos,
                 "metadata must use the phase-1 error reference");
 
+        // Hole filling may remove an inner boundary loop, but it must not turn
+        // an outer concavity into a free convex-hull rectangle before the
+        // Hausdorff-controlled merge stage.  This U-shaped planar patch has a
+        // rectangular convex hull and therefore catches that distinction.
+        const auto concave_patch = root / "concave_planar_patch.obj";
+        writeText(concave_patch,
+            "v 0 0 0\nv 3 0 0\nv 3 3 0\nv 2 3 0\n"
+            "v 2 1 0\nv 1 1 0\nv 1 3 0\nv 0 3 0\n"
+            "f 1 2 5\nf 1 5 6\nf 1 6 7\nf 1 7 8\n"
+            "f 2 3 4\nf 2 4 5\n");
+        const auto concave_stats = pqss_proxy_mesh::analyzePrimitiveMeshObj(
+            concave_patch, root / "concave_planar_patch", exact);
+        require(concave_stats.containment_validation_passed &&
+                    concave_stats.primitive_count == 1 &&
+                    concave_stats.proxy_triangles == 6,
+                "phase 1 must preserve a concave outer planar boundary");
+        require(readText(root / "concave_planar_patch" /
+                         "phase1_hole_filled.obj").find("_polygon") !=
+                    std::string::npos,
+                "a concave phase-1 patch must remain a polygon, not a rectangle hull");
+
+        // Partially overlapping coplanar source patches are one collision
+        // surface. Coverage repair and final canonicalization must emit their
+        // geometric union, not retain two stacked rectangles merely because
+        // they came from disconnected OBJ components.
+        const auto overlapping_patches = root / "overlapping_patches.obj";
+        writeText(overlapping_patches,
+            "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 0 1 0\n"
+            "v 1 0 0\nv 3 0 0\nv 3 1 0\nv 1 1 0\n"
+            "f 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\n");
+        const auto overlapping_stats =
+            pqss_proxy_mesh::analyzePrimitiveMeshObj(
+                overlapping_patches, root / "overlapping_patches", exact);
+        require(overlapping_stats.containment_validation_passed &&
+                    overlapping_stats.primitive_count == 1 &&
+                    overlapping_stats.proxy_triangles == 2,
+                "overlapping coplanar patches must become one non-overlapping union");
+
         // A complete analytic side surface is a surface primitive, not a solid
         // cylinder candidate.  Its outward circumscribed tessellation must pass
         // coverage directly without falling back to the source triangles.
@@ -338,8 +376,10 @@ int main()
                     strict_stats.merged_local_planar_primitives == 0,
                 "a merge beyond the directed Hausdorff limit must be rejected");
 
-        // Stage 3 contains surface candidates only.  A large error limit must
-        // not introduce a fitted box solid around a non-convex surface set.
+        // A complete connected component may compete as its conservative
+        // convex surface when the user error permits it.  This L extrusion is
+        // deliberately non-convex: the candidate must be the actual convex
+        // hull surface (seven polygons), not six faces of a fitted box.
         const auto spatial_group = root / "spatial_group.obj";
         writeText(spatial_group,
             "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 1 1 0\nv 1 3 0\nv 0 3 0\n"
@@ -357,15 +397,16 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
-                    group_loose_stats.primitive_count > 6 &&
-                    group_loose_stats.merged_spatial_primitive_groups == 0 &&
+                    group_loose_stats.primitive_count == 7 &&
+                    group_loose_stats.proxy_triangles == 16 &&
+                    group_loose_stats.merged_spatial_primitive_groups > 0 &&
                     group_loose_stats.merged_local_planar_primitives == 0,
-                "a loose error must not replace non-analytic adjacent surfaces with a solid envelope");
+                "a loose error must select the certified component hull surface");
         require(readText(root / "spatial_group_loose" /
                          "adjacent_envelope_group_profile.json").find(
-                    "\"strategy\":\"certified_analytic_surface_fixed_point\"") !=
+                    "\"accepted_groups\":0") ==
                     std::string::npos,
-                "non-coplanar adjacent merges must be limited to certified analytic surfaces");
+                "the convex hull must grow through accepted adjacent merges");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=
@@ -417,9 +458,9 @@ int main()
                     group_strict_stats.primitive_count > 6,
                 "exact error must also preserve the surface-only candidate set");
 
-        // A long, thin attachment can have low added area and low directed
-        // distance while still spanning a substantial fraction of the model.
-        // It must not become one oversized support-box shell.
+        // A long, thin attachment may merge into the adjacent body when the
+        // user-directed distance allows it. The result remains governed by
+        // conservative coverage and the same global error limit.
         const auto nonlocal_attachment = root / "nonlocal_attachment.obj";
         std::ostringstream nonlocal_attachment_obj;
         std::size_t next_vertex = 1;
@@ -436,8 +477,10 @@ int main()
                 nonlocal_attachment, root / "nonlocal_attachment_limited",
                 local_attachment_policy);
         require(local_attachment_stats.containment_validation_passed &&
-                    local_attachment_stats.merged_spatial_primitive_groups == 0,
-                "a nonlocal attachment must not become a support box shell");
+                    local_attachment_stats.open_max_distance <=
+                        local_attachment_policy.maximum_open_error_distance +
+                            1.0e-9,
+                "an accepted attachment merge must remain conservative and error-bounded");
 
         // Three equal closed components contain two independent narrow gaps.
         // Each gap is assessed against the model volume on its own.
