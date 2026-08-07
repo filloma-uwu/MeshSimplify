@@ -3023,7 +3023,8 @@ std::vector<std::vector<std::uint32_t>> approximatePlanarRegions(
         for (const auto index : domain.faces)
         {
             const double distance = domain.normal.dot(planes[index].centroid);
-            if (!plane_group.empty() && distance - previous_distance > distance_tolerance)
+            if (!plane_group.empty() &&
+                distance - previous_distance > distance_tolerance)
                 flush();
             plane_group.push_back(planes[index].id);
             previous_distance = distance;
@@ -4384,11 +4385,29 @@ double maximumFilledSurfaceDistance(
     double sample_spacing,
     double maximum_distance);
 
+// A bounded witness is used by the low-complexity support-envelope fitter.
+// Unlike the old convex-hull path, refinement is driven by the location where
+// the current proxy is farthest from the filled reference surface.
+struct FilledSurfaceDistanceWitness
+{
+    double maximum_distance = 0.0;
+    Vec3 proxy_point = Vec3::Zero();
+    Vec3 source_point = Vec3::Zero();
+};
+
+FilledSurfaceDistanceWitness measureFilledSurfaceDistanceWitness(
+    const Mesh& filled_surface_mesh,
+    const std::vector<OutputPrimitive>& output,
+    double sample_spacing,
+    double maximum_distance);
+
 struct FilledSurfaceDistanceCertificate
 {
     bool exceeded = false;
     bool certified = false;
     double observed_maximum = 0.0;
+    Vec3 maximum_proxy_point = Vec3::Zero();
+    Vec3 maximum_source_point = Vec3::Zero();
     std::size_t samples = 0;
 };
 
@@ -8071,6 +8090,491 @@ std::optional<ConvexHullSurface> fitConvexHullSurface(
     return result;
 }
 
+// Build a conservative, deliberately low-complexity envelope from support
+// planes.  Every plane has the form n.x <= max_source(n.x), so the resulting
+// intersection contains every responsibility vertex by construction.  The
+// plane set starts with an oriented box and is refined only when a measured
+// proxy-to-reference witness exceeds the user's error limit.  This is the
+// production replacement for feeding a dense point cloud to QuickHull.
+struct SupportEnvelopeFitProfile
+{
+    std::size_t calls = 0;
+    std::size_t dimensional_rejections = 0;
+    std::size_t construction_rejections = 0;
+    std::size_t inseparable_witness_rejections = 0;
+    std::size_t refinement_limit_rejections = 0;
+    std::size_t accepted = 0;
+};
+
+std::optional<ConvexHullSurface> fitSupportPlaneEnvelope(
+    const std::vector<Vec3>& points,
+    const std::vector<Vec3>& proposed_normals,
+    const std::vector<Vec3>& exclusion_points,
+    const std::vector<std::uint32_t>& responsibility,
+    const std::uint64_t enclosure_group,
+    const Mesh& distance_reference,
+    const double tolerance,
+    const double maximum_error,
+    const double sample_spacing,
+    SupportEnvelopeFitProfile* profile = nullptr)
+{
+    if (profile) ++profile->calls;
+    if (points.size() < 4)
+    {
+        if (profile) ++profile->dimensional_rejections;
+        return std::nullopt;
+    }
+
+    Mesh point_mesh;
+    point_mesh.vertices = points;
+    std::vector<std::uint32_t> point_ids(points.size());
+    std::iota(point_ids.begin(), point_ids.end(), 0);
+    const BoxFit box = fitBox(point_mesh, point_ids);
+    if (std::min({box.half_size.x(), box.half_size.y(), box.half_size.z()}) <=
+        tolerance * 8.0)
+    {
+        if (profile) ++profile->dimensional_rejections;
+        return std::nullopt;
+    }
+
+    struct Plane
+    {
+        Vec3 normal = Vec3::Zero();
+        double offset = 0.0;
+        bool mandatory = false;
+    };
+    std::vector<Plane> planes;
+    const auto addDirection = [&](std::vector<Plane>& target,
+                                  const Vec3& raw,
+                                  const bool mandatory)
+    {
+        const double norm = raw.norm();
+        if (norm <= 1.0e-12) return;
+        const Vec3 normal = raw / norm;
+        for (const auto& plane : target)
+            if (plane.normal.dot(normal) > 1.0 - 1.0e-8)
+                return;
+        double support = -std::numeric_limits<double>::infinity();
+        for (const Vec3& point : points)
+            support = std::max(support, normal.dot(point));
+        // The maximum source projection is already the exact containment
+        // certificate. An extra outward offset turns mere shared-boundary
+        // contact into strict intrusion and causes merges to flood through an
+        // otherwise valid surface partition.
+        target.push_back({normal, support, mandatory});
+    };
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        addDirection(planes, box.axes.col(axis), true);
+        addDirection(planes, -box.axes.col(axis), true);
+    }
+
+    std::vector<Vec3> directions;
+    directions.reserve(proposed_normals.size() + 16);
+    const auto addProposedDirection = [&](const Vec3& raw)
+    {
+        // A bounded angular dictionary is sufficient for an error-driven
+        // support envelope and prevents source tessellation density from
+        // becoming proxy complexity (or memory use) by another route.
+        if (directions.size() >= 1024) return;
+        const double norm = raw.norm();
+        if (norm <= 1.0e-12) return;
+        const Vec3 normal = raw / norm;
+        for (const auto& existing : directions)
+            if (existing.dot(normal) > 1.0 - 2.5e-3)
+                return;
+        directions.push_back(normal);
+    };
+    for (const Vec3& normal : proposed_normals)
+    {
+        addProposedDirection(normal);
+        addProposedDirection(-normal);
+    }
+
+    const auto intersect = [&](const Plane& first, const Plane& second,
+                               const Plane& third) -> std::optional<Vec3>
+    {
+        const Vec3 cross23 = second.normal.cross(third.normal);
+        const double determinant = first.normal.dot(cross23);
+        if (std::abs(determinant) <= 1.0e-12) return std::nullopt;
+        const Vec3 value =
+            cross23 * first.offset +
+            third.normal.cross(first.normal) * second.offset +
+            first.normal.cross(second.normal) * third.offset;
+        return value / determinant;
+    };
+    const auto makeEnvelope = [&](const std::vector<Plane>& current)
+        -> std::optional<ConvexHullSurface>
+    {
+        ConvexHullSurface result;
+        const double plane_tolerance = std::max(tolerance * 64.0, 1.0e-9);
+        for (std::size_t first = 0; first < current.size(); ++first)
+            for (std::size_t second = first + 1; second < current.size(); ++second)
+                for (std::size_t third = second + 1; third < current.size(); ++third)
+                {
+                    const auto point = intersect(
+                        current[first], current[second], current[third]);
+                    if (!point) continue;
+                    bool inside = true;
+                    for (const auto& plane : current)
+                        if (plane.normal.dot(*point) - plane.offset >
+                            plane_tolerance)
+                        {
+                            inside = false;
+                            break;
+                        }
+                    if (!inside) continue;
+                    bool duplicate = false;
+                    for (const Vec3& existing : result.vertices)
+                        if ((existing - *point).norm() <= plane_tolerance)
+                        {
+                            duplicate = true;
+                            break;
+                        }
+                    if (!duplicate) result.vertices.push_back(*point);
+                }
+        if (result.vertices.size() < 4) return std::nullopt;
+        for (const auto& plane : current)
+        {
+            std::vector<Vec3> face_vertices;
+            for (const Vec3& point : result.vertices)
+                if (std::abs(plane.normal.dot(point) - plane.offset) <=
+                    plane_tolerance * 4.0)
+                    face_vertices.push_back(point);
+            if (face_vertices.size() < 3) continue;
+            Vec3 center = Vec3::Zero();
+            for (const Vec3& point : face_vertices) center += point;
+            center /= static_cast<double>(face_vertices.size());
+            const Mat3 frame = orthonormalFrame(plane.normal);
+            std::sort(face_vertices.begin(), face_vertices.end(),
+                [&](const Vec3& left, const Vec3& right)
+                {
+                    const Vec3 left_delta = left - center;
+                    const Vec3 right_delta = right - center;
+                    const double left_angle = std::atan2(
+                        frame.col(2).dot(left_delta),
+                        frame.col(1).dot(left_delta));
+                    const double right_angle = std::atan2(
+                        frame.col(2).dot(right_delta),
+                        frame.col(1).dot(right_delta));
+                    return left_angle < right_angle;
+                });
+            std::vector<Vec2> projected;
+            projected.reserve(face_vertices.size());
+            for (const Vec3& point : face_vertices)
+            {
+                const Vec3 delta = point - center;
+                projected.emplace_back(frame.col(1).dot(delta),
+                                       frame.col(2).dot(delta));
+            }
+            projected = simplifyPolygon(
+                std::move(projected), plane_tolerance * 16.0);
+            std::vector<Vec3> polygon;
+            polygon.reserve(projected.size());
+            for (const Vec2& point : projected)
+                polygon.push_back(center + frame.col(1) * point.x() +
+                                  frame.col(2) * point.y());
+            if (polygon.size() < 3) continue;
+            const Vec3 polygon_normal =
+                (polygon[1] - polygon[0]).cross(polygon[2] - polygon[0]);
+            if (polygon_normal.dot(plane.normal) < 0.0)
+                std::reverse(polygon.begin(), polygon.end());
+            std::vector<std::uint32_t> polygon_indices;
+            polygon_indices.reserve(polygon.size());
+            for (const Vec3& point : polygon)
+            {
+                const auto found = std::find_if(
+                    result.vertices.begin(), result.vertices.end(),
+                    [&](const Vec3& vertex)
+                    { return (vertex - point).norm() <= plane_tolerance; });
+                if (found == result.vertices.end())
+                    return std::nullopt;
+                polygon_indices.push_back(static_cast<std::uint32_t>(
+                    std::distance(result.vertices.begin(), found)));
+            }
+            for (std::size_t corner = 1;
+                 corner + 1 < polygon_indices.size(); ++corner)
+            {
+                result.faces.push_back({polygon_indices[0],
+                                        polygon_indices[corner],
+                                        polygon_indices[corner + 1]});
+                result.plane_normals.push_back(plane.normal);
+                result.plane_offsets.push_back(plane.offset);
+            }
+            Primitive primitive;
+            primitive.kind = Kind::Polygon;
+            primitive.polygon = std::move(polygon);
+            OutputPrimitive output;
+            output.primitive = std::move(primitive);
+            output.source_faces = responsibility;
+            output.enclosure_group = enclosure_group;
+            result.shell.push_back(std::move(output));
+        }
+        if (result.shell.size() < 4) return std::nullopt;
+        for (const auto& item : result.shell)
+            for (const Vec3& point : item.primitive.polygon)
+            {
+                result.bounds.lower = result.bounds.lower.cwiseMin(point);
+                result.bounds.upper = result.bounds.upper.cwiseMax(point);
+            }
+        return result;
+    };
+
+    const auto workload = [](const ConvexHullSurface& surface)
+    { return triangulatedFaceCount(surface.shell); };
+    const auto separatingDirectionForPoint = [&](const Vec3& query)
+        -> std::optional<Vec3>
+    {
+        Vec3 closest = points.front();
+        double closest_distance = (query - closest).dot(query - closest);
+        for (const Vec3& point : points)
+        {
+            const double distance = (query - point).dot(query - point);
+            if (distance < closest_distance)
+            {
+                closest = point;
+                closest_distance = distance;
+            }
+        }
+        for (std::size_t step = 0; step < 256; ++step)
+        {
+            const Vec3 direction = query - closest;
+            if (direction.norm() <= tolerance) break;
+            const Vec3* support_point = &points.front();
+            double support_projection = direction.dot(*support_point);
+            for (const Vec3& point : points)
+            {
+                const double projection = direction.dot(point);
+                if (projection > support_projection)
+                {
+                    support_projection = projection;
+                    support_point = &point;
+                }
+            }
+            const Vec3 edge = *support_point - closest;
+            const double denominator = edge.dot(edge);
+            if (denominator <= 1.0e-30) break;
+            const double progress = direction.dot(edge);
+            if (progress <= tolerance * std::max(direction.norm(), 1.0))
+                break;
+            closest += edge * std::clamp(
+                progress / denominator, 0.0, 1.0);
+        }
+        const Vec3 difference = query - closest;
+        if (difference.norm() <= tolerance) return std::nullopt;
+        const Vec3 direction = difference.normalized();
+        double support = -std::numeric_limits<double>::infinity();
+        for (const Vec3& point : points)
+            support = std::max(support, direction.dot(point));
+        if (direction.dot(query) - support <= tolerance)
+            return std::nullopt;
+        return direction;
+    };
+    const auto auditEnvelope = [&](const ConvexHullSurface& surface)
+    {
+        FilledSurfaceDistanceWitness witness =
+            measureFilledSurfaceDistanceWitness(
+                distance_reference, surface.shell, sample_spacing,
+                maximum_error);
+        if (witness.maximum_distance > maximum_error + tolerance)
+            return witness;
+        // The production merge verifier certifies faces independently so its
+        // subdivision budget cannot be exhausted by unrelated faces. Mirror
+        // that exact acceptance rule here and use its failing sample as the
+        // next support-plane refinement witness.
+        for (const auto& face : surface.shell)
+        {
+            const FilledSurfaceDistanceCertificate certificate =
+                certifyFilledSurfaceDistance(
+                    distance_reference, {face}, maximum_error + tolerance);
+            if (certificate.exceeded)
+                return FilledSurfaceDistanceWitness{
+                    certificate.observed_maximum,
+                    certificate.maximum_proxy_point,
+                    certificate.maximum_source_point};
+            if (!certificate.certified)
+            {
+                const FilledSurfaceDistanceWitness face_witness =
+                    measureFilledSurfaceDistanceWitness(
+                        distance_reference, {face}, sample_spacing,
+                        maximum_error);
+                if (face_witness.maximum_distance >
+                    maximum_error + tolerance)
+                    return face_witness;
+            }
+        }
+        return witness;
+    };
+    std::optional<ConvexHullSurface> best;
+    std::vector<Plane> active = planes;
+    constexpr std::size_t maximum_refinement_planes = 48;
+    for (std::size_t iteration = 0; iteration <= maximum_refinement_planes;
+         ++iteration)
+    {
+        auto envelope = makeEnvelope(active);
+        if (!envelope)
+        {
+            if (profile) ++profile->construction_rejections;
+            return std::nullopt;
+        }
+        auto witness = auditEnvelope(*envelope);
+        if (witness.maximum_distance <= maximum_error + tolerance)
+        {
+            bool refined_for_exclusion = false;
+            for (const Vec3& point : exclusion_points)
+            {
+                bool inside = true;
+                for (std::size_t plane = 0;
+                     plane < envelope->plane_normals.size(); ++plane)
+                    if (envelope->plane_normals[plane].dot(point) -
+                            envelope->plane_offsets[plane] > tolerance)
+                    {
+                        inside = false;
+                        break;
+                    }
+                if (!inside) continue;
+                const auto direction = separatingDirectionForPoint(point);
+                if (!direction)
+                {
+                    if (profile)
+                        ++profile->inseparable_witness_rejections;
+                    return std::nullopt;
+                }
+                addDirection(active, *direction, false);
+                refined_for_exclusion = true;
+                break;
+            }
+            if (refined_for_exclusion) continue;
+            if (!best || workload(*envelope) < workload(*best) ||
+                (workload(*envelope) == workload(*best) &&
+                 witness.maximum_distance <
+                     measureFilledSurfaceDistanceWitness(
+                         distance_reference, best->shell, sample_spacing,
+                         std::numeric_limits<double>::infinity()).maximum_distance))
+                best = std::move(envelope);
+            break;
+        }
+        double best_gap = tolerance;
+        std::optional<Vec3> best_direction;
+        // Find a separating support direction for the failing proxy witness
+        // directly against the convex hull of the responsibility points,
+        // without constructing that hull. Gilbert's support-mapping iteration
+        // converges to the closest point in the convex point set. If the
+        // witness lies outside, witness-closest is a valid cutting direction;
+        // if it lies inside, no convex support plane can remove it and this
+        // candidate family must be rejected in favour of the non-convex shell.
+        Vec3 closest = points.front();
+        double closest_distance =
+            (witness.proxy_point - closest).dot(
+                witness.proxy_point - closest);
+        for (const Vec3& point : points)
+        {
+            const double distance =
+                (witness.proxy_point - point).dot(
+                    witness.proxy_point - point);
+            if (distance < closest_distance)
+            {
+                closest = point;
+                closest_distance = distance;
+            }
+        }
+        for (std::size_t step = 0; step < 256; ++step)
+        {
+            const Vec3 direction = witness.proxy_point - closest;
+            if (direction.norm() <= tolerance) break;
+            const Vec3* support_point = &points.front();
+            double support_projection = direction.dot(*support_point);
+            for (const Vec3& point : points)
+            {
+                const double projection = direction.dot(point);
+                if (projection > support_projection)
+                {
+                    support_projection = projection;
+                    support_point = &point;
+                }
+            }
+            const Vec3 edge = *support_point - closest;
+            const double denominator = edge.dot(edge);
+            if (denominator <= 1.0e-30) break;
+            const double progress = direction.dot(edge);
+            if (progress <= tolerance * std::max(direction.norm(), 1.0))
+                break;
+            const double fraction = std::clamp(
+                progress / denominator, 0.0, 1.0);
+            closest += edge * fraction;
+        }
+        const Vec3 witness_direction = witness.proxy_point - closest;
+        if (witness_direction.norm() > tolerance)
+        {
+            const Vec3 direction = witness_direction.normalized();
+            double support = -std::numeric_limits<double>::infinity();
+            for (const Vec3& point : points)
+                support = std::max(support, direction.dot(point));
+            const double gap = direction.dot(witness.proxy_point) - support;
+            if (gap > best_gap)
+            {
+                best_gap = gap;
+                best_direction = direction;
+            }
+        }
+        for (const Vec3& direction : directions)
+        {
+            double support = -std::numeric_limits<double>::infinity();
+            for (const Vec3& point : points)
+                support = std::max(support, direction.dot(point));
+            const double gap = direction.dot(witness.proxy_point) - support;
+            bool already_present = false;
+            for (const auto& plane : active)
+                if (plane.normal.dot(direction) > 1.0 - 2.5e-3)
+                    already_present = true;
+            if (!already_present && gap > best_gap)
+            {
+                best_gap = gap;
+                best_direction = direction;
+            }
+        }
+        if (!best_direction)
+        {
+            if (profile) ++profile->inseparable_witness_rejections;
+            return std::nullopt;
+        }
+        addDirection(active, *best_direction, false);
+    }
+    if (!best)
+    {
+        if (profile) ++profile->refinement_limit_rejections;
+        return std::nullopt;
+    }
+
+    // Once a feasible envelope exists, greedily remove every non-mandatory
+    // support plane that remains feasible. This makes the face count the
+    // primary objective and prevents a dense normal list from leaking into
+    // the proxy tessellation.
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (std::size_t index = 0; index < active.size(); ++index)
+        {
+            if (active[index].mandatory) continue;
+            std::vector<Plane> trial = active;
+            trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(index));
+            auto envelope = makeEnvelope(trial);
+            if (!envelope || workload(*envelope) > workload(*best)) continue;
+            const auto witness = auditEnvelope(*envelope);
+            if (witness.maximum_distance <= maximum_error + tolerance)
+            {
+                active = std::move(trial);
+                best = std::move(envelope);
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (profile) ++profile->accepted;
+    return best;
+}
+
 bool convexBoundsOverlap(const Bounds& first, const Bounds& second,
                          const double tolerance)
 {
@@ -9045,6 +9549,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         double intrusion_seconds = 0.0;
         double distance_seconds = 0.0;
         ConvexHullFitProfile convex_hull_kernel;
+        SupportEnvelopeFitProfile support_envelope;
     } profile;
     profile.input_primitives = primitives.size();
     auto last_profile_flush = started - std::chrono::seconds(2);
@@ -9124,6 +9629,18 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.convex_hull_kernel.dimensionality_seconds
                << ",\"quickhull_kernel_seconds\":"
                << profile.convex_hull_kernel.quickhull_seconds
+               << ",\"support_envelope_calls\":"
+               << profile.support_envelope.calls
+               << ",\"support_envelope_dimensional_rejections\":"
+               << profile.support_envelope.dimensional_rejections
+               << ",\"support_envelope_construction_rejections\":"
+               << profile.support_envelope.construction_rejections
+               << ",\"support_envelope_inseparable_witness_rejections\":"
+               << profile.support_envelope.inseparable_witness_rejections
+               << ",\"support_envelope_refinement_limit_rejections\":"
+               << profile.support_envelope.refinement_limit_rejections
+               << ",\"support_envelope_accepted\":"
+               << profile.support_envelope.accepted
                << ",\"convex_hull_output_seconds\":"
                << profile.convex_hull_kernel.output_seconds
                << ",\"intrusion_seconds\":" << profile.intrusion_seconds
@@ -10284,6 +10801,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::unordered_set<std::size_t> consumed_set(consumed.begin(),
                                                       consumed.end());
         std::optional<ConvexHullSurface> convex_candidate;
+        std::vector<Vec3> exclusion_points;
+        std::vector<std::size_t> exclusion_groups;
         for (;;)
         {
             ++profile.convex_growth_iterations;
@@ -10335,6 +10854,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             source_vertices.clear();
             input_triangle_workload = 0;
             std::vector<Vec3> points;
+            std::vector<Vec3> support_normals;
             std::unordered_set<FaceVertexKey, FaceVertexKeyHash> point_keys;
             std::size_t point_estimate = 0;
             for (const auto group : consumed)
@@ -10361,6 +10881,21 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 input_triangle_workload += groups[group].triangle_workload;
                 for (const Vec3& vertex : groups[group].hull_support_vertices)
                     appendPoint(vertex);
+                for (const auto& item : groups[group].shell)
+                {
+                    const PrimitiveMesh surface =
+                        triangulatePrimitive(item.primitive);
+                    for (const Face& face : surface.faces)
+                    {
+                        const Vec3 normal =
+                            (surface.vertices[face[1]] -
+                             surface.vertices[face[0]]).cross(
+                                surface.vertices[face[2]] -
+                                surface.vertices[face[0]]);
+                        if (normal.norm() > tolerance * tolerance)
+                            support_normals.push_back(normal.normalized());
+                    }
+                }
             }
             std::sort(responsibility.begin(), responsibility.end());
             responsibility.erase(
@@ -10370,19 +10905,33 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             source_vertices.erase(
                 std::unique(source_vertices.begin(), source_vertices.end()),
                 source_vertices.end());
+            for (const auto vertex : source_vertices)
+                if (vertex < responsibility_mesh.vertices.size())
+                    appendPoint(responsibility_mesh.vertices[vertex]);
             profile.closure_assembly_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() -
                 closure_assembly_started).count();
             ++profile.convex_hull_fits;
             const auto hull_started = std::chrono::steady_clock::now();
-            convex_candidate = fitConvexHullSurface(
-                std::move(points), responsibility,
-                next_component_enclosure_group, tolerance,
-                &profile.convex_hull_kernel);
+            convex_candidate = fitSupportPlaneEnvelope(
+                points, support_normals, exclusion_points, responsibility,
+                next_component_enclosure_group, distance_reference,
+                tolerance, candidate_error_limit, error_sample_spacing,
+                &profile.support_envelope);
             profile.convex_hull_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - hull_started).count();
             if (!convex_candidate)
             {
+                if (!exclusion_groups.empty())
+                {
+                    for (const auto group : exclusion_groups)
+                        if (groups[group].active &&
+                            consumed_set.insert(group).second)
+                            consumed.push_back(group);
+                    exclusion_groups.clear();
+                    exclusion_points.clear();
+                    continue;
+                }
                 cacheRejectedClosure(std::move(closure_key));
                 ++profile.degenerate_rejections;
                 return std::nullopt;
@@ -10460,6 +11009,34 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                                groups[right].bounds.lower.x();
                     return left < right;
                 });
+            if (!ordered_intruded_groups.empty() &&
+                exclusion_groups.empty())
+            {
+                // Resolve one owner at a time. If one unavoidable surface lies
+                // in the responsibility convex domain, absorbing the entire
+                // broad-phase intrusion set would incorrectly swallow every
+                // otherwise separable neighboring patch.
+                exclusion_groups.assign(1, ordered_intruded_groups.front());
+                exclusion_points.clear();
+                for (const auto group : exclusion_groups)
+                    for (const auto& surface :
+                         groups[group].intrusion_surfaces)
+                    {
+                        exclusion_points.insert(
+                            exclusion_points.end(), surface.mesh.vertices.begin(),
+                            surface.mesh.vertices.end());
+                        for (const Face& face : surface.mesh.faces)
+                            exclusion_points.push_back(
+                                (surface.mesh.vertices[face[0]] +
+                                 surface.mesh.vertices[face[1]] +
+                                 surface.mesh.vertices[face[2]]) / 3.0);
+                    }
+                // Refit the same responsibility set with separation
+                // constraints before transferring any neighboring owner.
+                continue;
+            }
+            exclusion_groups.clear();
+            exclusion_points.clear();
             for (const auto group : ordered_intruded_groups)
             {
                 consumed_set.insert(group);
@@ -10800,6 +11377,18 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.convex_hull_kernel.dimensionality_seconds
            << ",\"quickhull_kernel_seconds\":"
            << profile.convex_hull_kernel.quickhull_seconds
+           << ",\"support_envelope_calls\":"
+           << profile.support_envelope.calls
+           << ",\"support_envelope_dimensional_rejections\":"
+           << profile.support_envelope.dimensional_rejections
+           << ",\"support_envelope_construction_rejections\":"
+           << profile.support_envelope.construction_rejections
+           << ",\"support_envelope_inseparable_witness_rejections\":"
+           << profile.support_envelope.inseparable_witness_rejections
+           << ",\"support_envelope_refinement_limit_rejections\":"
+           << profile.support_envelope.refinement_limit_rejections
+           << ",\"support_envelope_accepted\":"
+           << profile.support_envelope.accepted
            << ",\"convex_hull_output_seconds\":"
            << profile.convex_hull_kernel.output_seconds
            << ",\"intrusion_seconds\":" << profile.intrusion_seconds
@@ -13351,9 +13940,19 @@ FilledSurfaceDistanceCertificate certifyFilledSurfaceDistance(
             if (cache.point_distances.size() >= 1000000)
                 cache.point_distances.clear();
             cache.point_distances.emplace(key, distance);
+            if (distance > result.observed_maximum)
+            {
+                result.maximum_proxy_point = point;
+                result.maximum_source_point = closest;
+            }
         }
-        result.observed_maximum = std::max(
-            result.observed_maximum, distance);
+        if (distance > result.observed_maximum)
+        {
+            result.observed_maximum = distance;
+            result.maximum_proxy_point = point;
+            result.maximum_source_point =
+                cache.reference->closestPoint(point).point;
+        }
         if (distance > maximum_distance) result.exceeded = true;
         return distance;
     };
@@ -13511,6 +14110,40 @@ FinalOpenErrorAudit measureFilledSurfaceDistance(
         audit.mean_distance = weighted_distance / total_weight;
     audit.distance_area_integral = weighted_distance;
     return audit;
+}
+
+FilledSurfaceDistanceWitness measureFilledSurfaceDistanceWitness(
+    const Mesh& filled_surface_mesh,
+    const std::vector<OutputPrimitive>& output,
+    const double sample_spacing,
+    const double maximum_distance)
+{
+    struct CachedReference
+    {
+        const Vec3* vertices = nullptr;
+        const Face* faces = nullptr;
+        std::size_t vertex_count = 0;
+        std::size_t face_count = 0;
+        std::unique_ptr<SourceTriangleBvh> reference;
+    };
+    static thread_local CachedReference cache;
+    if (cache.vertices != filled_surface_mesh.vertices.data() ||
+        cache.faces != filled_surface_mesh.faces.data() ||
+        cache.vertex_count != filled_surface_mesh.vertices.size() ||
+        cache.face_count != filled_surface_mesh.faces.size())
+    {
+        cache.vertices = filled_surface_mesh.vertices.data();
+        cache.faces = filled_surface_mesh.faces.data();
+        cache.vertex_count = filled_surface_mesh.vertices.size();
+        cache.face_count = filled_surface_mesh.faces.size();
+        cache.reference = std::make_unique<SourceTriangleBvh>(
+            filled_surface_mesh);
+    }
+    const FinalOpenErrorAudit audit = measureFilledSurfaceDistance(
+        *cache.reference, triangulateOutputPrimitives(output),
+        sample_spacing, maximum_distance);
+    return {audit.maximum_distance, audit.maximum_proxy_point,
+            audit.maximum_source_point};
 }
 
 FinalOpenErrorAudit measureOpenSurfaceDistance(
@@ -13747,6 +14380,7 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
     const Mesh& source_mesh,
     const Mesh& filled_surface_mesh,
     std::vector<OutputPrimitive> primitives,
+    const PrimitiveMeshAnalysisOptions& options,
     const double tolerance,
     const double maximum_error_distance,
     const double error_sample_spacing,
@@ -13793,8 +14427,11 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
     struct Profile
     {
         std::size_t nodes = 0;
+        std::size_t planar_candidates = 0;
+        std::size_t planar_rejections = 0;
         std::size_t box_candidates = 0;
-        std::size_t analytic_rejections = 0;
+        std::size_t revolved_candidates = 0;
+        std::size_t revolved_rejections = 0;
         std::size_t workload_rejections = 0;
         std::size_t error_rejections = 0;
         std::size_t accepted_boxes = 0;
@@ -13809,10 +14446,16 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
                << ",\"surface_candidates_only\":true"
                << ",\"input_primitives\":" << primitives.size()
                << ",\"hierarchy_nodes\":" << profile.nodes
+               << ",\"planar_surface_set_candidates\":"
+               << profile.planar_candidates
+               << ",\"planar_surface_set_rejections\":"
+               << profile.planar_rejections
                << ",\"box_surface_set_candidates\":"
                << profile.box_candidates
-               << ",\"analytic_rejections\":"
-               << profile.analytic_rejections
+               << ",\"revolved_surface_set_candidates\":"
+               << profile.revolved_candidates
+               << ",\"revolved_surface_set_rejections\":"
+               << profile.revolved_rejections
                << ",\"workload_rejections\":"
                << profile.workload_rejections
                << ",\"error_rejections\":" << profile.error_rejections
@@ -13827,6 +14470,17 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
     };
     writeProfile(false);
 
+    Bounds source_bounds;
+    for (const Vec3& vertex : source_mesh.vertices)
+    {
+        source_bounds.lower = source_bounds.lower.cwiseMin(vertex);
+        source_bounds.upper = source_bounds.upper.cwiseMax(vertex);
+    }
+    const Vec3 source_center =
+        (source_bounds.lower + source_bounds.upper) * 0.5;
+    const double source_diagonal =
+        (source_bounds.upper - source_bounds.lower).norm();
+
     const auto solve = [&](auto&& self, const std::size_t begin,
                            const std::size_t end)
         -> std::vector<OutputPrimitive>
@@ -13837,7 +14491,6 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
             return {primitives[records[order[begin]].primitive]};
 
         std::size_t original_triangles = 0;
-        bool polygon_surfaces_only = true;
         Bounds center_bounds;
         for (std::size_t offset = begin; offset < end; ++offset)
         {
@@ -13845,12 +14498,9 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
             center_bounds.lower = center_bounds.lower.cwiseMin(record.center);
             center_bounds.upper = center_bounds.upper.cwiseMax(record.center);
             original_triangles += record.triangles;
-            polygon_surfaces_only &= record.polygon_surface;
         }
 
-        if (!polygon_surfaces_only)
-            ++profile.analytic_rejections;
-        else if (original_triangles <= 12)
+        if (original_triangles <= 12)
             ++profile.workload_rejections;
         else
         {
@@ -13877,6 +14527,70 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
             responsibility.erase(
                 std::unique(responsibility.begin(), responsibility.end()),
                 responsibility.end());
+
+            struct AcceptedCandidate
+            {
+                std::vector<OutputPrimitive> surfaces;
+                std::optional<BoxFit> box;
+                std::size_t triangles =
+                    std::numeric_limits<std::size_t>::max();
+                double measured_error =
+                    std::numeric_limits<double>::infinity();
+            };
+            std::optional<AcceptedCandidate> selected;
+            const auto consider = [&](std::vector<OutputPrimitive> candidate,
+                                      std::optional<BoxFit> box)
+            {
+                const std::size_t triangles =
+                    triangulatedFaceCount(candidate);
+                // A candidate is not useful merely because it saves one
+                // triangle: replacing a well-formed analytic patch by a box
+                // at that point can block a later, tighter merge.  Require a
+                // material workload reduction before accepting a top-down
+                // replacement; the directed distance remains the hard gate.
+                if (triangles >= original_triangles ||
+                    triangles > std::numeric_limits<std::size_t>::max() / 4 ||
+                    triangles * 4 >= original_triangles)
+                    return false;
+                const auto distance_started =
+                    std::chrono::steady_clock::now();
+                const FilledSurfaceDistanceCertificate certificate =
+                    certifyFilledSurfaceDistance(
+                        filled_surface_mesh, candidate,
+                        maximum_error_distance + tolerance);
+                profile.certificate_samples += certificate.samples;
+                bool accepted = certificate.certified &&
+                    !certificate.exceeded;
+                double measured_error = certificate.observed_maximum;
+                if (!accepted && !certificate.exceeded)
+                {
+                    measured_error = maximumFilledSurfaceDistance(
+                        filled_surface_mesh, candidate, error_sample_spacing,
+                        maximum_error_distance + tolerance);
+                    accepted = measured_error <=
+                        maximum_error_distance + tolerance;
+                }
+                profile.distance_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    distance_started).count();
+                if (!accepted) return false;
+                if (!selected || triangles < selected->triangles ||
+                    (triangles == selected->triangles &&
+                     measured_error < selected->measured_error))
+                    selected = AcceptedCandidate{
+                        std::move(candidate), std::move(box), triangles,
+                        measured_error};
+                return true;
+            };
+
+            ++profile.planar_candidates;
+            auto planar_candidate = classifyApproximatePlanarSurface(
+                source_mesh, responsibility, source_center,
+                source_diagonal, options);
+            if (planar_candidate.empty() ||
+                !consider(std::move(planar_candidate), std::nullopt))
+                ++profile.planar_rejections;
+
             BoxFit box = fitBox(fitting_mesh, fitting_vertices);
             Vec3 local_lower = -box.half_size;
             Vec3 local_upper = box.half_size;
@@ -13904,29 +14618,83 @@ std::vector<OutputPrimitive> mergeSpatialSurfaceGroups(
                 appendBoxRectangles(candidate, box, responsibility, -1, 0.0,
                                     next_enclosure_group);
                 ++profile.box_candidates;
-                const auto distance_started = std::chrono::steady_clock::now();
-                const FilledSurfaceDistanceCertificate certificate =
-                    certifyFilledSurfaceDistance(
-                        filled_surface_mesh, candidate,
-                        maximum_error_distance + tolerance);
-                profile.certificate_samples += certificate.samples;
-                bool accepted = certificate.certified && !certificate.exceeded;
-                if (!accepted && !certificate.exceeded)
-                    accepted = maximumFilledSurfaceDistance(
-                        filled_surface_mesh, candidate, error_sample_spacing,
-                        maximum_error_distance + tolerance) <=
-                        maximum_error_distance + tolerance;
-                profile.distance_seconds += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - distance_started).count();
-                if (accepted)
+                if (!consider(std::move(candidate), box))
+                    ++profile.error_rejections;
+            }
+
+            // Compete a complete conservative surface of revolution at the
+            // same hierarchy node.  This is a set of analytic surface patches
+            // (one cylindrical/conical band and two disks), never a solid
+            // primitive.  It is particularly important for CAD parts whose
+            // source tessellation consists of thousands of disconnected
+            // wedges: fitting those wedges pairwise destroys the analytic
+            // identity before simplification even starts.
+            if (options.allow_round_surfaces && responsibility.size() >= 8)
+            {
+                ++profile.revolved_candidates;
+                auto revolved = fitConservativeRevolvedEnvelope(
+                    source_mesh, responsibility, options, tolerance);
+                if (revolved)
                 {
-                    ++next_enclosure_group;
-                    ++profile.accepted_boxes;
-                    ++merged_group_count;
-                    accepted_boxes.push_back(box);
-                    return candidate;
+                    revolved->segments = roundSegmentsForError(
+                        std::max(revolved->base_radius,
+                                 revolved->top_radius),
+                        maximum_error_distance, revolved->segments);
+                    std::vector<OutputPrimitive> candidate;
+                    Primitive band = *revolved;
+                    band.kind = std::abs(
+                        band.base_radius - band.top_radius) <=
+                        1.0e-8 * std::max({band.base_radius,
+                                           band.top_radius, band.height})
+                        ? Kind::CylindricalBand : Kind::ConicalBand;
+                    candidate.push_back({band, responsibility});
+                    candidate.back().enclosure_group =
+                        next_enclosure_group;
+                    const auto append_cap = [&](const Vec3& center,
+                                                const double radius,
+                                                Vec3 normal)
+                    {
+                        Primitive cap;
+                        cap.kind = Kind::Disk;
+                        cap.center = center;
+                        cap.axes = revolved->axes;
+                        if (cap.axes.col(0).dot(normal) < 0.0)
+                        {
+                            cap.axes.col(0) =
+                                -static_cast<Vec3>(cap.axes.col(0));
+                            cap.axes.col(1) =
+                                -static_cast<Vec3>(cap.axes.col(1));
+                        }
+                        cap.base_radius = radius;
+                        cap.top_radius = radius;
+                        cap.segments = revolved->segments;
+                        candidate.push_back({std::move(cap), responsibility});
+                        candidate.back().enclosure_group =
+                            next_enclosure_group;
+                    };
+                    append_cap(revolved->center, revolved->base_radius,
+                               -static_cast<Vec3>(revolved->axes.col(0)));
+                    append_cap(revolved->center +
+                                   revolved->axes.col(0) * revolved->height,
+                               revolved->top_radius,
+                               revolved->axes.col(0));
+                    if (!consider(std::move(candidate), std::nullopt))
+                        ++profile.revolved_rejections;
                 }
-                ++profile.error_rejections;
+                else
+                    ++profile.revolved_rejections;
+            }
+
+            if (selected)
+            {
+                ++next_enclosure_group;
+                if (selected->box)
+                {
+                    ++profile.accepted_boxes;
+                    accepted_boxes.push_back(*selected->box);
+                }
+                ++merged_group_count;
+                return std::move(selected->surfaces);
             }
         }
 
@@ -18852,6 +19620,49 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double merge_tolerance =
         std::max(diagonal * 1.0e-9, 1.0e-10);
 
+    // First solve the simplification problem from the top down.  The input to
+    // this pass is a set of surface primitives, but a node is allowed to
+    // contain any analytic surface kind: a cylindrical or conical patch is not
+    // forced through thousands of pairwise planar merges before a conservative
+    // six-surface envelope can be considered.  A node is replaced only after
+    // its complete proxy surface passes the user's directed-distance limit;
+    // otherwise it is split spatially and the same rule is applied to both
+    // children.  This makes the search size depend on geometric regions rather
+    // than on the tessellation density of the source OBJ.
+    std::size_t top_down_surface_merges = 0;
+    std::vector<BoxFit> top_down_boxes;
+    bool top_down_used = false;
+    // Pairwise fitting is quadratic in the number of candidate surfaces.  The
+    // top-down analytic pass is a workload guard for genuinely oversized
+    // candidate sets, not a model-specific shortcut.  Below this bound the
+    // ordinary adjacency fixed point is both cheaper and more faithful to
+    // already recognized local surfaces.
+    constexpr std::size_t top_down_workload_guard = 4096;
+    if (output.size() > top_down_workload_guard)
+    {
+        top_down_used = true;
+        output = mergeSpatialSurfaceGroups(
+            mesh, filled_surface_mesh, std::move(output), effective_options,
+            merge_tolerance,
+            maximum_open_error_distance,
+            std::max(diagonal / 192.0, 1.0e-30),
+            top_down_surface_merges, top_down_boxes,
+            output_directory / "top_down_surface_profile.json");
+        stats.merged_spatial_primitive_groups += top_down_surface_merges;
+        certified_closed_volumes.insert(
+            certified_closed_volumes.end(), top_down_boxes.begin(),
+            top_down_boxes.end());
+    }
+    else
+    {
+        std::ofstream profile(output_directory /
+                              "top_down_surface_profile.json");
+        profile << "{\"complete\":true,\"skipped\":true,\"input_primitives\":"
+                << output.size() << ",\"workload_guard\":"
+                << top_down_workload_guard << "}\n";
+    }
+    markStage("top_down_surface_decomposition");
+
     // A non-coplanar protruding component cannot in general be represented by
     // one planar patch.  Detect a complete component from a dominant support
     // plane and emit only its five exposed box faces.  This avoids arbitrary
@@ -18860,15 +19671,22 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     std::vector<OutputPrimitive> occluded_support_certificates;
     const double support_surface_error_limit = std::min(
         maximum_open_error_distance, diagonal * 0.02);
-    output = mergeSupportProtrusionSurfaceSets(
-        mesh, filled_surface_mesh, std::move(output), effective_options,
-        diagonal, model_surface_area, merge_tolerance,
-        support_surface_error_limit,
-        std::max(diagonal / 192.0, 1.0e-30),
-        support_surface_set_merges,
-        occluded_support_certificates,
-        output_directory / "support_protrusion_merge_profile.json");
-    stats.merged_spatial_primitive_groups = support_surface_set_merges;
+    if (!top_down_used)
+        output = mergeSupportProtrusionSurfaceSets(
+            mesh, filled_surface_mesh, std::move(output), effective_options,
+            diagonal, model_surface_area, merge_tolerance,
+            support_surface_error_limit,
+            std::max(diagonal / 192.0, 1.0e-30),
+            support_surface_set_merges,
+            occluded_support_certificates,
+            output_directory / "support_protrusion_merge_profile.json");
+    else
+    {
+        std::ofstream profile(output_directory /
+                              "support_protrusion_merge_profile.json");
+        profile << "{\"skipped\":true,\"reason\":\"top_down_surface_decomposition\"}\n";
+    }
+    stats.merged_spatial_primitive_groups += support_surface_set_merges;
     {
         std::ofstream profile(
             output_directory / "spatial_group_fixed_point_profile.json");
@@ -18889,14 +19707,21 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     requireSurfaceCandidates(output, "phase 3 surface merging");
     std::size_t adjacent_envelope_group_merges = 0;
     std::vector<OutputPrimitive> convex_enclosure_certificates;
-    output = mergeAdjacentEnvelopeGroups(
-        mesh, filled_surface_mesh, std::move(output), effective_options,
-        merge_tolerance,
-        maximum_open_error_distance,
-        std::max(diagonal / 192.0, 1.0e-30),
-        adjacent_envelope_group_merges,
-        convex_enclosure_certificates,
-        output_directory / "adjacent_envelope_group_profile.json");
+    if (!top_down_used)
+        output = mergeAdjacentEnvelopeGroups(
+            mesh, filled_surface_mesh, std::move(output), effective_options,
+            merge_tolerance,
+            maximum_open_error_distance,
+            std::max(diagonal / 192.0, 1.0e-30),
+            adjacent_envelope_group_merges,
+            convex_enclosure_certificates,
+            output_directory / "adjacent_envelope_group_profile.json");
+    else
+    {
+        std::ofstream profile(output_directory /
+                              "adjacent_envelope_group_profile.json");
+        profile << "{\"skipped\":true,\"reason\":\"top_down_surface_decomposition\"}\n";
+    }
     stats.merged_spatial_primitive_groups += adjacent_envelope_group_merges;
     // Boolean clipping may leave a zero-area loop that carries duplicate or
     // collinear coordinates. It has no collision surface and cannot cover a

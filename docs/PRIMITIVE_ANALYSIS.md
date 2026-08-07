@@ -114,6 +114,19 @@ configured circumferential segment count.
    artifacts and are discarded before occlusion. The final source-coverage
    audit remains authoritative after this cleanup.
 
+For oversized phase-2 sets, stage 3 now changes search direction before the
+quadratic adjacency loop. It evaluates a spatial hierarchy from the root down;
+each node competes as a set of analytic surface patches, not as a volumetric
+primitive. The current families are a conservative planar box shell (six
+polygons) and a conservative surface of revolution (one cylindrical/conical
+band plus two disks). Every candidate must reduce triangulated query work by at
+least four times, pass the same directed proxy-to-phase-1 distance limit, and
+retain a source-coverage certificate. If the node fails, it is split and the
+same competition is repeated on its children. Candidate sets below the fixed
+workload guard continue through the ordinary adjacency fixed point unchanged;
+this preserves already good planar, disk, annulus, cylindrical-band, and
+conical-band recognition. Production candidates never invoke QuickHull.
+
 The approach combines the face-based hierarchical framework of Attene,
 Falcidieno, and Spagnuolo (2006), *Hierarchical Mesh Segmentation Based on
 Fitting Primitives*, with the adjacency collapse and added-volume principle of
@@ -142,6 +155,9 @@ Each analyzed model directory contains:
   surface-only mode and the requested directed-error limit;
 - `adjacent_envelope_group_profile.json`: adjacency count, accepted certified
   analytic surface merges, distance work, and final group workload;
+- `top_down_surface_profile.json`: workload-guard decision plus planar,
+  revolved-surface, and six-polygon shell candidate counts for the bounded
+  top-down decomposition;
 - `coverage_audit_pre_repair.json`: exported workload before conservative
   fallback repair, the exact source-face IDs, and the reduced repair workload;
 - `final_occlusion_certificate_profile.json`: historical versus active closed

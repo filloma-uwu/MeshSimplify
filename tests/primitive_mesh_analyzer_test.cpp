@@ -376,10 +376,11 @@ int main()
                     strict_stats.merged_local_planar_primitives == 0,
                 "a merge beyond the directed Hausdorff limit must be rejected");
 
-        // A complete connected component may compete as its conservative
-        // convex surface when the user error permits it.  This L extrusion is
-        // deliberately non-convex: the candidate must be the actual convex
-        // hull surface (seven polygons), not six faces of a fitted box.
+        // A complete connected component may reduce to the lowest-triangle
+        // conservative envelope permitted by the user's directed error. This
+        // L extrusion is deliberately non-convex; with a loose limit its
+        // oriented six-polygon box (twelve triangles) beats the exact convex
+        // hull and must therefore win the candidate competition.
         const auto spatial_group = root / "spatial_group.obj";
         writeText(spatial_group,
             "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 1 1 0\nv 1 3 0\nv 0 3 0\n"
@@ -397,16 +398,21 @@ int main()
             pqss_proxy_mesh::analyzePrimitiveMeshObj(
                 spatial_group, root / "spatial_group_loose", group_loose);
         require(group_loose_stats.containment_validation_passed &&
-                    group_loose_stats.primitive_count == 7 &&
-                    group_loose_stats.proxy_triangles == 16 &&
+                    group_loose_stats.primitive_count == 6 &&
+                    group_loose_stats.proxy_triangles == 12 &&
                     group_loose_stats.merged_spatial_primitive_groups > 0 &&
                     group_loose_stats.merged_local_planar_primitives == 0,
-                "a loose error must select the certified component hull surface");
+                "a loose error must select the minimum-triangle conservative envelope");
         require(readText(root / "spatial_group_loose" /
                          "adjacent_envelope_group_profile.json").find(
                     "\"accepted_groups\":0") ==
                     std::string::npos,
-                "the convex hull must grow through accepted adjacent merges");
+                "the conservative envelope must grow through accepted adjacent merges");
+        require(readText(root / "spatial_group_loose" /
+                         "adjacent_envelope_group_profile.json").find(
+                    "\"quickhull_kernel_seconds\":0") !=
+                    std::string::npos,
+                "production envelope fitting must not invoke QuickHull");
         require(readText(root / "spatial_group_loose" /
                          "surface_merge_profile.json").find(
                     "\"remaining_acceptable_candidates\":0") !=
