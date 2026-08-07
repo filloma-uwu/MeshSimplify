@@ -114,8 +114,9 @@ density is controlled by `--round-surface-segments`.
 ```
 
 `--maximum-open-error-distance` is a sampled proxy-to-source distance limit in
-the OBJ's model units. If omitted, the limit is 20% of the source AABB
-diagonal. Like MeshLab's surface Hausdorff workflow, the C++ audit samples the
+the OBJ's model units. If omitted, the limit is 100 model units for every model
+in the pool; it is not scaled by each model's AABB. Like MeshLab's surface
+Hausdorff workflow, the C++ audit samples the
 emitted proxy surface and computes every sample's exact closest point and
 closest source triangle through a triangle BVH. Sampling is deterministic and
 includes triangle vertices, uniformly spaced edge points, and area-weighted

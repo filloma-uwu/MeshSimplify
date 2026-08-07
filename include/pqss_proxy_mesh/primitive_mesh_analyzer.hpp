@@ -72,9 +72,9 @@ struct PrimitiveMeshAnalysisOptions
     // box when both globally normalized added-volume and added-area budgets pass.
     bool forbid_main_body_box_approximation = true;
     // Hard one-sided proxy-to-source distance limit in model units. A negative
-    // value selects the default of 8% of the model AABB diagonal. Box-shaped
-    // support-surface replacements additionally have a 2% structural-fit cap;
-    // this keeps the general error budget from manufacturing oversized boxes.
+    // value selects the pool-wide default of 100 model units. The default is
+    // deliberately independent of each model's AABB: collision tolerances are
+    // physical distances shared by the model pool, not fractions of object size.
     double maximum_open_error_distance = -1.0;
 };
 

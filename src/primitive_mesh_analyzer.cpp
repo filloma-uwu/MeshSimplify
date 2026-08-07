@@ -8102,13 +8102,30 @@ bool segmentIntersectsTriangleInterior(
            segment_parameter < 1.0 - barycentric_tolerance;
 }
 
+struct PlanarProjectionBounds
+{
+    Vec3 first_axis = Vec3::Zero();
+    Vec3 second_axis = Vec3::Zero();
+    double first_lower = std::numeric_limits<double>::infinity();
+    double first_upper = -std::numeric_limits<double>::infinity();
+    double second_lower = std::numeric_limits<double>::infinity();
+    double second_upper = -std::numeric_limits<double>::infinity();
+};
+
 bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
                             const PrimitiveMesh& mesh,
                             const Bounds& mesh_bounds,
                             const double tolerance,
-                            bool* halfspace_rejected = nullptr)
+                            bool* halfspace_rejected = nullptr,
+                            const Vec3* mesh_plane_normal = nullptr,
+                            const double mesh_plane_offset = 0.0,
+                            bool* mesh_plane_rejected = nullptr,
+                            const PlanarProjectionBounds* projection = nullptr,
+                            bool* projection_rejected = nullptr)
 {
     if (halfspace_rejected) *halfspace_rejected = false;
+    if (mesh_plane_rejected) *mesh_plane_rejected = false;
+    if (projection_rejected) *projection_rejected = false;
     if (!convexBoundsOverlap(hull.bounds, mesh_bounds, tolerance))
         return false;
     // A hull face plane that places every mesh vertex on its exterior side is
@@ -8128,6 +8145,47 @@ bool meshIntrudesConvexHull(const ConvexHullSurface& hull,
         if (all_outside)
         {
             if (halfspace_rejected) *halfspace_rejected = true;
+            return false;
+        }
+    }
+    if (projection != nullptr)
+    {
+        double first_lower = std::numeric_limits<double>::infinity();
+        double first_upper = -std::numeric_limits<double>::infinity();
+        double second_lower = std::numeric_limits<double>::infinity();
+        double second_upper = -std::numeric_limits<double>::infinity();
+        for (const Vec3& vertex : hull.vertices)
+        {
+            const double first = projection->first_axis.dot(vertex);
+            const double second = projection->second_axis.dot(vertex);
+            first_lower = std::min(first_lower, first);
+            first_upper = std::max(first_upper, first);
+            second_lower = std::min(second_lower, second);
+            second_upper = std::max(second_upper, second);
+        }
+        if (first_upper < projection->first_lower - tolerance ||
+            projection->first_upper < first_lower - tolerance ||
+            second_upper < projection->second_lower - tolerance ||
+            projection->second_upper < second_lower - tolerance)
+        {
+            if (projection_rejected) *projection_rejected = true;
+            return false;
+        }
+    }
+    if (mesh_plane_normal != nullptr)
+    {
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (const Vec3& vertex : hull.vertices)
+        {
+            const double distance =
+                mesh_plane_normal->dot(vertex) - mesh_plane_offset;
+            minimum = std::min(minimum, distance);
+            maximum = std::max(maximum, distance);
+        }
+        if (minimum > tolerance || maximum < -tolerance)
+        {
+            if (mesh_plane_rejected) *mesh_plane_rejected = true;
             return false;
         }
     }
@@ -8742,6 +8800,10 @@ struct EnvelopeMergeGroup
     {
         PrimitiveMesh mesh;
         Bounds bounds;
+        Vec3 plane_normal = Vec3::Zero();
+        double plane_offset = 0.0;
+        PlanarProjectionBounds projection;
+        bool planar = false;
     };
     std::vector<OutputPrimitive> shell;
     std::vector<IntrusionSurface> intrusion_surfaces;
@@ -8793,7 +8855,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         bool operator()(const Candidate& left,
                         const Candidate& right) const noexcept
         {
-            return left.priority < right.priority;
+            if (left.priority != right.priority)
+                return left.priority < right.priority;
+            if (left.first != right.first) return left.first > right.first;
+            return left.second > right.second;
         }
     };
     using FitResult = EnvelopeFitResult;
@@ -8824,8 +8889,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t convex_growth_iterations = 0;
         std::size_t convex_debt_growth_steps = 0;
         std::size_t convex_debt_rejections = 0;
+        std::size_t convex_error_cache_hits = 0;
+        std::size_t convex_transition_cache_hits = 0;
         std::size_t intrusion_tests = 0;
         std::size_t intrusion_halfspace_rejections = 0;
+        std::size_t intrusion_surface_plane_rejections = 0;
+        std::size_t intrusion_planar_projection_rejections = 0;
         std::size_t certificate_samples = 0;
         std::size_t fine_distance_evaluations = 0;
         double coarse_distance_seconds = 0.0;
@@ -8864,9 +8933,17 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.convex_debt_growth_steps
                << ",\"convex_debt_rejections\":"
                << profile.convex_debt_rejections
+               << ",\"convex_error_cache_hits\":"
+               << profile.convex_error_cache_hits
+               << ",\"convex_transition_cache_hits\":"
+               << profile.convex_transition_cache_hits
                << ",\"intrusion_tests\":" << profile.intrusion_tests
                << ",\"intrusion_halfspace_rejections\":"
                << profile.intrusion_halfspace_rejections
+               << ",\"intrusion_surface_plane_rejections\":"
+               << profile.intrusion_surface_plane_rejections
+               << ",\"intrusion_planar_projection_rejections\":"
+               << profile.intrusion_planar_projection_rejections
                << ",\"certificate_samples\":"
                << profile.certificate_samples
                << ",\"coarse_distance_seconds\":"
@@ -9292,6 +9369,38 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
 
     std::vector<Group> groups;
     groups.reserve(primitives.size());
+    const auto makeIntrusionSurface = [&](const OutputPrimitive& output)
+    {
+        Group::IntrusionSurface result;
+        result.mesh = triangulatePrimitive(output.primitive);
+        result.bounds = primitiveBounds(output.primitive);
+        result.planar = planarNormal(
+            output.primitive, tolerance * 8.0, result.plane_normal);
+        if (result.planar && !result.mesh.vertices.empty())
+        {
+            result.plane_offset = result.plane_normal.dot(
+                result.mesh.vertices.front());
+            const Mat3 frame = orthonormalFrame(result.plane_normal);
+            result.projection.first_axis = frame.col(1);
+            result.projection.second_axis = frame.col(2);
+            for (const Vec3& vertex : result.mesh.vertices)
+            {
+                const double first =
+                    result.projection.first_axis.dot(vertex);
+                const double second =
+                    result.projection.second_axis.dot(vertex);
+                result.projection.first_lower = std::min(
+                    result.projection.first_lower, first);
+                result.projection.first_upper = std::max(
+                    result.projection.first_upper, first);
+                result.projection.second_lower = std::min(
+                    result.projection.second_lower, second);
+                result.projection.second_upper = std::max(
+                    result.projection.second_upper, second);
+            }
+        }
+        return result;
+    };
     for (auto& primitive : primitives)
     {
         Group group;
@@ -9313,9 +9422,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         group.triangle_workload =
             triangulatePrimitive(primitive.primitive).faces.size();
         group.shell.push_back(std::move(primitive));
-        group.intrusion_surfaces.push_back({
-            triangulatePrimitive(group.shell.front().primitive),
-            group.bounds});
+        group.intrusion_surfaces.push_back(
+            makeIntrusionSurface(group.shell.front()));
         groups.push_back(std::move(group));
     }
     const auto connect = [&](const std::size_t first, const std::size_t second)
@@ -9471,6 +9579,53 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     std::unordered_map<ConvexFaceKey, bool, ConvexFaceKeyHash>
         convex_face_error_cache;
     convex_face_error_cache.reserve(16384);
+
+    struct ClosureStateKey
+    {
+        std::vector<std::uint64_t> members;
+        bool operator==(const ClosureStateKey&) const = default;
+    };
+    struct ClosureStateKeyHash
+    {
+        std::size_t operator()(const ClosureStateKey& key) const noexcept
+        {
+            std::size_t seed = 0;
+            for (const auto member : key.members)
+                seed ^= std::hash<std::uint64_t>{}(member) +
+                    0x9e3779b97f4a7c15ULL +
+                    (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    std::unordered_set<ClosureStateKey, ClosureStateKeyHash>
+        rejected_closure_states;
+    std::unordered_map<ClosureStateKey, std::vector<std::uint64_t>,
+                       ClosureStateKeyHash> closure_transitions;
+    std::size_t rejected_closure_members = 0;
+    std::size_t transition_closure_members = 0;
+    constexpr std::size_t maximum_cached_closure_members = 2000000;
+    const auto closureStateKey = [&](const std::vector<std::size_t>& consumed)
+    {
+        ClosureStateKey key;
+        key.members.reserve(consumed.size());
+        for (const auto group : consumed)
+            key.members.push_back(
+                (groups[group].version << 32U) |
+                static_cast<std::uint64_t>(group));
+        std::sort(key.members.begin(), key.members.end());
+        return key;
+    };
+    const auto cacheRejectedClosure = [&](ClosureStateKey key)
+    {
+        if (rejected_closure_members + key.members.size() >
+            maximum_cached_closure_members)
+        {
+            rejected_closure_states.clear();
+            rejected_closure_members = 0;
+        }
+        rejected_closure_members += key.members.size();
+        rejected_closure_states.insert(std::move(key));
+    };
 
     const std::function<std::optional<FitResult>(std::size_t, std::size_t)>
         fitPair = [&](std::size_t first, std::size_t second)
@@ -9663,6 +9818,48 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         for (;;)
         {
             ++profile.convex_growth_iterations;
+            ClosureStateKey closure_key = closureStateKey(consumed);
+            if (rejected_closure_states.contains(closure_key))
+            {
+                ++profile.convex_error_cache_hits;
+                ++profile.error_rejections;
+                return std::nullopt;
+            }
+            const auto cached_transition =
+                closure_transitions.find(closure_key);
+            if (cached_transition != closure_transitions.end())
+            {
+                bool valid = !cached_transition->second.empty();
+                std::vector<std::size_t> additions;
+                for (const auto token : cached_transition->second)
+                {
+                    const std::size_t group =
+                        static_cast<std::uint32_t>(token);
+                    const std::uint64_t version = token >> 32U;
+                    if (group >= groups.size() || !groups[group].active ||
+                        groups[group].version != version ||
+                        consumed_set.contains(group))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    additions.push_back(group);
+                }
+                if (valid)
+                {
+                    ++profile.convex_transition_cache_hits;
+                    for (const auto group : additions)
+                    {
+                        consumed_set.insert(group);
+                        consumed.push_back(group);
+                    }
+                    continue;
+                }
+                transition_closure_members -=
+                    cached_transition->first.members.size() +
+                    cached_transition->second.size();
+                closure_transitions.erase(cached_transition);
+            }
             responsibility.clear();
             source_vertices.clear();
             input_triangle_workload = 0;
@@ -9700,16 +9897,19 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 std::chrono::steady_clock::now() - hull_started).count();
             if (!convex_candidate)
             {
+                cacheRejectedClosure(std::move(closure_key));
                 ++profile.degenerate_rejections;
                 return std::nullopt;
             }
             if (!convexCandidatePassesError(convex_candidate->shell))
             {
+                cacheRejectedClosure(std::move(closure_key));
                 ++profile.error_rejections;
                 return std::nullopt;
             }
 
             bool expanded = false;
+            std::vector<std::size_t> iteration_additions;
             const auto intrusion_scan_started =
                 std::chrono::steady_clock::now();
             const auto broad_phase_end = surface_bounds_index.upper_bound(
@@ -9737,11 +9937,21 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     continue;
                 ++profile.intrusion_tests;
                 bool halfspace_rejected = false;
+                bool surface_plane_rejected = false;
+                bool planar_projection_rejected = false;
                 const bool intrudes = meshIntrudesConvexHull(
                     *convex_candidate, surface.mesh, surface.bounds,
-                    tolerance * 8.0, &halfspace_rejected);
+                    tolerance * 8.0, &halfspace_rejected,
+                    surface.planar ? &surface.plane_normal : nullptr,
+                    surface.plane_offset, &surface_plane_rejected,
+                    surface.planar ? &surface.projection : nullptr,
+                    &planar_projection_rejected);
                 if (halfspace_rejected)
                     ++profile.intrusion_halfspace_rejections;
+                if (surface_plane_rejected)
+                    ++profile.intrusion_surface_plane_rejections;
+                if (planar_projection_rejected)
+                    ++profile.intrusion_planar_projection_rejections;
                 if (!intrudes) continue;
                 intruded_groups.insert(group);
             }
@@ -9761,6 +9971,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             {
                 consumed_set.insert(group);
                 consumed.push_back(group);
+                iteration_additions.push_back(group);
                 expanded = true;
             }
             profile.intrusion_seconds += std::chrono::duration<double>(
@@ -9803,8 +10014,29 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 }
                 consumed_set.insert(frontier.front());
                 consumed.push_back(frontier.front());
+                iteration_additions.push_back(frontier.front());
                 ++profile.convex_debt_growth_steps;
                 expanded = true;
+            }
+            if (expanded)
+            {
+                if (transition_closure_members + closure_key.members.size() +
+                        iteration_additions.size() >
+                    maximum_cached_closure_members)
+                {
+                    closure_transitions.clear();
+                    transition_closure_members = 0;
+                }
+                std::vector<std::uint64_t> addition_tokens;
+                addition_tokens.reserve(iteration_additions.size());
+                for (const auto group : iteration_additions)
+                    addition_tokens.push_back(
+                        (groups[group].version << 32U) |
+                        static_cast<std::uint64_t>(group));
+                transition_closure_members +=
+                    closure_key.members.size() + addition_tokens.size();
+                closure_transitions.insert_or_assign(
+                    std::move(closure_key), std::move(addition_tokens));
             }
             if (!expanded) break;
         }
@@ -9826,31 +10058,91 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
 
     std::priority_queue<
         Candidate, std::vector<Candidate>, CandidateCompare> queue;
-    const auto enqueue = [&](std::size_t first, std::size_t second)
+    struct PairVersionKey
+    {
+        std::size_t first = 0;
+        std::size_t second = 0;
+        std::uint64_t first_version = 0;
+        std::uint64_t second_version = 0;
+        bool operator==(const PairVersionKey&) const = default;
+    };
+    struct PairVersionKeyHash
+    {
+        std::size_t operator()(const PairVersionKey& key) const noexcept
+        {
+            std::size_t seed = std::hash<std::size_t>{}(key.first);
+            for (const auto value : {
+                     static_cast<std::uint64_t>(key.second),
+                     key.first_version, key.second_version})
+                seed ^= std::hash<std::uint64_t>{}(value) +
+                    0x9e3779b97f4a7c15ULL +
+                    (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    const auto pairVersionKey = [&](std::size_t first, std::size_t second)
     {
         if (first > second) std::swap(first, second);
-        if (!groups[first].active || !groups[second].active ||
-            !groups[first].neighbors.contains(second)) return;
-        queue.push({first, second, groups[first].version,
-                    groups[second].version,
-                    groups[first].triangle_workload +
-                        groups[second].triangle_workload});
+        return PairVersionKey{first, second, groups[first].version,
+                              groups[second].version};
+    };
+    std::unordered_set<PairVersionKey, PairVersionKeyHash> scheduled_pairs;
+    std::unordered_set<PairVersionKey, PairVersionKeyHash> attempted_pairs;
+    const auto enqueueBestNeighbor = [&](const std::size_t group)
+    {
+        if (group >= groups.size() || !groups[group].active) return;
+        std::optional<Candidate> best;
+        for (const auto neighbor : groups[group].neighbors)
+        {
+            if (!groups[neighbor].active) continue;
+            const PairVersionKey key = pairVersionKey(group, neighbor);
+            if (scheduled_pairs.contains(key) || attempted_pairs.contains(key))
+                continue;
+            const std::size_t priority =
+                groups[key.first].triangle_workload +
+                groups[key.second].triangle_workload;
+            Candidate candidate{key.first, key.second,
+                                key.first_version, key.second_version,
+                                priority};
+            if (!best || CandidateCompare{}(*best, candidate))
+                best = candidate;
+        }
+        if (!best) return;
+        const PairVersionKey key{best->first, best->second,
+                                 best->first_version,
+                                 best->second_version};
+        scheduled_pairs.insert(key);
+        queue.push(*best);
     };
     for (std::size_t first = 0; first < groups.size(); ++first)
-        for (const auto second : groups[first].neighbors)
-            if (first < second) enqueue(first, second);
+        enqueueBestNeighbor(first);
 
     while (!queue.empty())
     {
         const Candidate pair = queue.top();
         queue.pop();
+        const PairVersionKey key{pair.first, pair.second,
+                                 pair.first_version, pair.second_version};
+        scheduled_pairs.erase(key);
         if (!groups[pair.first].active || !groups[pair.second].active ||
             groups[pair.first].version != pair.first_version ||
             groups[pair.second].version != pair.second_version ||
             !groups[pair.first].neighbors.contains(pair.second))
+        {
+            enqueueBestNeighbor(pair.first);
+            enqueueBestNeighbor(pair.second);
             continue;
+        }
+        attempted_pairs.insert(key);
         auto candidate = fitPair(pair.first, pair.second);
-        if (!candidate) continue;
+        if (!candidate)
+        {
+            enqueueBestNeighbor(pair.first);
+            enqueueBestNeighbor(pair.second);
+            continue;
+        }
+        closure_transitions.clear();
+        transition_closure_members = 0;
         const bool accepted_convex_enclosure = std::any_of(
             candidate->shell.begin(), candidate->shell.end(),
             [&](const OutputPrimitive& item)
@@ -9869,9 +10161,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         groups[pair.first].intrusion_surfaces.reserve(
             groups[pair.first].shell.size());
         for (const auto& surface : groups[pair.first].shell)
-            groups[pair.first].intrusion_surfaces.push_back({
-                triangulatePrimitive(surface.primitive),
-                primitiveBounds(surface.primitive)});
+            groups[pair.first].intrusion_surfaces.push_back(
+                makeIntrusionSurface(surface));
         groups[pair.first].responsibility = std::move(candidate->responsibility);
         groups[pair.first].source_vertices =
             std::move(candidate->source_vertices);
@@ -9901,8 +10192,9 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         ++profile.accepted_groups;
         if (accepted_convex_enclosure)
             ++next_component_enclosure_group;
+        enqueueBestNeighbor(pair.first);
         for (const auto neighbor : groups[pair.first].neighbors)
-            enqueue(pair.first, neighbor);
+            enqueueBestNeighbor(neighbor);
     }
 
     std::vector<OutputPrimitive> result;
@@ -9959,9 +10251,17 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.convex_debt_growth_steps
            << ",\"convex_debt_rejections\":"
            << profile.convex_debt_rejections
+           << ",\"convex_error_cache_hits\":"
+           << profile.convex_error_cache_hits
+           << ",\"convex_transition_cache_hits\":"
+           << profile.convex_transition_cache_hits
            << ",\"intrusion_tests\":" << profile.intrusion_tests
            << ",\"intrusion_halfspace_rejections\":"
            << profile.intrusion_halfspace_rejections
+           << ",\"intrusion_surface_plane_rejections\":"
+           << profile.intrusion_surface_plane_rejections
+           << ",\"intrusion_planar_projection_rejections\":"
+           << profile.intrusion_planar_projection_rejections
            << ",\"certificate_samples\":" << profile.certificate_samples
            << ",\"fine_distance_evaluations\":"
            << profile.fine_distance_evaluations
@@ -14454,7 +14754,7 @@ StructuralCleanup identifyStructuralRedundantFaces(
     closure_options.maximum_open_error_distance =
         options.maximum_open_error_distance >= 0.0
             ? options.maximum_open_error_distance
-            : model_diagonal * 0.08;
+            : 100.0;
     std::vector<std::unordered_set<std::uint32_t>> ignored_neighbors;
     const auto clusters = coplanarClusters(
         mesh, model_diagonal * options.coplanar_relative_tolerance, ignored_neighbors);
@@ -17766,7 +18066,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double maximum_open_error_distance =
         effective_options.maximum_open_error_distance >= 0.0
             ? effective_options.maximum_open_error_distance
-            : diagonal * 0.08;
+            : 100.0;
     stats.maximum_open_error_distance_limit = maximum_open_error_distance;
 
     // There is deliberately no enclosing-volume candidate phase.  Every
