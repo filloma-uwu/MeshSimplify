@@ -19620,6 +19620,29 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     const double merge_tolerance =
         std::max(diagonal * 1.0e-9, 1.0e-10);
 
+    std::size_t support_surface_set_merges = 0;
+    std::vector<OutputPrimitive> occluded_support_certificates;
+    const double support_surface_error_limit = std::min(
+        maximum_open_error_distance, diagonal * 0.02);
+    bool support_preprocessed = false;
+    // Local support recognition is linear in the current surface set and is
+    // cheap enough to use as a first reduction for medium-sized inputs. It
+    // preserves model3's already good four-support decomposition, while the
+    // large-input path goes directly to the top-down analytic hierarchy.
+    if (output.size() <= 4096)
+    {
+        output = mergeSupportProtrusionSurfaceSets(
+            mesh, filled_surface_mesh, std::move(output), effective_options,
+            diagonal, model_surface_area, merge_tolerance,
+            support_surface_error_limit,
+            std::max(diagonal / 192.0, 1.0e-30),
+            support_surface_set_merges,
+            occluded_support_certificates,
+            output_directory / "support_protrusion_merge_profile.json");
+        support_preprocessed = true;
+        stats.merged_spatial_primitive_groups += support_surface_set_merges;
+    }
+
     // First solve the simplification problem from the top down.  The input to
     // this pass is a set of surface primitives, but a node is allowed to
     // contain any analytic surface kind: a cylindrical or conical patch is not
@@ -19637,7 +19660,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // candidate sets, not a model-specific shortcut.  Below this bound the
     // ordinary adjacency fixed point is both cheaper and more faithful to
     // already recognized local surfaces.
-    constexpr std::size_t top_down_workload_guard = 4096;
+    constexpr std::size_t top_down_workload_guard = 256;
     if (output.size() > top_down_workload_guard)
     {
         top_down_used = true;
@@ -19667,11 +19690,7 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
     // one planar patch.  Detect a complete component from a dominant support
     // plane and emit only its five exposed box faces.  This avoids arbitrary
     // spatial subtrees cutting the main body into unrelated local boxes.
-    std::size_t support_surface_set_merges = 0;
-    std::vector<OutputPrimitive> occluded_support_certificates;
-    const double support_surface_error_limit = std::min(
-        maximum_open_error_distance, diagonal * 0.02);
-    if (!top_down_used)
+    if (!top_down_used && !support_preprocessed)
         output = mergeSupportProtrusionSurfaceSets(
             mesh, filled_surface_mesh, std::move(output), effective_options,
             diagonal, model_surface_area, merge_tolerance,
@@ -19680,13 +19699,14 @@ PrimitiveMeshAnalysisStats analyzePrimitiveMeshObj(
             support_surface_set_merges,
             occluded_support_certificates,
             output_directory / "support_protrusion_merge_profile.json");
-    else
+    else if (top_down_used)
     {
         std::ofstream profile(output_directory /
                               "support_protrusion_merge_profile.json");
         profile << "{\"skipped\":true,\"reason\":\"top_down_surface_decomposition\"}\n";
     }
-    stats.merged_spatial_primitive_groups += support_surface_set_merges;
+    if (!support_preprocessed && !top_down_used)
+        stats.merged_spatial_primitive_groups += support_surface_set_merges;
     {
         std::ofstream profile(
             output_directory / "spatial_group_fixed_point_profile.json");

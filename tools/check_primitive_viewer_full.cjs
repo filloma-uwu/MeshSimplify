@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 
-const baseUrl = process.argv[2] || 'http://127.0.0.1:8091/viewer/primitive_analysis.html?manifest=/outputs/primitive_mesh_cpp_official_scope_strengths_003/viewer_manifest.json&model=2';
+const baseUrl = process.argv[2] || 'http://127.0.0.1:8091/viewer/primitive_analysis.html?manifest=/outputs/unified_surface_fix_full_parallel_v2/viewer_manifest.json&model=2';
 const screenshots = path.join(__dirname, '..', 'viewer', 'screenshots');
 fs.mkdirSync(screenshots, { recursive: true });
 let activeBrowser = null;

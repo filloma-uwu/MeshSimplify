@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("outputs/analytic_surface_no_box_fallback_full_v8/viewer_manifest.json"),
+        default=Path("outputs/unified_surface_fix_full_parallel_v2/viewer_manifest.json"),
     )
     parser.add_argument(
         "--executable",
