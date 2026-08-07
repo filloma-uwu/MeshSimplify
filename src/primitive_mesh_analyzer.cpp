@@ -7929,12 +7929,30 @@ struct ConvexHullSurface
     Bounds bounds;
 };
 
+struct ConvexHullFitProfile
+{
+    std::size_t calls = 0;
+    std::size_t input_points = 0;
+    std::size_t unique_points = 0;
+    double sort_deduplicate_seconds = 0.0;
+    double dimensionality_seconds = 0.0;
+    double quickhull_seconds = 0.0;
+    double output_seconds = 0.0;
+};
+
 std::optional<ConvexHullSurface> fitConvexHullSurface(
     std::vector<Vec3> points,
     const std::vector<std::uint32_t>& responsibility,
     const std::uint64_t enclosure_group,
-    const double tolerance)
+    const double tolerance,
+    ConvexHullFitProfile* profile = nullptr)
 {
+    const auto sort_started = std::chrono::steady_clock::now();
+    if (profile)
+    {
+        ++profile->calls;
+        profile->input_points += points.size();
+    }
     std::sort(points.begin(), points.end(),
         [](const Vec3& first, const Vec3& second)
         {
@@ -7945,8 +7963,15 @@ std::optional<ConvexHullSurface> fitConvexHullSurface(
     points.erase(std::unique(points.begin(), points.end(),
         [&](const Vec3& first, const Vec3& second)
         { return (first - second).norm() <= tolerance; }), points.end());
+    if (profile)
+    {
+        profile->unique_points += points.size();
+        profile->sort_deduplicate_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - sort_started).count();
+    }
     if (points.size() < 4) return std::nullopt;
 
+    const auto dimensionality_started = std::chrono::steady_clock::now();
     Mesh point_mesh;
     point_mesh.vertices = points;
     std::vector<std::uint32_t> point_ids(points.size());
@@ -7954,7 +7979,15 @@ std::optional<ConvexHullSurface> fitConvexHullSurface(
     const BoxFit dimensionality = fitBox(point_mesh, point_ids);
     if (std::min({dimensionality.half_size.x(), dimensionality.half_size.y(),
                   dimensionality.half_size.z()}) <= tolerance)
+    {
+        if (profile)
+            profile->dimensionality_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - dimensionality_started).count();
         return std::nullopt;
+    }
+    if (profile)
+        profile->dimensionality_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - dimensionality_started).count();
 
     Bounds input_bounds;
     std::vector<quickhull::Vector3<double>> cloud;
@@ -7967,14 +8000,19 @@ std::optional<ConvexHullSurface> fitConvexHullSurface(
     }
     const double scale = std::max(
         (input_bounds.upper - input_bounds.lower).norm(), tolerance);
+    const auto quickhull_started = std::chrono::steady_clock::now();
     quickhull::QuickHull<double> builder;
     const auto hull = builder.getConvexHull(
         cloud, true, false, std::max(tolerance / scale, 1.0e-12));
+    if (profile)
+        profile->quickhull_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - quickhull_started).count();
     if (hull.getVertexBuffer().size() < 4 ||
         hull.getIndexBuffer().size() < 12 ||
         hull.getIndexBuffer().size() % 3 != 0)
         return std::nullopt;
 
+    const auto output_started = std::chrono::steady_clock::now();
     ConvexHullSurface result;
     result.vertices.reserve(hull.getVertexBuffer().size());
     Vec3 center = Vec3::Zero();
@@ -8019,6 +8057,9 @@ std::optional<ConvexHullSurface> fitConvexHullSurface(
         item.enclosure_group = enclosure_group;
         result.shell.push_back(std::move(item));
     }
+    if (profile)
+        profile->output_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - output_started).count();
     if (result.faces.size() < 4) return std::nullopt;
     return result;
 }
@@ -8049,6 +8090,24 @@ bool boundsEntirelyOutsideHull(const ConvexHullSurface& hull,
             return true;
     }
     return false;
+}
+
+bool boundsEntirelyInsideHull(const ConvexHullSurface& hull,
+                              const Bounds& bounds,
+                              const double tolerance)
+{
+    for (std::size_t face = 0; face < hull.faces.size(); ++face)
+    {
+        const Vec3& normal = hull.plane_normals[face];
+        double maximum_projection = 0.0;
+        for (int axis = 0; axis < 3; ++axis)
+            maximum_projection += normal[axis] >= 0.0
+                ? normal[axis] * bounds.upper[axis]
+                : normal[axis] * bounds.lower[axis];
+        if (maximum_projection - hull.plane_offsets[face] > -tolerance)
+            return false;
+    }
+    return true;
 }
 
 bool pointStrictlyInsideHull(const ConvexHullSurface& hull,
@@ -8827,6 +8886,7 @@ struct EnvelopeMergeGroup
     std::vector<IntrusionSurface> intrusion_surfaces;
     std::vector<std::uint32_t> responsibility;
     std::vector<std::uint32_t> source_vertices;
+    std::vector<Vec3> hull_support_vertices;
     Bounds bounds;
     bool contains_round_surface = false;
     std::size_t triangle_workload = 0;
@@ -8840,6 +8900,7 @@ struct EnvelopeFitResult
     std::vector<OutputPrimitive> shell;
     std::vector<std::uint32_t> responsibility;
     std::vector<std::uint32_t> source_vertices;
+    std::vector<Vec3> hull_support_vertices;
     Bounds bounds;
     bool contains_round_surface = false;
     std::size_t triangle_workload = 0;
@@ -8913,6 +8974,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         std::size_t intrusion_index_candidates = 0;
         std::size_t intrusion_index_rebuilds = 0;
         std::size_t intrusion_index_halfspace_rejections = 0;
+        std::size_t intrusion_index_inside_nodes = 0;
+        std::size_t intrusion_index_inside_entries = 0;
         std::size_t intrusion_halfspace_rejections = 0;
         std::size_t intrusion_surface_plane_rejections = 0;
         std::size_t intrusion_planar_projection_rejections = 0;
@@ -8922,6 +8985,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         double convex_hull_seconds = 0.0;
         double intrusion_seconds = 0.0;
         double distance_seconds = 0.0;
+        ConvexHullFitProfile convex_hull_kernel;
     } profile;
     profile.input_primitives = primitives.size();
     auto last_profile_flush = started - std::chrono::seconds(2);
@@ -8965,6 +9029,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.intrusion_index_rebuilds
                << ",\"intrusion_index_halfspace_rejections\":"
                << profile.intrusion_index_halfspace_rejections
+               << ",\"intrusion_index_inside_nodes\":"
+               << profile.intrusion_index_inside_nodes
+               << ",\"intrusion_index_inside_entries\":"
+               << profile.intrusion_index_inside_entries
                << ",\"intrusion_halfspace_rejections\":"
                << profile.intrusion_halfspace_rejections
                << ",\"intrusion_surface_plane_rejections\":"
@@ -8977,6 +9045,18 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                << profile.coarse_distance_seconds
                << ",\"convex_hull_seconds\":"
                << profile.convex_hull_seconds
+               << ",\"convex_hull_sort_seconds\":"
+               << profile.convex_hull_kernel.sort_deduplicate_seconds
+               << ",\"convex_hull_input_points\":"
+               << profile.convex_hull_kernel.input_points
+               << ",\"convex_hull_unique_points\":"
+               << profile.convex_hull_kernel.unique_points
+               << ",\"convex_hull_dimensionality_seconds\":"
+               << profile.convex_hull_kernel.dimensionality_seconds
+               << ",\"quickhull_kernel_seconds\":"
+               << profile.convex_hull_kernel.quickhull_seconds
+               << ",\"convex_hull_output_seconds\":"
+               << profile.convex_hull_kernel.output_seconds
                << ",\"intrusion_seconds\":" << profile.intrusion_seconds
                << ",\"distance_seconds\":" << profile.distance_seconds
                << ",\"elapsed_seconds\":"
@@ -9451,6 +9531,30 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         group.shell.push_back(std::move(primitive));
         group.intrusion_surfaces.push_back(
             makeIntrusionSurface(group.shell.front()));
+        group.hull_support_vertices.reserve(
+            group.source_vertices.size() +
+            group.intrusion_surfaces.front().mesh.vertices.size());
+        for (const auto vertex : group.source_vertices)
+            group.hull_support_vertices.push_back(
+                responsibility_mesh.vertices[vertex]);
+        group.hull_support_vertices.insert(
+            group.hull_support_vertices.end(),
+            group.intrusion_surfaces.front().mesh.vertices.begin(),
+            group.intrusion_surfaces.front().mesh.vertices.end());
+        std::sort(group.hull_support_vertices.begin(),
+                  group.hull_support_vertices.end(),
+            [](const Vec3& first, const Vec3& second)
+            {
+                if (first.x() != second.x()) return first.x() < second.x();
+                if (first.y() != second.y()) return first.y() < second.y();
+                return first.z() < second.z();
+            });
+        group.hull_support_vertices.erase(std::unique(
+            group.hull_support_vertices.begin(),
+            group.hull_support_vertices.end(),
+            [&](const Vec3& first, const Vec3& second)
+            { return (first - second).norm() <= tolerance; }),
+            group.hull_support_vertices.end());
         groups.push_back(std::move(group));
     }
     const auto connect = [&](const std::size_t first, const std::size_t second)
@@ -9602,27 +9706,134 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             surface_bounds_nodes[node_index].end = end;
             if (end - begin <= 8) return node_index;
             const Vec3 extent = center_bounds.upper - center_bounds.lower;
-            int axis = 0;
-            if (extent.y() > extent.x()) axis = 1;
-            if (extent.z() > extent[axis]) axis = 2;
-            const std::size_t middle = begin + (end - begin) / 2;
-            std::nth_element(
-                surface_bounds_entries.begin() + begin,
-                surface_bounds_entries.begin() + middle,
-                surface_bounds_entries.begin() + end,
-                [axis](const IndexedSurface& left,
-                       const IndexedSurface& right)
+            constexpr std::size_t bin_count = 16;
+            struct Bin
+            {
+                Bounds bounds;
+                std::size_t count = 0;
+            };
+            const auto area = [](const Bounds& item)
+            {
+                const Vec3 size = item.upper - item.lower;
+                return 2.0 * (size.x() * size.y() + size.y() * size.z() +
+                              size.z() * size.x());
+            };
+            double best_cost = std::numeric_limits<double>::infinity();
+            int best_axis = -1;
+            std::size_t best_split = 0;
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                if (extent[axis] <= 1.0e-30) continue;
+                std::array<Bin, bin_count> bins;
+                for (std::size_t index = begin; index < end; ++index)
                 {
-                    const double left_center =
-                        left.bounds.lower[axis] + left.bounds.upper[axis];
-                    const double right_center =
-                        right.bounds.lower[axis] + right.bounds.upper[axis];
-                    if (left_center != right_center)
-                        return left_center < right_center;
-                    if (left.group != right.group)
-                        return left.group < right.group;
-                    return left.surface < right.surface;
-                });
+                    const Bounds& item = surface_bounds_entries[index].bounds;
+                    const double center =
+                        0.5 * (item.lower[axis] + item.upper[axis]);
+                    const std::size_t bin = std::min<std::size_t>(
+                        bin_count - 1,
+                        static_cast<std::size_t>(
+                            (center - center_bounds.lower[axis]) /
+                            extent[axis] * static_cast<double>(bin_count)));
+                    bins[bin].bounds.lower =
+                        bins[bin].bounds.lower.cwiseMin(item.lower);
+                    bins[bin].bounds.upper =
+                        bins[bin].bounds.upper.cwiseMax(item.upper);
+                    ++bins[bin].count;
+                }
+                std::array<Bounds, bin_count> prefix_bounds;
+                std::array<Bounds, bin_count> suffix_bounds;
+                std::array<std::size_t, bin_count> prefix_counts{};
+                std::array<std::size_t, bin_count> suffix_counts{};
+                Bounds prefix;
+                std::size_t prefix_count = 0;
+                for (std::size_t bin = 0; bin < bin_count; ++bin)
+                {
+                    if (bins[bin].count != 0)
+                    {
+                        prefix.lower = prefix.lower.cwiseMin(
+                            bins[bin].bounds.lower);
+                        prefix.upper = prefix.upper.cwiseMax(
+                            bins[bin].bounds.upper);
+                    }
+                    prefix_count += bins[bin].count;
+                    prefix_bounds[bin] = prefix;
+                    prefix_counts[bin] = prefix_count;
+                }
+                Bounds suffix;
+                std::size_t suffix_count = 0;
+                for (std::size_t bin = bin_count; bin-- > 0;)
+                {
+                    if (bins[bin].count != 0)
+                    {
+                        suffix.lower = suffix.lower.cwiseMin(
+                            bins[bin].bounds.lower);
+                        suffix.upper = suffix.upper.cwiseMax(
+                            bins[bin].bounds.upper);
+                    }
+                    suffix_count += bins[bin].count;
+                    suffix_bounds[bin] = suffix;
+                    suffix_counts[bin] = suffix_count;
+                }
+                for (std::size_t split = 0; split + 1 < bin_count; ++split)
+                {
+                    if (prefix_counts[split] == 0 ||
+                        suffix_counts[split + 1] == 0)
+                        continue;
+                    const double cost =
+                        area(prefix_bounds[split]) * prefix_counts[split] +
+                        area(suffix_bounds[split + 1]) *
+                            suffix_counts[split + 1];
+                    if (cost < best_cost)
+                    {
+                        best_cost = cost;
+                        best_axis = axis;
+                        best_split = split;
+                    }
+                }
+            }
+            std::size_t middle = begin;
+            if (best_axis >= 0)
+            {
+                const double split_coordinate =
+                    center_bounds.lower[best_axis] + extent[best_axis] *
+                    static_cast<double>(best_split + 1) /
+                    static_cast<double>(bin_count);
+                middle = static_cast<std::size_t>(std::distance(
+                    surface_bounds_entries.begin(), std::partition(
+                        surface_bounds_entries.begin() + begin,
+                        surface_bounds_entries.begin() + end,
+                        [&](const IndexedSurface& item)
+                        {
+                            return item.bounds.lower[best_axis] +
+                                item.bounds.upper[best_axis] <
+                                2.0 * split_coordinate;
+                        })));
+            }
+            if (middle == begin || middle == end)
+            {
+                int axis = 0;
+                if (extent.y() > extent.x()) axis = 1;
+                if (extent.z() > extent[axis]) axis = 2;
+                middle = begin + (end - begin) / 2;
+                std::nth_element(
+                    surface_bounds_entries.begin() + begin,
+                    surface_bounds_entries.begin() + middle,
+                    surface_bounds_entries.begin() + end,
+                    [axis](const IndexedSurface& left,
+                           const IndexedSurface& right)
+                    {
+                        const double left_center =
+                            left.bounds.lower[axis] + left.bounds.upper[axis];
+                        const double right_center =
+                            right.bounds.lower[axis] + right.bounds.upper[axis];
+                        if (left_center != right_center)
+                            return left_center < right_center;
+                        if (left.group != right.group)
+                            return left.group < right.group;
+                        return left.surface < right.surface;
+                    });
+            }
             const std::size_t first_child = build(begin, middle);
             const std::size_t second_child = build(middle, end);
             surface_bounds_nodes[node_index].first_child = first_child;
@@ -9674,6 +9885,15 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     ++profile.intrusion_index_halfspace_rejections;
                     continue;
                 }
+                if (boundsEntirelyInsideHull(
+                        query_hull, node.bounds, tolerance * 8.0))
+                {
+                    ++profile.intrusion_index_inside_nodes;
+                    for (std::size_t index = node.begin;
+                         index < node.end; ++index)
+                        visit(surface_bounds_entries[index], true);
+                    continue;
+                }
                 if (node.first_child ==
                     std::numeric_limits<std::size_t>::max())
                 {
@@ -9682,7 +9902,11 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                         if (convexBoundsOverlap(
                                 query, surface_bounds_entries[index].bounds,
                                 tolerance * 8.0))
-                            visit(surface_bounds_entries[index]);
+                            visit(surface_bounds_entries[index],
+                                boundsEntirelyInsideHull(
+                                    query_hull,
+                                    surface_bounds_entries[index].bounds,
+                                    tolerance * 8.0));
                     continue;
                 }
                 pending.push_back(node.first_child);
@@ -9692,7 +9916,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         for (const IndexedSurface& indexed : surface_bounds_delta)
             if (convexBoundsOverlap(
                     query, indexed.bounds, tolerance * 8.0))
-                visit(indexed);
+                visit(indexed, boundsEntirelyInsideHull(
+                    query_hull, indexed.bounds, tolerance * 8.0));
     };
     rebuildSurfaceBoundsIndex();
 
@@ -9707,6 +9932,18 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
     {
         std::array<FaceVertexKey, 3> vertices{};
         bool operator==(const ConvexFaceKey&) const = default;
+    };
+    struct FaceVertexKeyHash
+    {
+        std::size_t operator()(const FaceVertexKey& key) const noexcept
+        {
+            std::size_t seed = 0;
+            for (const auto coordinate : {key.x, key.y, key.z})
+                seed ^= std::hash<std::uint64_t>{}(coordinate) +
+                    0x9e3779b97f4a7c15ULL +
+                    (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
     };
     struct ConvexFaceKeyHash
     {
@@ -9938,6 +10175,19 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 result.shell = std::move(round_candidate);
                 result.responsibility = std::move(responsibility);
                 result.source_vertices = std::move(source_vertices);
+                for (const auto group : consumed)
+                    result.hull_support_vertices.insert(
+                        result.hull_support_vertices.end(),
+                        groups[group].hull_support_vertices.begin(),
+                        groups[group].hull_support_vertices.end());
+                for (const auto& item : result.shell)
+                {
+                    const PrimitiveMesh surface =
+                        triangulatePrimitive(item.primitive);
+                    result.hull_support_vertices.insert(
+                        result.hull_support_vertices.end(),
+                        surface.vertices.begin(), surface.vertices.end());
+                }
                 result.bounds = bounds;
                 result.contains_round_surface = true;
                 result.triangle_workload = round_workload;
@@ -10009,6 +10259,20 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             source_vertices.clear();
             input_triangle_workload = 0;
             std::vector<Vec3> points;
+            std::unordered_set<FaceVertexKey, FaceVertexKeyHash> point_keys;
+            std::size_t point_estimate = 0;
+            for (const auto group : consumed)
+                point_estimate += groups[group].hull_support_vertices.size();
+            point_keys.reserve(point_estimate);
+            points.reserve(point_estimate);
+            const auto appendPoint = [&](const Vec3& point)
+            {
+                const FaceVertexKey key{
+                    std::bit_cast<std::uint64_t>(point.x()),
+                    std::bit_cast<std::uint64_t>(point.y()),
+                    std::bit_cast<std::uint64_t>(point.z())};
+                if (point_keys.insert(key).second) points.push_back(point);
+            };
             for (const auto group : consumed)
             {
                 responsibility.insert(
@@ -10019,9 +10283,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     groups[group].source_vertices.begin(),
                     groups[group].source_vertices.end());
                 input_triangle_workload += groups[group].triangle_workload;
-                for (const auto& surface : groups[group].intrusion_surfaces)
-                    points.insert(points.end(), surface.mesh.vertices.begin(),
-                                  surface.mesh.vertices.end());
+                for (const Vec3& vertex : groups[group].hull_support_vertices)
+                    appendPoint(vertex);
             }
             std::sort(responsibility.begin(), responsibility.end());
             responsibility.erase(
@@ -10031,13 +10294,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
             source_vertices.erase(
                 std::unique(source_vertices.begin(), source_vertices.end()),
                 source_vertices.end());
-            for (const auto vertex : source_vertices)
-                points.push_back(responsibility_mesh.vertices[vertex]);
             ++profile.convex_hull_fits;
             const auto hull_started = std::chrono::steady_clock::now();
             convex_candidate = fitConvexHullSurface(
                 std::move(points), responsibility,
-                next_component_enclosure_group, tolerance);
+                next_component_enclosure_group, tolerance,
+                &profile.convex_hull_kernel);
             profile.convex_hull_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - hull_started).count();
             if (!convex_candidate)
@@ -10059,7 +10321,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                 std::chrono::steady_clock::now();
             std::unordered_set<std::size_t> intruded_groups;
             querySurfaceBoundsIndex(*convex_candidate,
-                [&](const IndexedSurface& indexed)
+                [&](const IndexedSurface& indexed,
+                    const bool guaranteed_inside)
             {
                 const std::size_t group = indexed.group;
                 if (!groups[group].active ||
@@ -10069,6 +10332,12 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
                     indexed.surface >= groups[group].intrusion_surfaces.size())
                     return;
                 ++profile.intrusion_index_candidates;
+                if (guaranteed_inside)
+                {
+                    ++profile.intrusion_index_inside_entries;
+                    intruded_groups.insert(group);
+                    return;
+                }
                 const auto& surface =
                     groups[group].intrusion_surfaces[indexed.surface];
                 if (!convexBoundsOverlap(
@@ -10186,6 +10455,7 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         convex_result.shell = std::move(convex_candidate->shell);
         convex_result.responsibility = std::move(responsibility);
         convex_result.source_vertices = std::move(source_vertices);
+        convex_result.hull_support_vertices = convex_candidate->vertices;
         convex_result.bounds = convex_candidate->bounds;
         convex_result.contains_round_surface = false;
         convex_result.triangle_workload = convex_workload;
@@ -10306,6 +10576,8 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
         groups[pair.first].responsibility = std::move(candidate->responsibility);
         groups[pair.first].source_vertices =
             std::move(candidate->source_vertices);
+        groups[pair.first].hull_support_vertices =
+            std::move(candidate->hull_support_vertices);
         groups[pair.first].bounds = candidate->bounds;
         groups[pair.first].contains_round_surface =
             candidate->contains_round_surface;
@@ -10403,6 +10675,10 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << profile.intrusion_index_rebuilds
            << ",\"intrusion_index_halfspace_rejections\":"
            << profile.intrusion_index_halfspace_rejections
+           << ",\"intrusion_index_inside_nodes\":"
+           << profile.intrusion_index_inside_nodes
+           << ",\"intrusion_index_inside_entries\":"
+           << profile.intrusion_index_inside_entries
            << ",\"intrusion_halfspace_rejections\":"
            << profile.intrusion_halfspace_rejections
            << ",\"intrusion_surface_plane_rejections\":"
@@ -10415,6 +10691,18 @@ std::vector<OutputPrimitive> mergeAdjacentEnvelopeGroups(
            << ",\"coarse_distance_seconds\":"
            << profile.coarse_distance_seconds
            << ",\"convex_hull_seconds\":" << profile.convex_hull_seconds
+           << ",\"convex_hull_sort_seconds\":"
+           << profile.convex_hull_kernel.sort_deduplicate_seconds
+           << ",\"convex_hull_input_points\":"
+           << profile.convex_hull_kernel.input_points
+           << ",\"convex_hull_unique_points\":"
+           << profile.convex_hull_kernel.unique_points
+           << ",\"convex_hull_dimensionality_seconds\":"
+           << profile.convex_hull_kernel.dimensionality_seconds
+           << ",\"quickhull_kernel_seconds\":"
+           << profile.convex_hull_kernel.quickhull_seconds
+           << ",\"convex_hull_output_seconds\":"
+           << profile.convex_hull_kernel.output_seconds
            << ",\"intrusion_seconds\":" << profile.intrusion_seconds
            << ",\"distance_seconds\":" << profile.distance_seconds
            << ",\"output_primitives\":" << result.size()
