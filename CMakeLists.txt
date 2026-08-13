@@ -9,6 +9,8 @@ set(PQSS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../PQSS" CACHE PATH "Path to th
 add_library(pqss_proxy_mesh STATIC
     src/mesh_pool.cpp
     src/options.cpp
+    src/topology_fill.cpp
+    src/hausdorff_simplifier.cpp
     src/primitive_mesh_analyzer.cpp
     deps/quickhull/QuickHull.cpp
     deps/clipper2/CPP/Clipper2Lib/src/clipper.engine.cpp
@@ -37,6 +39,24 @@ target_link_libraries(pqss-proxy-mesh PRIVATE pqss_proxy_mesh)
 
 add_executable(pqss-primitive-mesh-analyze tools/primitive_mesh_analyze.cpp)
 target_link_libraries(pqss-primitive-mesh-analyze PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-topology-fill tools/topology_fill_generate.cpp)
+target_link_libraries(pqss-topology-fill PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-topology-reconstruct tools/topology_fill_reconstruct.cpp)
+target_link_libraries(pqss-topology-reconstruct PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-canonicalize-soup tools/canonicalize_triangle_soup.cpp)
+target_link_libraries(pqss-canonicalize-soup PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-source-dominated-preview tools/source_dominated_phase1_preview.cpp)
+target_link_libraries(pqss-source-dominated-preview PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-original-obj-hole-surgery tools/original_obj_hole_surgery.cpp)
+target_link_libraries(pqss-original-obj-hole-surgery PRIVATE pqss_proxy_mesh)
+
+add_executable(pqss-hausdorff-simplify tools/hausdorff_simplify.cpp)
+target_link_libraries(pqss-hausdorff-simplify PRIVATE pqss_proxy_mesh)
 
 if(PQSS_PROXY_MESH_BUILD_REAL_SCENE_COMPARE)
     if(NOT EXISTS "${PQSS_SOURCE_DIR}/src/pqss/include/pqss/model_pool.hpp")
@@ -99,6 +119,14 @@ if(PQSS_PROXY_MESH_BUILD_TESTS)
     add_executable(pqss_primitive_mesh_analyzer_test tests/primitive_mesh_analyzer_test.cpp)
     target_link_libraries(pqss_primitive_mesh_analyzer_test PRIVATE pqss_proxy_mesh)
     add_test(NAME pqss_primitive_mesh_analyzer_test COMMAND pqss_primitive_mesh_analyzer_test)
+
+    add_executable(pqss_topology_fill_test tests/topology_fill_test.cpp)
+    target_link_libraries(pqss_topology_fill_test PRIVATE pqss_proxy_mesh)
+    add_test(NAME pqss_topology_fill_test COMMAND pqss_topology_fill_test)
+
+    add_executable(pqss_hausdorff_simplifier_test tests/hausdorff_simplifier_test.cpp)
+    target_link_libraries(pqss_hausdorff_simplifier_test PRIVATE pqss_proxy_mesh)
+    add_test(NAME pqss_hausdorff_simplifier_test COMMAND pqss_hausdorff_simplifier_test)
 
     if(PQSS_PROXY_MESH_BUILD_REAL_SCENE_COMPARE)
         add_executable(pqss_independent_primitive_pool_test tests/independent_primitive_pool_test.cpp)

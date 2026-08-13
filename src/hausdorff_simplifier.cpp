@@ -1,0 +1,1217 @@
+#include "pqss_proxy_mesh/hausdorff_simplifier.hpp"
+
+#include "QuickHull.hpp"
+#include "clipper2/clipper.h"
+#include "clipper2/clipper.triangulation.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <tuple>
+#include <unordered_map>
+
+namespace pqss_proxy_mesh
+{
+namespace
+{
+
+struct Vec3
+{
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+Vec3 toVec(const Position3 p) { return {p.x, p.y, p.z}; }
+Position3 toPosition(const Vec3 p) { return {p.x, p.y, p.z}; }
+Vec3 operator+(const Vec3 a, const Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+Vec3 operator-(const Vec3 a, const Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+Vec3 operator*(const Vec3 a, const double s) { return {a.x * s, a.y * s, a.z * s}; }
+double dot(const Vec3 a, const Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+Vec3 cross(const Vec3 a, const Vec3 b)
+{
+    return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x};
+}
+double normSquared(const Vec3 a) { return dot(a, a); }
+double norm(const Vec3 a) { return std::sqrt(normSquared(a)); }
+
+struct Bounds
+{
+    Vec3 lower{std::numeric_limits<double>::infinity(),
+               std::numeric_limits<double>::infinity(),
+               std::numeric_limits<double>::infinity()};
+    Vec3 upper{-std::numeric_limits<double>::infinity(),
+               -std::numeric_limits<double>::infinity(),
+               -std::numeric_limits<double>::infinity()};
+};
+
+void include(Bounds& bounds, const Vec3 p)
+{
+    bounds.lower.x = std::min(bounds.lower.x, p.x);
+    bounds.lower.y = std::min(bounds.lower.y, p.y);
+    bounds.lower.z = std::min(bounds.lower.z, p.z);
+    bounds.upper.x = std::max(bounds.upper.x, p.x);
+    bounds.upper.y = std::max(bounds.upper.y, p.y);
+    bounds.upper.z = std::max(bounds.upper.z, p.z);
+}
+
+double boundsDistanceSquared(const Bounds& bounds, const Vec3 p)
+{
+    const auto axis = [](const double value, const double lower, const double upper)
+    {
+        if (value < lower) return lower - value;
+        if (value > upper) return value - upper;
+        return 0.0;
+    };
+    const double dx = axis(p.x, bounds.lower.x, bounds.upper.x);
+    const double dy = axis(p.y, bounds.lower.y, bounds.upper.y);
+    const double dz = axis(p.z, bounds.lower.z, bounds.upper.z);
+    return dx*dx + dy*dy + dz*dz;
+}
+
+Vec3 closestPointOnTriangle(const Vec3 p, const Vec3 a, const Vec3 b, const Vec3 c)
+{
+    const Vec3 ab = b - a;
+    const Vec3 ac = c - a;
+    const Vec3 ap = p - a;
+    const double d1 = dot(ab, ap);
+    const double d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+
+    const Vec3 bp = p - b;
+    const double d3 = dot(ab, bp);
+    const double d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+
+    const double vc = d1*d4 - d3*d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+        return a + ab * (d1 / (d1 - d3));
+
+    const Vec3 cp = p - c;
+    const double d5 = dot(ab, cp);
+    const double d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+
+    const double vb = d5*d2 - d1*d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+        return a + ac * (d2 / (d2 - d6));
+
+    const double va = d3*d6 - d5*d4;
+    if (va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+
+    const double denominator = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denominator) + ac * (vc * denominator);
+}
+
+class TriangleBvh
+{
+public:
+    explicit TriangleBvh(const MeshModel& mesh) : mesh_(mesh)
+    {
+        if (mesh.triangles.empty()) throw std::invalid_argument("reference mesh is empty");
+        ids_.resize(mesh.triangles.size());
+        std::iota(ids_.begin(), ids_.end(), std::uint32_t{0});
+        nodes_.reserve(mesh.triangles.size() * 2);
+        build(0, static_cast<std::uint32_t>(ids_.size()));
+    }
+
+    std::pair<double, Vec3> nearest(const Vec3 point) const
+    {
+        struct Visit { double lower; std::uint32_t node; };
+        struct Greater { bool operator()(const Visit& a, const Visit& b) const { return a.lower > b.lower; } };
+        std::priority_queue<Visit, std::vector<Visit>, Greater> queue;
+        queue.push({boundsDistanceSquared(nodes_[0].bounds, point), 0});
+        double best = std::numeric_limits<double>::infinity();
+        Vec3 nearest{};
+        while (!queue.empty())
+        {
+            const Visit visit = queue.top();
+            queue.pop();
+            if (visit.lower >= best) continue;
+            const Node& node = nodes_[visit.node];
+            if (node.count != 0)
+            {
+                for (std::uint32_t offset = 0; offset < node.count; ++offset)
+                {
+                    const auto face = mesh_.triangles[ids_[node.begin + offset]];
+                    const Vec3 candidate = closestPointOnTriangle(
+                        point, toVec(mesh_.vertices[face[0]]),
+                        toVec(mesh_.vertices[face[1]]), toVec(mesh_.vertices[face[2]]));
+                    const double distance = normSquared(point - candidate);
+                    if (distance < best) { best = distance; nearest = candidate; }
+                }
+            }
+            else
+            {
+                for (const std::uint32_t child : {node.left, node.right})
+                {
+                    const double lower = boundsDistanceSquared(nodes_[child].bounds, point);
+                    if (lower < best) queue.push({lower, child});
+                }
+            }
+        }
+        return {std::sqrt(best), nearest};
+    }
+
+private:
+    struct Node
+    {
+        Bounds bounds;
+        std::uint32_t begin = 0;
+        std::uint32_t count = 0;
+        std::uint32_t left = 0;
+        std::uint32_t right = 0;
+    };
+
+    std::uint32_t build(const std::uint32_t begin, const std::uint32_t end)
+    {
+        const std::uint32_t id = static_cast<std::uint32_t>(nodes_.size());
+        nodes_.push_back({});
+        Bounds bounds;
+        Bounds centers;
+        for (std::uint32_t i = begin; i < end; ++i)
+        {
+            const auto face = mesh_.triangles[ids_[i]];
+            Vec3 center{};
+            for (const auto vertex : face)
+            {
+                const Vec3 p = toVec(mesh_.vertices[vertex]);
+                include(bounds, p);
+                center = center + p * (1.0 / 3.0);
+            }
+            include(centers, center);
+        }
+        nodes_[id].bounds = bounds;
+        const std::uint32_t count = end - begin;
+        if (count <= 8)
+        {
+            nodes_[id].begin = begin;
+            nodes_[id].count = count;
+            return id;
+        }
+        const Vec3 extent = centers.upper - centers.lower;
+        const int axis = extent.y > extent.x ? (extent.z > extent.y ? 2 : 1)
+                                             : (extent.z > extent.x ? 2 : 0);
+        const auto coordinate = [axis](const Vec3 p) { return axis == 0 ? p.x : axis == 1 ? p.y : p.z; };
+        const std::uint32_t middle = begin + count / 2;
+        std::nth_element(ids_.begin() + begin, ids_.begin() + middle, ids_.begin() + end,
+            [&](const std::uint32_t first, const std::uint32_t second)
+            {
+                const auto centroid = [&](const std::uint32_t face_id)
+                {
+                    const auto f = mesh_.triangles[face_id];
+                    return (toVec(mesh_.vertices[f[0]]) + toVec(mesh_.vertices[f[1]]) +
+                            toVec(mesh_.vertices[f[2]])) * (1.0 / 3.0);
+                };
+                return coordinate(centroid(first)) < coordinate(centroid(second));
+            });
+        const std::uint32_t left = build(begin, middle);
+        const std::uint32_t right = build(middle, end);
+        nodes_[id].left = left;
+        nodes_[id].right = right;
+        return id;
+    }
+
+    const MeshModel& mesh_;
+    std::vector<std::uint32_t> ids_;
+    std::vector<Node> nodes_;
+};
+
+DirectedHausdorffCertificate certifyWithBvh(
+    const MeshModel& proxy, const TriangleBvh& reference_bvh,
+    const double maximum_distance, const std::uint32_t maximum_depth,
+    const double numerical_tolerance)
+{
+    DirectedHausdorffCertificate result;
+    result.passed = true;
+    struct Node { Vec3 a,b,c; std::uint32_t depth; };
+    std::vector<Node> stack;
+    const double tolerance = numerical_tolerance * std::max(1.0, maximum_distance);
+    for (const auto face : proxy.triangles)
+    {
+        stack.push_back({toVec(proxy.vertices[face[0]]), toVec(proxy.vertices[face[1]]),
+                         toVec(proxy.vertices[face[2]]), 0});
+        while (!stack.empty())
+        {
+            const Node node = stack.back();
+            stack.pop_back();
+            ++result.subdivision_nodes;
+            std::array<double, 4> distances{};
+            std::array<Vec3, 4> nearest{};
+            const std::array<Vec3, 4> samples{node.a, node.b, node.c,
+                                              (node.a + node.b + node.c) * (1.0 / 3.0)};
+            for (int i = 0; i < 4; ++i)
+            {
+                std::tie(distances[i], nearest[i]) = reference_bvh.nearest(samples[i]);
+                ++result.reference_queries;
+                if (distances[i] > result.lower_bound)
+                {
+                    result.lower_bound = distances[i];
+                    result.maximum_proxy_point = {samples[i].x, samples[i].y, samples[i].z};
+                    result.nearest_reference_point = {nearest[i].x, nearest[i].y, nearest[i].z};
+                }
+                if (distances[i] > maximum_distance + tolerance)
+                {
+                    result.passed = false;
+                    result.failure_reason = "witness point exceeds the directed Hausdorff limit";
+                    result.upper_bound = std::numeric_limits<double>::infinity();
+                    return result;
+                }
+            }
+            const double radius = std::max({norm(node.a-node.b), norm(node.b-node.c),
+                                            norm(node.c-node.a)}) * (2.0 / 3.0);
+            const double local_upper = distances[3] + radius;
+            if (local_upper <= maximum_distance)
+            {
+                result.upper_bound = std::max(result.upper_bound, local_upper);
+                continue;
+            }
+            if (node.depth >= maximum_depth)
+            {
+                result.passed = false;
+                result.failure_reason = "certificate depth exhausted before proving the upper bound";
+                return result;
+            }
+            const Vec3 ab = (node.a + node.b) * 0.5;
+            const Vec3 bc = (node.b + node.c) * 0.5;
+            const Vec3 ca = (node.c + node.a) * 0.5;
+            const auto depth = node.depth + 1;
+            stack.push_back({node.a,ab,ca,depth});
+            stack.push_back({ab,node.b,bc,depth});
+            stack.push_back({ca,bc,node.c,depth});
+            stack.push_back({ab,bc,ca,depth});
+        }
+    }
+    return result;
+}
+
+MeshModel makeBox(const MeshModel& reference)
+{
+    Bounds bounds;
+    for (const Position3 p : reference.vertices) include(bounds, toVec(p));
+    MeshModel box;
+    box.name = "axis_aligned_enclosing_box";
+    for (int x = 0; x < 2; ++x)
+        for (int y = 0; y < 2; ++y)
+            for (int z = 0; z < 2; ++z)
+                box.vertices.push_back({x ? bounds.upper.x : bounds.lower.x,
+                                        y ? bounds.upper.y : bounds.lower.y,
+                                        z ? bounds.upper.z : bounds.lower.z});
+    box.triangles = {
+        {0,2,3},{0,3,1}, {4,5,7},{4,7,6},
+        {0,1,5},{0,5,4}, {2,6,7},{2,7,3},
+        {0,4,6},{0,6,2}, {1,3,7},{1,7,5}};
+    return box;
+}
+
+MeshModel makeConvexHull(const MeshModel& reference)
+{
+    std::vector<quickhull::Vector3<double>> points;
+    points.reserve(reference.vertices.size());
+    for (const Position3 p : reference.vertices) points.emplace_back(p.x, p.y, p.z);
+    std::sort(points.begin(),points.end(),[](const auto& first,const auto& second)
+    { return std::tie(first.x,first.y,first.z)<std::tie(second.x,second.y,second.z); });
+    points.erase(std::unique(points.begin(),points.end(),[](const auto& first,const auto& second)
+    { return first.x==second.x && first.y==second.y && first.z==second.z; }),points.end());
+    if (points.size()<4) throw std::runtime_error("convex hull input is lower dimensional");
+    quickhull::QuickHull<double> builder;
+    const auto hull = builder.getConvexHull(points, true, false, 0.0);
+    if (builder.getDiagnostics().m_failedHorizonEdges != 0)
+        throw std::runtime_error("QuickHull reported an unresolved horizon edge");
+    MeshModel result;
+    result.name = "convex_hull_of_all_phase1_vertices";
+    for (const auto& p : hull.getVertexBuffer()) result.vertices.push_back({p.x, p.y, p.z});
+    const auto& indices = hull.getIndexBuffer();
+    for (std::size_t i = 0; i + 2 < indices.size(); i += 3)
+        result.triangles.push_back({static_cast<std::uint32_t>(indices[i]),
+                                    static_cast<std::uint32_t>(indices[i + 1]),
+                                    static_cast<std::uint32_t>(indices[i + 2])});
+    if (result.triangles.empty()) throw std::runtime_error("convex hull construction failed");
+    Bounds hull_bounds;
+    for (const Position3 point : result.vertices) include(hull_bounds,toVec(point));
+    const double scale=norm(hull_bounds.upper-hull_bounds.lower);
+    for (const TriangleIndices face : result.triangles)
+        if (norm(cross(toVec(result.vertices[face[1]])-toVec(result.vertices[face[0]]),
+                       toVec(result.vertices[face[2]])-toVec(result.vertices[face[0]]))) <=
+            std::max(1.0e-20,scale*scale*1.0e-14))
+            throw std::runtime_error("convex hull contains a degenerate face");
+    return result;
+}
+
+Vec3 normalized(Vec3 value);
+
+MeshModel makeConvexHull(const MeshModel& reference,
+                         const std::vector<std::uint32_t>& faces)
+{
+    MeshModel subset;
+    subset.name = "convex_face_group";
+    subset.vertices.reserve(faces.size() * 3);
+    for (const std::uint32_t face_id : faces)
+        for (const std::uint32_t vertex : reference.triangles[face_id])
+            subset.vertices.push_back(reference.vertices[vertex]);
+    return makeConvexHull(subset);
+}
+
+struct ConvexPiece
+{
+    MeshModel mesh;
+    Bounds bounds;
+    std::vector<Vec3> normals;
+    std::vector<double> offsets;
+    std::vector<std::uint32_t> responsibility;
+};
+
+ConvexPiece makeConvexPiece(MeshModel mesh, std::vector<std::uint32_t> responsibility)
+{
+    ConvexPiece piece;
+    piece.mesh = std::move(mesh);
+    piece.responsibility = std::move(responsibility);
+    Vec3 center{};
+    for (const Position3 point : piece.mesh.vertices)
+    {
+        include(piece.bounds, toVec(point));
+        center = center + toVec(point);
+    }
+    center = center * (1.0 / piece.mesh.vertices.size());
+    piece.normals.reserve(piece.mesh.triangles.size());
+    piece.offsets.reserve(piece.mesh.triangles.size());
+    for (TriangleIndices& face : piece.mesh.triangles)
+    {
+        const Vec3 a = toVec(piece.mesh.vertices[face[0]]);
+        const Vec3 b = toVec(piece.mesh.vertices[face[1]]);
+        const Vec3 c = toVec(piece.mesh.vertices[face[2]]);
+        Vec3 normal = normalized(cross(b-a, c-a));
+        if (dot(normal, center-a) > 0.0)
+        {
+            std::swap(face[1], face[2]);
+            normal = normal * -1.0;
+        }
+        piece.normals.push_back(normal);
+        piece.offsets.push_back(dot(normal, a));
+    }
+    return piece;
+}
+
+bool boundsOverlap(const Bounds& first, const Bounds& second, const double tolerance)
+{
+    return first.upper.x >= second.lower.x-tolerance &&
+           second.upper.x >= first.lower.x-tolerance &&
+           first.upper.y >= second.lower.y-tolerance &&
+           second.upper.y >= first.lower.y-tolerance &&
+           first.upper.z >= second.lower.z-tolerance &&
+           second.upper.z >= first.lower.z-tolerance;
+}
+
+std::vector<Vec3> clipPolygonInsideConvexPiece(
+    std::vector<Vec3> polygon, const ConvexPiece& piece, const double tolerance)
+{
+    for (std::size_t plane = 0; plane < piece.normals.size() && !polygon.empty(); ++plane)
+    {
+        std::vector<Vec3> clipped;
+        clipped.reserve(polygon.size()+2);
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3 first = polygon[index];
+            const Vec3 second = polygon[(index+1)%polygon.size()];
+            const double first_distance = dot(piece.normals[plane], first)-piece.offsets[plane];
+            const double second_distance = dot(piece.normals[plane], second)-piece.offsets[plane];
+            const bool first_inside = first_distance <= tolerance;
+            const bool second_inside = second_distance <= tolerance;
+            if (first_inside) clipped.push_back(first);
+            if (first_inside == second_inside) continue;
+            const double denominator = first_distance-second_distance;
+            if (std::abs(denominator) <= 1.0e-30) continue;
+            clipped.push_back(first+(second-first)*
+                std::clamp(first_distance/denominator, 0.0, 1.0));
+        }
+        polygon = std::move(clipped);
+    }
+    return polygon;
+}
+
+MeshModel convexUnionOuterSurface(
+    const std::vector<ConvexPiece>& pieces, const MeshModel& exact_fallback,
+    const double scale)
+{
+    constexpr int precision = 8;
+    const double tolerance = std::max(1.0e-10, scale*1.0e-10);
+    MeshModel result;
+    result.name = "adaptive_certified_convex_cover_exposed_boundary";
+    const auto appendTriangle = [&](const Vec3 a, const Vec3 b, const Vec3 c)
+    {
+        if (normSquared(cross(b-a,c-a)) <= tolerance*tolerance) return;
+        const std::uint32_t base = static_cast<std::uint32_t>(result.vertices.size());
+        result.vertices.push_back(toPosition(a));
+        result.vertices.push_back(toPosition(b));
+        result.vertices.push_back(toPosition(c));
+        result.triangles.push_back({base,base+1,base+2});
+    };
+    for (std::size_t piece_id = 0; piece_id < pieces.size(); ++piece_id)
+    {
+        const ConvexPiece& piece = pieces[piece_id];
+        for (std::size_t face_id = 0; face_id < piece.mesh.triangles.size(); ++face_id)
+        {
+            const TriangleIndices face = piece.mesh.triangles[face_id];
+            const Vec3 origin = toVec(piece.mesh.vertices[face[0]]);
+            const Vec3 normal = piece.normals[face_id];
+            const Vec3 basis_u = std::abs(normal.x) < 0.8
+                ? normalized(cross(normal,{1,0,0}))
+                : normalized(cross(normal,{0,1,0}));
+            const Vec3 basis_v = cross(normal,basis_u);
+            const auto project = [&](const Vec3 point)
+            {
+                const Vec3 relative = point-origin;
+                return Clipper2Lib::PointD(dot(relative,basis_u),dot(relative,basis_v));
+            };
+            Clipper2Lib::PathD original;
+            for (const std::uint32_t vertex : face)
+                original.push_back(project(toVec(piece.mesh.vertices[vertex])));
+            if (Clipper2Lib::Area(original)<0.0) std::reverse(original.begin(),original.end());
+            Clipper2Lib::PathsD remaining{original};
+            for (std::size_t other_id = 0; other_id < pieces.size() && !remaining.empty(); ++other_id)
+            {
+                if (piece_id == other_id || !boundsOverlap(piece.bounds,pieces[other_id].bounds,tolerance))
+                    continue;
+                const ConvexPiece& other = pieces[other_id];
+                bool same_facing_coplanar = false;
+                for (std::size_t other_face = 0; other_face < other.normals.size(); ++other_face)
+                    if (dot(normal,other.normals[other_face]) > 1.0-1.0e-10 &&
+                        std::abs(dot(normal,toVec(other.mesh.vertices[
+                            other.mesh.triangles[other_face][0]]))-piece.offsets[face_id]) <= tolerance*8.0)
+                    {
+                        same_facing_coplanar = true;
+                        break;
+                    }
+                if (same_facing_coplanar && piece_id < other_id) continue;
+                std::vector<Vec3> intersection = clipPolygonInsideConvexPiece(
+                    {toVec(piece.mesh.vertices[face[0]]),
+                     toVec(piece.mesh.vertices[face[1]]),
+                     toVec(piece.mesh.vertices[face[2]])}, other, tolerance*8.0);
+                if (intersection.size()<3) continue;
+                Clipper2Lib::PathD clip;
+                for (const Vec3 point : intersection) clip.push_back(project(point));
+                if (std::abs(Clipper2Lib::Area(clip))<=tolerance*tolerance) continue;
+                if (Clipper2Lib::Area(clip)<0.0) std::reverse(clip.begin(),clip.end());
+                remaining = Clipper2Lib::Difference(
+                    remaining,Clipper2Lib::PathsD{clip},Clipper2Lib::FillRule::NonZero,precision);
+            }
+            Clipper2Lib::PathsD triangles;
+            if (!remaining.empty() && Clipper2Lib::Triangulate(
+                    remaining,precision,triangles,false)==Clipper2Lib::TriangulateResult::success)
+                for (const auto& triangle : triangles)
+                    if (triangle.size()==3)
+                        appendTriangle(origin+basis_u*triangle[0].x+basis_v*triangle[0].y,
+                                       origin+basis_u*triangle[1].x+basis_v*triangle[1].y,
+                                       origin+basis_u*triangle[2].x+basis_v*triangle[2].y);
+        }
+    }
+    // Exact fallback triangles are zero-error surface responsibility. Remove
+    // only the portions certified inside an accepted closed convex piece.
+    for (const TriangleIndices face : exact_fallback.triangles)
+    {
+        const Vec3 origin=toVec(exact_fallback.vertices[face[0]]);
+        Vec3 normal=cross(toVec(exact_fallback.vertices[face[1]])-origin,
+                          toVec(exact_fallback.vertices[face[2]])-origin);
+        if (norm(normal)<=tolerance*tolerance) continue;
+        normal=normalized(normal);
+        const Vec3 basis_u=std::abs(normal.x)<0.8
+            ? normalized(cross(normal,{1,0,0}))
+            : normalized(cross(normal,{0,1,0}));
+        const Vec3 basis_v=cross(normal,basis_u);
+        const auto project=[&](const Vec3 point)
+        {
+            const Vec3 relative=point-origin;
+            return Clipper2Lib::PointD(dot(relative,basis_u),dot(relative,basis_v));
+        };
+        Clipper2Lib::PathD original;
+        for (const std::uint32_t vertex:face)
+            original.push_back(project(toVec(exact_fallback.vertices[vertex])));
+        if (Clipper2Lib::Area(original)<0.0) std::reverse(original.begin(),original.end());
+        Clipper2Lib::PathsD remaining{original};
+        Bounds face_bounds;
+        for (const std::uint32_t vertex:face) include(face_bounds,toVec(exact_fallback.vertices[vertex]));
+        for (const ConvexPiece& piece:pieces)
+        {
+            if (!boundsOverlap(face_bounds,piece.bounds,tolerance)||remaining.empty()) continue;
+            std::vector<Vec3> intersection=clipPolygonInsideConvexPiece(
+                {toVec(exact_fallback.vertices[face[0]]),
+                 toVec(exact_fallback.vertices[face[1]]),
+                 toVec(exact_fallback.vertices[face[2]])},piece,tolerance*8.0);
+            if (intersection.size()<3) continue;
+            Clipper2Lib::PathD clip;
+            for (const Vec3 point:intersection) clip.push_back(project(point));
+            if (std::abs(Clipper2Lib::Area(clip))<=tolerance*tolerance) continue;
+            if (Clipper2Lib::Area(clip)<0.0) std::reverse(clip.begin(),clip.end());
+            remaining=Clipper2Lib::Difference(
+                remaining,Clipper2Lib::PathsD{clip},Clipper2Lib::FillRule::NonZero,precision);
+        }
+        Clipper2Lib::PathsD triangles;
+        if (!remaining.empty()&&Clipper2Lib::Triangulate(
+                remaining,precision,triangles,false)==Clipper2Lib::TriangulateResult::success)
+            for (const auto& triangle:triangles)
+                if (triangle.size()==3)
+                    appendTriangle(origin+basis_u*triangle[0].x+basis_v*triangle[0].y,
+                                   origin+basis_u*triangle[1].x+basis_v*triangle[1].y,
+                                   origin+basis_u*triangle[2].x+basis_v*triangle[2].y);
+    }
+    return canonicalizeCoplanarTriangleSoup(result);
+}
+
+MeshModel adaptiveConvexCover(
+    const MeshModel& reference, const double maximum_distance,
+    const std::uint32_t maximum_depth, const double numerical_tolerance)
+{
+    const TriangleBvh reference_bvh(reference);
+    std::vector<ConvexPiece> accepted_pieces;
+    MeshModel exact_fallback;
+    exact_fallback.name = "adaptive_convex_exact_fallback";
+    struct Group { std::vector<std::uint32_t> faces; std::uint32_t depth = 0; };
+    Group root;
+    root.faces.resize(reference.triangles.size());
+    std::iota(root.faces.begin(), root.faces.end(), std::uint32_t{0});
+    std::vector<Group> stack;
+    stack.push_back(std::move(root));
+    const auto appendFallback = [&](const MeshModel& patch)
+    {
+        const std::uint32_t base = static_cast<std::uint32_t>(exact_fallback.vertices.size());
+        exact_fallback.vertices.insert(exact_fallback.vertices.end(),patch.vertices.begin(),patch.vertices.end());
+        for (const TriangleIndices face : patch.triangles)
+            exact_fallback.triangles.push_back({base+face[0],base+face[1],base+face[2]});
+    };
+    while (!stack.empty())
+    {
+        Group group = std::move(stack.back());
+        stack.pop_back();
+        MeshModel hull;
+        bool hull_built = false;
+        if (group.faces.size() >= 4)
+        {
+            try
+            {
+                hull = makeConvexHull(reference, group.faces);
+                hull_built = !hull.triangles.empty() && hull.triangles.size() < group.faces.size();
+            }
+            catch (const std::exception&) {}
+        }
+        if (hull_built)
+        {
+            const auto certificate = certifyWithBvh(
+                hull, reference_bvh, maximum_distance, maximum_depth, numerical_tolerance);
+            if (certificate.passed)
+            {
+                ConvexPiece piece=makeConvexPiece(std::move(hull),group.faces);
+                Bounds piece_bounds;
+                for (const Position3 point : piece.mesh.vertices) include(piece_bounds,toVec(point));
+                const double piece_scale=norm(piece_bounds.upper-piece_bounds.lower);
+                const double coverage_tolerance=std::max(1.0e-9,piece_scale*1.0e-9);
+                bool covers=true;
+                for (const std::uint32_t face_id : group.faces)
+                    for (const std::uint32_t vertex : reference.triangles[face_id])
+                        for (std::size_t plane=0;plane<piece.normals.size();++plane)
+                            if (dot(piece.normals[plane],toVec(reference.vertices[vertex])) >
+                                piece.offsets[plane]+coverage_tolerance)
+                            {
+                                covers=false;
+                                break;
+                            }
+                if (covers)
+                {
+                    accepted_pieces.push_back(std::move(piece));
+                    continue;
+                }
+            }
+        }
+        if (group.faces.size() <= 8 || group.depth >= 32)
+        {
+            MeshModel fallback;
+            fallback.name = "exact_face_group_fallback";
+            std::unordered_map<std::uint32_t,std::uint32_t> vertex_map;
+            fallback.triangles.reserve(group.faces.size());
+            for (const std::uint32_t face_id : group.faces)
+            {
+                TriangleIndices face{};
+                for (int local = 0; local < 3; ++local)
+                {
+                    const std::uint32_t source_vertex = reference.triangles[face_id][local];
+                    const auto [iterator, inserted] = vertex_map.try_emplace(
+                        source_vertex, static_cast<std::uint32_t>(fallback.vertices.size()));
+                    if (inserted) fallback.vertices.push_back(reference.vertices[source_vertex]);
+                    face[local] = iterator->second;
+                }
+                fallback.triangles.push_back(face);
+            }
+            appendFallback(fallback);
+            continue;
+        }
+        Bounds centers;
+        std::vector<std::pair<double,std::uint32_t>> ordered;
+        ordered.reserve(group.faces.size());
+        for (const std::uint32_t face_id : group.faces)
+        {
+            const auto face = reference.triangles[face_id];
+            const Vec3 center = (toVec(reference.vertices[face[0]]) +
+                                 toVec(reference.vertices[face[1]]) +
+                                 toVec(reference.vertices[face[2]])) * (1.0/3.0);
+            include(centers, center);
+        }
+        const Vec3 extent = centers.upper - centers.lower;
+        const int axis = extent.y > extent.x ? (extent.z > extent.y ? 2 : 1)
+                                             : (extent.z > extent.x ? 2 : 0);
+        const auto coordinate = [axis](const Vec3 point)
+        { return axis == 0 ? point.x : axis == 1 ? point.y : point.z; };
+        for (const std::uint32_t face_id : group.faces)
+        {
+            const auto face = reference.triangles[face_id];
+            const Vec3 center = (toVec(reference.vertices[face[0]]) +
+                                 toVec(reference.vertices[face[1]]) +
+                                 toVec(reference.vertices[face[2]])) * (1.0/3.0);
+            ordered.emplace_back(coordinate(center), face_id);
+        }
+        const std::size_t middle = ordered.size()/2;
+        std::nth_element(ordered.begin(), ordered.begin()+middle, ordered.end());
+        Group first, second;
+        first.depth = second.depth = group.depth + 1;
+        first.faces.reserve(middle);
+        second.faces.reserve(ordered.size()-middle);
+        for (std::size_t i = 0; i < ordered.size(); ++i)
+            (i < middle ? first.faces : second.faces).push_back(ordered[i].second);
+        stack.push_back(std::move(second));
+        stack.push_back(std::move(first));
+    }
+    Bounds reference_bounds;
+    for (const Position3 point : reference.vertices) include(reference_bounds,toVec(point));
+    const double scale = norm(reference_bounds.upper-reference_bounds.lower);
+    // Every responsibility triangle is either certified inside one accepted
+    // convex piece above or copied exactly. Removing faces inside another
+    // accepted convex solid does not change that union coverage.
+    return convexUnionOuterSurface(accepted_pieces,exact_fallback,scale);
+}
+
+Vec3 normalized(const Vec3 value)
+{
+    const double length = norm(value);
+    if (!(length > 0.0)) throw std::invalid_argument("zero polytope direction");
+    return value * (1.0 / length);
+}
+
+std::vector<Vec3> kdopDirections(const int family)
+{
+    std::vector<Vec3> result{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+    const auto addSigned = [&](const Vec3 base)
+    {
+        for (int sx : {-1, 1}) for (int sy : {-1, 1}) for (int sz : {-1, 1})
+        {
+            Vec3 direction{base.x*sx, base.y*sy, base.z*sz};
+            if (normSquared(direction) == 0.0) continue;
+            direction = normalized(direction);
+            if (std::none_of(result.begin(), result.end(), [&](const Vec3 existing)
+                { return normSquared(existing - direction) < 1.0e-20; }))
+                result.push_back(direction);
+        }
+    };
+    if (family >= 18)
+    {
+        addSigned({1,1,0});
+        addSigned({1,0,1});
+        addSigned({0,1,1});
+    }
+    if (family == 14 || family >= 26) addSigned({1,1,1});
+    return result;
+}
+
+MeshModel makeSupportPolytope(const MeshModel& reference, const int family)
+{
+    const std::vector<Vec3> directions = kdopDirections(family);
+    std::vector<double> supports(directions.size(), -std::numeric_limits<double>::infinity());
+    Bounds bounds;
+    for (const Position3 point : reference.vertices)
+    {
+        const Vec3 p = toVec(point);
+        include(bounds, p);
+        for (std::size_t i = 0; i < directions.size(); ++i)
+            supports[i] = std::max(supports[i], dot(directions[i], p));
+    }
+    const double scale = norm(bounds.upper - bounds.lower);
+    const double tolerance = std::max(1.0e-10, scale * 1.0e-10);
+    MeshModel result;
+    result.name = std::to_string(family) + "_dop_support_polytope";
+    for (std::size_t i = 0; i < directions.size(); ++i)
+        for (std::size_t j = i + 1; j < directions.size(); ++j)
+            for (std::size_t k = j + 1; k < directions.size(); ++k)
+            {
+                const Vec3 jk = cross(directions[j], directions[k]);
+                const double determinant = dot(directions[i], jk);
+                if (std::abs(determinant) <= 1.0e-12) continue;
+                const Vec3 point = (jk * supports[i] +
+                    cross(directions[k], directions[i]) * supports[j] +
+                    cross(directions[i], directions[j]) * supports[k]) * (1.0 / determinant);
+                bool inside = true;
+                for (std::size_t plane = 0; plane < directions.size(); ++plane)
+                    inside &= dot(directions[plane], point) <= supports[plane] + tolerance;
+                if (!inside) continue;
+                if (std::none_of(result.vertices.begin(), result.vertices.end(), [&](const Position3 existing)
+                    { return normSquared(toVec(existing) - point) <= tolerance*tolerance; }))
+                    result.vertices.push_back(toPosition(point));
+            }
+    for (std::size_t plane = 0; plane < directions.size(); ++plane)
+    {
+        std::vector<std::uint32_t> face_vertices;
+        for (std::uint32_t vertex = 0; vertex < result.vertices.size(); ++vertex)
+            if (std::abs(dot(directions[plane], toVec(result.vertices[vertex])) - supports[plane]) <=
+                tolerance * 4.0)
+                face_vertices.push_back(vertex);
+        if (face_vertices.size() < 3) continue;
+        Vec3 basis_u = std::abs(directions[plane].x) < 0.8
+            ? normalized(cross(directions[plane], {1,0,0}))
+            : normalized(cross(directions[plane], {0,1,0}));
+        const Vec3 basis_v = cross(directions[plane], basis_u);
+        Vec3 center{};
+        for (const auto vertex : face_vertices) center = center + toVec(result.vertices[vertex]);
+        center = center * (1.0 / face_vertices.size());
+        std::sort(face_vertices.begin(), face_vertices.end(), [&](const std::uint32_t first,
+                                                                  const std::uint32_t second)
+        {
+            const Vec3 a = toVec(result.vertices[first]) - center;
+            const Vec3 b = toVec(result.vertices[second]) - center;
+            return std::atan2(dot(a,basis_v), dot(a,basis_u)) <
+                   std::atan2(dot(b,basis_v), dot(b,basis_u));
+        });
+        for (std::size_t i = 1; i + 1 < face_vertices.size(); ++i)
+            result.triangles.push_back({face_vertices[0], face_vertices[i], face_vertices[i+1]});
+    }
+    if (result.triangles.empty()) throw std::runtime_error("support polytope construction failed");
+    return result;
+}
+
+struct EdgeKey
+{
+    std::uint32_t first = 0;
+    std::uint32_t second = 0;
+    auto operator<=>(const EdgeKey&) const = default;
+};
+
+struct EdgeHash
+{
+    std::size_t operator()(const EdgeKey key) const
+    {
+        return (static_cast<std::size_t>(key.first) << 32) ^ key.second;
+    }
+};
+
+MeshModel convexifyCoplanarComponents(
+    const MeshModel& input, const MeshModel& reference,
+    const double maximum_distance, const std::uint32_t maximum_depth,
+    const double numerical_tolerance)
+{
+    if (input.triangles.empty()) return input;
+    Bounds bounds;
+    for (const Position3 point : input.vertices) include(bounds, toVec(point));
+    const double scale = norm(bounds.upper - bounds.lower);
+    const double planar_tolerance = std::max(1.0e-10, scale * 1.0e-11);
+    std::vector<std::uint32_t> parent(input.triangles.size());
+    std::iota(parent.begin(), parent.end(), std::uint32_t{0});
+    const auto root = [&](std::uint32_t value)
+    {
+        while (parent[value] != value)
+        {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        return value;
+    };
+    const auto unite = [&](std::uint32_t first, std::uint32_t second)
+    {
+        first = root(first);
+        second = root(second);
+        if (first != second) parent[second] = first;
+    };
+    struct Plane { Vec3 normal; double offset = 0.0; bool valid = false; };
+    std::vector<Plane> planes(input.triangles.size());
+    for (std::size_t face_id = 0; face_id < input.triangles.size(); ++face_id)
+    {
+        const auto face = input.triangles[face_id];
+        const Vec3 a = toVec(input.vertices[face[0]]);
+        const Vec3 normal_value = cross(toVec(input.vertices[face[1]]) - a,
+                                        toVec(input.vertices[face[2]]) - a);
+        const double length = norm(normal_value);
+        if (length > planar_tolerance * planar_tolerance)
+        {
+            planes[face_id] = {normal_value * (1.0 / length), 0.0, true};
+            planes[face_id].offset = dot(planes[face_id].normal, a);
+        }
+    }
+    std::unordered_map<EdgeKey, std::uint32_t, EdgeHash> edges;
+    for (std::uint32_t face_id = 0; face_id < input.triangles.size(); ++face_id)
+    {
+        const auto face = input.triangles[face_id];
+        for (int local = 0; local < 3; ++local)
+        {
+            const EdgeKey edge{std::min(face[local], face[(local+1)%3]),
+                               std::max(face[local], face[(local+1)%3])};
+            const auto [iterator, inserted] = edges.emplace(edge, face_id);
+            if (inserted) continue;
+            const std::uint32_t other = iterator->second;
+            if (!planes[face_id].valid || !planes[other].valid) continue;
+            const double alignment = dot(planes[face_id].normal, planes[other].normal);
+            if (alignment < 1.0 - 1.0e-12) continue;
+            const Position3 point = input.vertices[input.triangles[other][0]];
+            if (std::abs(dot(planes[face_id].normal, toVec(point)) - planes[face_id].offset) >
+                planar_tolerance) continue;
+            unite(face_id, other);
+        }
+    }
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> groups;
+    for (std::uint32_t face = 0; face < input.triangles.size(); ++face)
+        groups[root(face)].push_back(face);
+
+    std::vector<std::uint8_t> replaced(input.triangles.size(), 0);
+    const TriangleBvh reference_bvh(reference);
+    MeshModel result;
+    result.name = "certified_planar_component_convexification";
+    result.vertices = input.vertices;
+    for (const auto& [representative, faces] : groups)
+    {
+        if (faces.size() <= 1 || !planes[representative].valid) continue;
+        const Vec3 normal = planes[representative].normal;
+        const Vec3 basis_u = std::abs(normal.x) < 0.8
+            ? normalized(cross(normal, {1,0,0}))
+            : normalized(cross(normal, {0,1,0}));
+        const Vec3 basis_v = cross(normal, basis_u);
+        struct Point2 { double x,y; std::uint32_t vertex; };
+        std::vector<Point2> points;
+        for (const std::uint32_t face_id : faces)
+            for (const std::uint32_t vertex : input.triangles[face_id])
+                points.push_back({dot(toVec(input.vertices[vertex]), basis_u),
+                                  dot(toVec(input.vertices[vertex]), basis_v), vertex});
+        std::sort(points.begin(), points.end(), [](const Point2& a, const Point2& b)
+        { return std::tie(a.x,a.y,a.vertex) < std::tie(b.x,b.y,b.vertex); });
+        points.erase(std::unique(points.begin(), points.end(), [&](const Point2& a, const Point2& b)
+        { return std::abs(a.x-b.x) <= planar_tolerance && std::abs(a.y-b.y) <= planar_tolerance; }),
+                     points.end());
+        if (points.size() < 3) continue;
+        const auto turn = [](const Point2& a, const Point2& b, const Point2& c)
+        { return (b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x); };
+        std::vector<Point2> hull(points.size()*2);
+        std::size_t count = 0;
+        for (const Point2 point : points)
+        {
+            while (count >= 2 && turn(hull[count-2], hull[count-1], point) <= 0.0) --count;
+            hull[count++] = point;
+        }
+        const std::size_t lower_count = count;
+        for (auto iterator = points.rbegin() + 1; iterator != points.rend(); ++iterator)
+        {
+            while (count > lower_count && turn(hull[count-2], hull[count-1], *iterator) <= 0.0) --count;
+            hull[count++] = *iterator;
+        }
+        if (count > 1) --count;
+        hull.resize(count);
+        if (hull.size() < 3 || hull.size() - 2 >= faces.size()) continue;
+        MeshModel patch;
+        patch.name = "planar_component_candidate";
+        for (const Point2 point : hull)
+        {
+            const Vec3 projected = basis_u * point.x + basis_v * point.y +
+                normal * planes[representative].offset;
+            patch.vertices.push_back(toPosition(projected));
+        }
+        for (std::size_t index = 1; index + 1 < patch.vertices.size(); ++index)
+            patch.triangles.push_back({0, static_cast<std::uint32_t>(index),
+                                      static_cast<std::uint32_t>(index+1)});
+        const DirectedHausdorffCertificate certificate = certifyWithBvh(
+            patch, reference_bvh, maximum_distance, maximum_depth, numerical_tolerance);
+        if (!certificate.passed) continue;
+        const std::uint32_t base = static_cast<std::uint32_t>(result.vertices.size());
+        result.vertices.insert(result.vertices.end(), patch.vertices.begin(), patch.vertices.end());
+        for (const TriangleIndices face : patch.triangles)
+            result.triangles.push_back({base+face[0], base+face[1], base+face[2]});
+        for (const std::uint32_t face : faces) replaced[face] = 1;
+    }
+    for (std::size_t face = 0; face < input.triangles.size(); ++face)
+        if (!replaced[face]) result.triangles.push_back(input.triangles[face]);
+    return canonicalizeCoplanarTriangleSoup(result);
+}
+
+void writeObj(const std::filesystem::path& path, const MeshModel& mesh)
+{
+    std::ofstream stream(path);
+    if (!stream) throw std::runtime_error("failed to create OBJ: " + path.string());
+    stream << std::setprecision(17) << "o " << mesh.name << '\n';
+    for (const Position3 p : mesh.vertices) stream << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+    for (const TriangleIndices f : mesh.triangles)
+        stream << "f " << f[0] + 1 << ' ' << f[1] + 1 << ' ' << f[2] + 1 << '\n';
+}
+
+template<class T>
+void readExact(std::ifstream& stream, T* data, const std::size_t count, const char* label)
+{
+    stream.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(sizeof(T) * count));
+    if (!stream) throw std::runtime_error(std::string("truncated PQSSHED1 ") + label);
+}
+
+void validateHalfedge(const OrientedSurfaceMesh& mesh)
+{
+    const auto face_count = mesh.geometry.triangles.size();
+    const auto edge_count = mesh.halfedges.size();
+    if (edge_count != face_count * 3 || mesh.face_halfedges.size() != face_count ||
+        mesh.vertex_halfedges.size() != mesh.geometry.vertices.size())
+        throw std::runtime_error("PQSSHED1 arrays have inconsistent counts");
+    for (std::uint32_t face = 0; face < face_count; ++face)
+    {
+        const std::uint32_t first = mesh.face_halfedges[face];
+        if (first >= edge_count) throw std::runtime_error("PQSSHED1 face halfedge is invalid");
+        std::uint32_t edge = first;
+        for (int local = 0; local < 3; ++local)
+        {
+            const auto& value = mesh.halfedges[edge];
+            if (value.face != face || value.origin >= mesh.geometry.vertices.size() ||
+                value.next >= edge_count || value.opposite >= edge_count)
+                throw std::runtime_error("PQSSHED1 halfedge index is invalid");
+            const auto& opposite = mesh.halfedges[value.opposite];
+            if (opposite.opposite != edge || opposite.origin != mesh.halfedges[value.next].origin ||
+                mesh.halfedges[opposite.next].origin != value.origin)
+                throw std::runtime_error("PQSSHED1 opposite relation is invalid");
+            edge = value.next;
+        }
+        if (edge != first) throw std::runtime_error("PQSSHED1 face is not a triangle cycle");
+    }
+    std::vector<std::uint8_t> visited(edge_count, 0);
+    std::vector<std::uint32_t> queue{0};
+    visited[0] = 1;
+    for (std::size_t cursor = 0; cursor < queue.size(); ++cursor)
+        for (const auto neighbor : {mesh.halfedges[queue[cursor]].next,
+                                    mesh.halfedges[queue[cursor]].opposite})
+            if (!visited[neighbor]) { visited[neighbor] = 1; queue.push_back(neighbor); }
+    if (queue.size() != edge_count) throw std::runtime_error("PQSSHED1 has multiple halfedge components");
+}
+
+} // namespace
+
+OrientedSurfaceMesh readAnalysisHalfedgeMesh(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw std::runtime_error("failed to open halfedge mesh: " + path.string());
+    std::array<char, 8> magic{};
+    readExact(stream, magic.data(), magic.size(), "magic");
+    if (std::memcmp(magic.data(), "PQSSHED1", 8) != 0)
+        throw std::runtime_error("invalid PQSSHED1 magic");
+    std::array<std::uint32_t, 5> counts{};
+    readExact(stream, counts.data(), counts.size(), "counts");
+    OrientedSurfaceMesh mesh;
+    mesh.geometry.name = path.stem().string();
+    mesh.geometry.vertices.resize(counts[0]);
+    mesh.geometry.triangles.resize(counts[1]);
+    mesh.halfedges.resize(counts[2]);
+    mesh.vertex_halfedges.resize(counts[3]);
+    mesh.face_halfedges.resize(counts[4]);
+    for (Position3& p : mesh.geometry.vertices)
+    {
+        std::array<double, 3> value{};
+        readExact(stream, value.data(), value.size(), "vertices");
+        p = {value[0], value[1], value[2]};
+    }
+    for (auto& face : mesh.geometry.triangles) readExact(stream, face.data(), face.size(), "faces");
+    for (auto& edge : mesh.halfedges)
+    {
+        std::array<std::uint32_t, 4> value{};
+        readExact(stream, value.data(), value.size(), "halfedges");
+        edge = {value[0], value[1], value[2], value[3]};
+    }
+    readExact(stream, mesh.vertex_halfedges.data(), mesh.vertex_halfedges.size(), "vertex halfedges");
+    readExact(stream, mesh.face_halfedges.data(), mesh.face_halfedges.size(), "face halfedges");
+    if (stream.peek() != std::ifstream::traits_type::eof())
+        throw std::runtime_error("PQSSHED1 contains trailing bytes");
+    validateHalfedge(mesh);
+    return mesh;
+}
+
+DirectedHausdorffCertificate certifyDirectedHausdorff(
+    const MeshModel& proxy, const MeshModel& reference, const double maximum_distance,
+    const std::uint32_t maximum_depth, const double numerical_tolerance)
+{
+    if (!std::isfinite(maximum_distance) || maximum_distance < 0.0)
+        throw std::invalid_argument("maximum directed Hausdorff distance must be finite and non-negative");
+    TriangleBvh reference_bvh(reference);
+    DirectedHausdorffCertificate result;
+    result.passed = true;
+    const auto samePoint = [&](const Position3 first, const Position3 second)
+    {
+        return std::abs(first.x - second.x) <= numerical_tolerance &&
+               std::abs(first.y - second.y) <= numerical_tolerance &&
+               std::abs(first.z - second.z) <= numerical_tolerance;
+    };
+    const bool identical = proxy.vertices.size() == reference.vertices.size() &&
+        proxy.triangles == reference.triangles &&
+        std::equal(proxy.vertices.begin(), proxy.vertices.end(), reference.vertices.begin(),
+            [&](const Position3 first, const Position3 second)
+            { return samePoint(first, second); });
+    if (identical)
+    {
+        result.upper_bound = 0.0;
+        return result;
+    }
+    return certifyWithBvh(proxy, reference_bvh, maximum_distance,
+                          maximum_depth, numerical_tolerance);
+}
+
+HausdorffSimplificationStats simplifyPhase1Halfedge(
+    const std::filesystem::path& phase1_halfedge, const std::filesystem::path& source_obj,
+    const std::filesystem::path& output_directory, const HausdorffSimplificationOptions& options)
+{
+    const auto started = std::chrono::steady_clock::now();
+    if (!std::isfinite(options.maximum_directed_hausdorff) ||
+        options.maximum_directed_hausdorff < 0.0)
+        throw std::invalid_argument("maximum directed Hausdorff distance must be finite and non-negative");
+    std::filesystem::create_directories(output_directory);
+    const OrientedSurfaceMesh phase1 = readAnalysisHalfedgeMesh(phase1_halfedge);
+    const MeshModel& reference = phase1.geometry;
+    HausdorffSimplificationStats stats;
+    stats.phase1_vertices = reference.vertices.size();
+    stats.phase1_triangles = reference.triangles.size();
+    stats.maximum_directed_hausdorff = options.maximum_directed_hausdorff;
+
+    MeshModel selected = reference;
+    selected.name = "exact_phase1_fallback";
+    stats.selected_candidate = selected.name;
+    HausdorffCandidateStats fallback;
+    fallback.name = selected.name;
+    fallback.triangles = selected.triangles.size();
+    fallback.conservative_coverage = true;
+    fallback.hausdorff.passed = true;
+    fallback.hausdorff.upper_bound = 0.0;
+    fallback.selected = true;
+    stats.candidates.push_back(fallback);
+
+    const auto consider = [&](MeshModel candidate, const std::string& name,
+                              const bool conservative_coverage,
+                              const bool exact_surface_equivalence = false)
+    {
+        HausdorffCandidateStats record;
+        record.name = name;
+        record.triangles = candidate.triangles.size();
+        record.conservative_coverage = conservative_coverage;
+        if (conservative_coverage && candidate.triangles.size() < selected.triangles.size() &&
+            exact_surface_equivalence)
+        {
+            record.hausdorff.passed = true;
+            record.hausdorff.upper_bound = 0.0;
+        }
+        else if (conservative_coverage && candidate.triangles.size() < selected.triangles.size())
+            record.hausdorff = certifyDirectedHausdorff(
+                candidate, reference, options.maximum_directed_hausdorff,
+                options.maximum_certificate_depth, options.numerical_tolerance);
+        else
+        {
+            record.hausdorff.passed = false;
+            record.hausdorff.failure_reason = conservative_coverage
+                ? "candidate does not reduce final triangle count"
+                : "candidate lacks a conservative coverage certificate";
+        }
+        if (record.hausdorff.passed)
+        {
+            for (auto& existing : stats.candidates) existing.selected = false;
+            record.selected = true;
+            selected = std::move(candidate);
+            selected.name = name;
+            stats.selected_candidate = name;
+        }
+        stats.candidates.push_back(std::move(record));
+    };
+
+    if (options.enable_exact_coplanar_union)
+    {
+        MeshModel coplanar = canonicalizeCoplanarTriangleSoup(reference);
+        MeshModel convexified = convexifyCoplanarComponents(
+            coplanar, reference, options.maximum_directed_hausdorff,
+            options.maximum_certificate_depth, options.numerical_tolerance);
+        consider(std::move(convexified), "planar_component_convexification", true);
+        consider(std::move(coplanar), "exact_coplanar_union", true, true);
+    }
+    if (options.enable_convex_hull)
+        consider(makeConvexHull(reference), "convex_hull_of_all_phase1_vertices", true);
+    if (options.enable_adaptive_convex_cover)
+        consider(adaptiveConvexCover(
+            reference, options.maximum_directed_hausdorff,
+            options.maximum_certificate_depth, options.numerical_tolerance),
+            "adaptive_certified_convex_cover", true);
+    if (options.enable_discrete_orientation_polytopes)
+        for (const int family : {14, 18, 26})
+            consider(makeSupportPolytope(reference, family),
+                     std::to_string(family) + "_dop_support_polytope", true);
+    if (options.enable_axis_aligned_box)
+        consider(makeBox(reference), "axis_aligned_enclosing_box", true);
+
+    stats.final_vertices = selected.vertices.size();
+    stats.final_triangles = selected.triangles.size();
+    stats.elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    writeObj(output_directory / "proxy.obj", selected);
+    std::filesystem::copy_file(phase1_halfedge, output_directory / "phase1_halfedge.bin",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(source_obj, output_directory / "source.obj",
+                               std::filesystem::copy_options::overwrite_existing);
+
+    std::ofstream model(output_directory / "model.json");
+    const auto jsonNumber = [](const double value)
+    {
+        if (!std::isfinite(value)) return std::string("null");
+        std::ostringstream stream;
+        stream << std::setprecision(17) << value;
+        return stream.str();
+    };
+    model << std::setprecision(17)
+          << "{\n  \"stats\":{\"source_triangles\":" << stats.phase1_triangles
+          << ",\"proxy_triangles\":" << stats.final_triangles
+          << ",\"primitive_count\":1,\"primitive_types\":{\"polygon\":1}"
+          << ",\"timings_seconds\":{\"total\":" << stats.elapsed_seconds << "}"
+          << ",\"simplification_error\":{\"direction\":\"proxy_to_phase1\""
+          << ",\"method\":\"triangle_bvh_1_lipschitz_adaptive_upper_bound\""
+          << ",\"maximum_is_certified_upper_bound\":true"
+          << ",\"maximum_distance_limit\":" << options.maximum_directed_hausdorff;
+    const auto selected_record = std::find_if(stats.candidates.begin(), stats.candidates.end(),
+        [](const auto& candidate) { return candidate.selected; });
+    model << ",\"maximum_distance\":" << selected_record->hausdorff.upper_bound
+          << ",\"observed_lower_bound\":" << selected_record->hausdorff.lower_bound
+          << ",\"reference_queries\":" << selected_record->hausdorff.reference_queries
+          << ",\"subdivision_nodes\":" << selected_record->hausdorff.subdivision_nodes << '}'
+          << ",\"optimization\":{\"objective\":\"minimum_final_obj_triangle_count\""
+          << ",\"status\":\"best-known feasible over generated certified candidates\""
+          << ",\"selected_candidate\":\"" << stats.selected_candidate << "\""
+          << ",\"candidates\":[";
+    for (std::size_t i = 0; i < stats.candidates.size(); ++i)
+    {
+        if (i) model << ',';
+        const auto& c = stats.candidates[i];
+        model << "{\"name\":\"" << c.name << "\",\"triangles\":" << c.triangles
+              << ",\"coverage_certified\":" << (c.conservative_coverage ? "true" : "false")
+              << ",\"hausdorff_certified\":" << (c.hausdorff.passed ? "true" : "false")
+              << ",\"upper_bound\":" << jsonNumber(c.hausdorff.upper_bound)
+              << ",\"selected\":" << (c.selected ? "true" : "false") << '}';
+    }
+    model << "]}},\n  \"source\":\"source.obj\",\n  \"phase1_halfedge\":\"phase1_halfedge.bin\","
+          << "\n  \"phase4_triangulated\":\"proxy.obj\",\n  \"proxy\":\"proxy.obj\","
+          << "\n  \"proxy_components\":[{\"id\":0,\"type\":\"polygon\",\"triangulated_face_count\":"
+          << stats.final_triangles << "}],\n  \"viewer_stages\":[\"source\",\"phase1\",\"phase4\",\"split\"]\n}\n";
+    std::ofstream manifest(output_directory / "viewer_manifest.json");
+    const std::string model_id = options.model_id.empty()
+        ? source_obj.stem().string() : options.model_id;
+    manifest << "{\"algorithm\":\"CertifiedDirectedHausdorffSimplifierV1\""
+             << ",\"complete\":true,\"model_count\":1,\"models\":[{\"id\":\""
+             << model_id << "\",\"metadata\":\"model.json\"}]"
+             << ",\"options\":{\"maximum_directed_hausdorff\":"
+             << std::setprecision(17) << options.maximum_directed_hausdorff
+             << ",\"direction\":\"proxy_to_phase1\"}}\n";
+    return stats;
+}
+
+} // namespace pqss_proxy_mesh
