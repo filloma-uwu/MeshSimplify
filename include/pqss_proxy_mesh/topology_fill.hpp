@@ -247,6 +247,11 @@ struct OriginalObjHoleSurgeryStats
     const VoxelGrid& filled_occupancy,
     const VoxelGrid& source_occupancy,
     const MeshModel& source);
+// Removes zero-area faces by topology-preserving halfedge edge collapses.
+// Every collapse must satisfy the closed triangular-manifold link condition;
+// the returned mesh is rebuilt and strictly validated.
+[[nodiscard]] OrientedSurfaceMesh collapseDegenerateHalfedges(
+    const OrientedSurfaceMesh& surface);
 // Visual inspection mesh that keeps certified source-boundary triangles exact
 // and uses the frozen topology surface only where the source has no support.
 [[nodiscard]] MeshModel buildSourceDominatedPhase1Preview(

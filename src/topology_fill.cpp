@@ -3706,6 +3706,158 @@ Phase1Solid buildPhase1Solid(VoxelGrid occupancy)
     return buildPhase1Solid(std::move(occupancy), MeshModel{});
 }
 
+OrientedSurfaceMesh collapseDegenerateHalfedges(const OrientedSurfaceMesh& input)
+{
+    if (input.geometry.vertices.empty() || input.geometry.triangles.empty() ||
+        input.halfedges.size() != input.geometry.triangles.size() * 3)
+        throw std::invalid_argument("degenerate cleanup requires a halfedge surface");
+
+    std::vector<Position3> vertices = input.geometry.vertices;
+    std::vector<TriangleIndices> faces = input.geometry.triangles;
+    Bounds3 bounds;
+    for (const auto point : vertices) include(bounds, toVec(point));
+    const double scale = norm(bounds.upper - bounds.lower);
+    const double minimum_area = std::max(1.0, scale * scale) * 1.0e-24;
+    using Edge = std::array<std::uint32_t, 2>;
+    const auto edgeKey = [](const std::uint32_t a, const std::uint32_t b)
+    { return Edge{std::min(a, b), std::max(a, b)}; };
+
+    std::size_t collapse_count = 0;
+    for (std::size_t pass = 0; pass < 64; ++pass)
+    {
+        std::map<Edge, std::vector<std::uint32_t>> edge_faces;
+        std::vector<std::vector<std::uint32_t>> neighbors(vertices.size());
+        std::vector<std::uint32_t> degenerate_faces;
+        for (std::uint32_t face = 0; face < faces.size(); ++face)
+        {
+            const auto triangle = faces[face];
+            const Vec3 a = toVec(vertices[triangle[0]]);
+            const Vec3 b = toVec(vertices[triangle[1]]);
+            const Vec3 c = toVec(vertices[triangle[2]]);
+            if (norm(cross(b - a, c - a)) <= minimum_area)
+                degenerate_faces.push_back(face);
+            for (int local = 0; local < 3; ++local)
+            {
+                const auto first = triangle[local];
+                const auto second = triangle[(local + 1) % 3];
+                edge_faces[edgeKey(first, second)].push_back(face);
+                neighbors[first].push_back(second);
+                neighbors[second].push_back(first);
+            }
+        }
+        if (degenerate_faces.empty()) break;
+        for (auto& adjacent : neighbors)
+        {
+            std::sort(adjacent.begin(), adjacent.end());
+            adjacent.erase(std::unique(adjacent.begin(), adjacent.end()), adjacent.end());
+        }
+
+        struct Collapse { std::uint32_t removed; std::uint32_t kept; };
+        std::vector<Collapse> collapses;
+        std::vector<std::uint8_t> locked(vertices.size(), 0);
+        const auto oppositeVertex = [&](const std::uint32_t face, const Edge edge)
+        {
+            for (const auto vertex : faces[face])
+                if (vertex != edge[0] && vertex != edge[1]) return vertex;
+            throw std::runtime_error("edge incident face has no opposite vertex");
+        };
+        const auto linkCondition = [&](const Edge edge)
+        {
+            const auto found = edge_faces.find(edge);
+            if (found == edge_faces.end() || found->second.size() != 2) return false;
+            std::vector<std::uint32_t> common;
+            std::set_intersection(neighbors[edge[0]].begin(), neighbors[edge[0]].end(),
+                neighbors[edge[1]].begin(), neighbors[edge[1]].end(),
+                std::back_inserter(common));
+            std::array<std::uint32_t, 2> opposite{
+                oppositeVertex(found->second[0], edge),
+                oppositeVertex(found->second[1], edge)};
+            std::sort(opposite.begin(), opposite.end());
+            return opposite[0] != opposite[1] && common.size() == 2 &&
+                common[0] == opposite[0] && common[1] == opposite[1];
+        };
+
+        for (const std::uint32_t face : degenerate_faces)
+        {
+            const auto triangle = faces[face];
+            std::array<std::pair<double, Edge>, 3> candidates{};
+            for (int local = 0; local < 3; ++local)
+            {
+                const Edge edge = edgeKey(
+                    triangle[local], triangle[(local + 1) % 3]);
+                const Vec3 delta = toVec(vertices[edge[0]]) - toVec(vertices[edge[1]]);
+                candidates[local] = {dot(delta, delta), edge};
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                [](const auto& first, const auto& second)
+                { return first.first < second.first; });
+            for (const auto& [length_squared, edge] : candidates)
+            {
+                (void)length_squared;
+                if (locked[edge[0]] || locked[edge[1]] || !linkCondition(edge)) continue;
+                collapses.push_back({edge[1], edge[0]});
+                locked[edge[0]] = locked[edge[1]] = 1;
+                for (const auto neighbor : neighbors[edge[0]]) locked[neighbor] = 1;
+                for (const auto neighbor : neighbors[edge[1]]) locked[neighbor] = 1;
+                break;
+            }
+        }
+        if (collapses.empty())
+            throw std::runtime_error(
+                "degenerate halfedge cleanup found no link-condition collapse");
+
+        std::vector<std::uint32_t> replacement(vertices.size());
+        std::iota(replacement.begin(), replacement.end(), 0);
+        for (const auto collapse : collapses)
+            replacement[collapse.removed] = collapse.kept;
+        std::vector<TriangleIndices> next_faces;
+        next_faces.reserve(faces.size() - 2 * collapses.size());
+        std::set<TriangleIndices> unique_faces;
+        for (auto triangle : faces)
+        {
+            for (auto& vertex : triangle) vertex = replacement[vertex];
+            if (triangle[0] == triangle[1] || triangle[1] == triangle[2] ||
+                triangle[2] == triangle[0]) continue;
+            TriangleIndices signature = triangle;
+            std::sort(signature.begin(), signature.end());
+            if (!unique_faces.insert(signature).second)
+                throw std::runtime_error(
+                    "link-condition collapse created a duplicate face");
+            next_faces.push_back(triangle);
+        }
+        faces = std::move(next_faces);
+        collapse_count += collapses.size();
+        std::cerr << "monitor: stage=degenerate_halfedge_collapse pass=" << pass
+                  << " batch=" << collapses.size()
+                  << " remaining_faces=" << faces.size() << '\n';
+    }
+
+    std::vector<std::uint32_t> remap(vertices.size(), invalid_surface_index);
+    IndexedSurface cleaned;
+    cleaned.triangles = faces;
+    for (auto& triangle : cleaned.triangles)
+        for (auto& vertex : triangle)
+        {
+            if (remap[vertex] == invalid_surface_index)
+            {
+                remap[vertex] = static_cast<std::uint32_t>(cleaned.vertices.size());
+                cleaned.vertices.push_back(toVec(vertices[vertex]));
+            }
+            vertex = remap[vertex];
+        }
+    VoxelGrid placeholder;
+    placeholder.shape = {1, 1, 1};
+    placeholder.pitch = 1.0;
+    placeholder.occupancy = {1};
+    OrientedSurfaceMesh result = buildOrientedSurfaceMesh(
+        std::move(cleaned), placeholder);
+    std::cerr << "monitor: stage=degenerate_halfedge_cleanup"
+              << " collapses=" << collapse_count
+              << " vertices=" << result.geometry.vertices.size()
+              << " triangles=" << result.geometry.triangles.size() << '\n';
+    return result;
+}
+
 OrientedSurfaceMesh projectPhase1BoundaryToSource(
     const OrientedSurfaceMesh& boundary, const VoxelGrid& filled_occupancy,
     const VoxelGrid& source_occupancy, const MeshModel& source)
@@ -3759,7 +3911,7 @@ OrientedSurfaceMesh projectPhase1BoundaryToSource(
               << " projected_vertices=" << result.geometry.vertices.size()
               << " retained_topology=1"
               << " degenerate_faces_pending_collapse=" << degenerate_faces << '\n';
-    return result;
+    return collapseDegenerateHalfedges(result);
 }
 
 MeshModel buildSourceDominatedPhase1Preview(

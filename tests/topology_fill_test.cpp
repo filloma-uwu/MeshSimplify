@@ -415,6 +415,32 @@ void testNearestSourceProjectionPreservesHalfedgeTopology()
     }
 }
 
+void testDegenerateHalfedgeCollapsePreservesClosedSphere()
+{
+    pqss_proxy_mesh::MeshModel octahedron;
+    octahedron.vertices = {
+        {1,0,0}, {0,1,0}, {-1,0,0}, {0,-1,0},
+        {0,0,1}, {0,0,-1}};
+    octahedron.triangles = {
+        {{4,0,1}}, {{4,1,2}}, {{4,2,3}}, {{4,3,0}},
+        {{5,1,0}}, {{5,2,1}}, {{5,3,2}}, {{5,0,3}}};
+    pqss_proxy_mesh::AnalysisHalfedgeStats stats;
+    auto input = pqss_proxy_mesh::buildAnalysisHalfedgeMesh(octahedron, &stats);
+    require(stats.boundary_halfedges == 0 && stats.face_components == 1,
+            "degenerate fixture must start as one closed topology surface");
+    input.geometry.vertices[4] = input.geometry.vertices[0];
+    const auto cleaned = pqss_proxy_mesh::collapseDegenerateHalfedges(input);
+    require(cleaned.geometry.vertices.size() == 5 &&
+                cleaned.geometry.triangles.size() == 6 &&
+                cleaned.euler_characteristic == 2 && cleaned.signed_volume > 0.0,
+            "degenerate collapse did not preserve the closed sphere");
+    for (const auto& halfedge : cleaned.halfedges)
+        require(halfedge.opposite < cleaned.halfedges.size() &&
+                    cleaned.halfedges[halfedge.opposite].opposite ==
+                        static_cast<std::uint32_t>(&halfedge - cleaned.halfedges.data()),
+                "degenerate collapse produced an invalid opposite pair");
+}
+
 void testSourceConstrainedBoundaryKeepsExactPlane()
 {
     // Two tetrahedra share z=0.  The occupied tetrahedron is below it and the
@@ -534,6 +560,7 @@ int main()
         testNearCoplanarSourcePatchesDoNotCreateSawTeeth();
         testSourceProjectionStaysInsideActiveCell();
         testNearestSourceProjectionPreservesHalfedgeTopology();
+        testDegenerateHalfedgeCollapsePreservesClosedSphere();
         testSourceConstrainedBoundaryKeepsExactPlane();
         testCoplanarSoupCanonicalization();
         testCoplanarSoupCanonicalizationPreservesHole();
