@@ -3880,11 +3880,42 @@ OrientedSurfaceMesh projectPhase1BoundaryToSource(
     const SourceTriangleBvh source_bvh(source, retained_faces);
     OrientedSurfaceMesh result = boundary;
     result.geometry.name = boundary.geometry.name + "_source_projected";
+    if (boundary.face_boundary_crossings.size() !=
+        boundary.geometry.triangles.size())
+        throw std::invalid_argument("phase-1 boundary lost voxel provenance");
+    std::vector<std::uint8_t> touches_source_surface(
+        result.geometry.vertices.size(), 0);
+    std::vector<std::uint8_t> touches_generated_fill(
+        result.geometry.vertices.size(), 0);
+    for (std::size_t face = 0; face < boundary.geometry.triangles.size(); ++face)
+    {
+        const std::uint32_t crossing_id = boundary.face_boundary_crossings[face];
+        if (crossing_id >= boundary.boundary_crossings.size())
+            throw std::invalid_argument("phase-1 boundary has invalid voxel provenance");
+        const auto inside = boundary.boundary_crossings[crossing_id].inside;
+        const bool generated_fill = !source_occupancy.occupied(
+            inside[0], inside[1], inside[2]);
+        auto& responsibility = generated_fill
+            ? touches_generated_fill : touches_source_surface;
+        for (const std::uint32_t vertex : boundary.geometry.triangles[face])
+            responsibility[vertex] = 1;
+    }
+    std::size_t projected_vertices = 0;
+    std::size_t retained_fill_vertices = 0;
     for (std::size_t vertex = 0; vertex < result.geometry.vertices.size(); ++vertex)
     {
+        // A fill-only vertex has no corresponding point on the source OBJ.
+        // Projecting it would collapse the cap toward the hole wall. Shared
+        // mouth vertices are source constrained so the cap joins exactly.
+        if (!touches_source_surface[vertex] && touches_generated_fill[vertex])
+        {
+            ++retained_fill_vertices;
+            continue;
+        }
         const auto closest = source_bvh.closestPoint(
             toVec(boundary.geometry.vertices[vertex]));
         result.geometry.vertices[vertex] = toPosition(closest.point);
+        ++projected_vertices;
     }
 
     double signed_volume = 0.0;
@@ -3908,7 +3939,8 @@ OrientedSurfaceMesh projectPhase1BoundaryToSource(
         throw std::runtime_error("exact source projection has inward orientation");
     result.signed_volume = signed_volume;
     std::cerr << "monitor: stage=exact_source_projection"
-              << " projected_vertices=" << result.geometry.vertices.size()
+              << " projected_vertices=" << projected_vertices
+              << " retained_fill_vertices=" << retained_fill_vertices
               << " retained_topology=1"
               << " degenerate_faces_pending_collapse=" << degenerate_faces << '\n';
     return collapseDegenerateHalfedges(result);

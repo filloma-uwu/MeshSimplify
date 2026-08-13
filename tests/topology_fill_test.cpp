@@ -441,6 +441,38 @@ void testDegenerateHalfedgeCollapsePreservesClosedSphere()
                 "degenerate collapse produced an invalid opposite pair");
 }
 
+void testGeneratedFillVerticesAreNotProjectedToMissingSourceSurface()
+{
+    auto filled = makeGrid(7);
+    filled.occupancy[filled.index(3, 3, 3)] = 1;
+    const auto solid = pqss_proxy_mesh::buildPhase1Solid(filled);
+    auto source_occupancy = filled;
+    std::fill(source_occupancy.occupancy.begin(),
+              source_occupancy.occupancy.end(), std::uint8_t{0});
+    source_occupancy.occupancy[source_occupancy.index(1, 1, 1)] = 1;
+
+    pqss_proxy_mesh::MeshModel nearby_source;
+    nearby_source.vertices = {
+        {2.0, 2.0, 2.25}, {4.0, 2.0, 2.25},
+        {4.0, 4.0, 2.25}, {2.0, 4.0, 2.25}};
+    nearby_source.triangles = {{{0,2,1}}, {{0,3,2}}};
+    const auto projected = pqss_proxy_mesh::projectPhase1BoundaryToSource(
+        solid.boundary, filled, source_occupancy, nearby_source);
+    require(projected.geometry.vertices.size() ==
+                solid.boundary.geometry.vertices.size(),
+            "fill-only projection changed the vertex count");
+    for (std::size_t vertex = 0; vertex < projected.geometry.vertices.size(); ++vertex)
+    {
+        const auto actual = projected.geometry.vertices[vertex];
+        const auto expected = solid.boundary.geometry.vertices[vertex];
+        require(actual.x == expected.x && actual.y == expected.y &&
+                    actual.z == expected.z,
+                "fill-only vertex was attracted to a missing source cap");
+    }
+    require(projected.euler_characteristic == 2 && projected.signed_volume > 0.0,
+            "fill-only projection guard damaged the closed halfedge surface");
+}
+
 void testSourceConstrainedBoundaryKeepsExactPlane()
 {
     // Two tetrahedra share z=0.  The occupied tetrahedron is below it and the
@@ -561,6 +593,7 @@ int main()
         testSourceProjectionStaysInsideActiveCell();
         testNearestSourceProjectionPreservesHalfedgeTopology();
         testDegenerateHalfedgeCollapsePreservesClosedSphere();
+        testGeneratedFillVerticesAreNotProjectedToMissingSourceSurface();
         testSourceConstrainedBoundaryKeepsExactPlane();
         testCoplanarSoupCanonicalization();
         testCoplanarSoupCanonicalizationPreservesHole();
