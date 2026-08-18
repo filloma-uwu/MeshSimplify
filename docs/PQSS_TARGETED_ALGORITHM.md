@@ -1,5 +1,11 @@
 # PQSS-Targeted Conservative Primitive Decomposition
 
+> **Historical design only.** Its PQSS-workload objective is superseded by
+> repository rule 15 and `PHASE2_SIMPLIFICATION_RESEARCH.md`: the active
+> objective is minimum final triangulated OBJ face count under hard conservative
+> coverage and directed Hausdorff constraints. PQSS workload is post-generation
+> diagnostic data and must not drive candidate selection.
+
 ## Objective
 
 The generator runs offline before query poses are known. It must not execute

@@ -5,9 +5,12 @@ These rules are mandatory for every simplification change in this repository.
 1. Never branch on a model ID, file name, known test-scene role, or hand-picked
    coordinate. A fix must be expressed as a geometry rule and run unchanged on
    every input OBJ.
-2. Input is the original arbitrary OBJ triangle soup. Do not substitute the
-   official simplified mesh and do not require watertight, manifold, consistently
-   wound, or self-intersection-free input.
+2. Phase 1 takes the original arbitrary OBJ triangle soup and emits
+   `phase1_halfedge.bin` as its only formal geometry artifact. Any occupancy
+   grid used by phase 1 is temporary internal state, never a persisted phase
+   result. Phase 2 takes the frozen halfedge file as its sole geometry input;
+   it must not rerun phase 1 or use a display OBJ, a voxel file, or a
+   reconstructed mesh in its place.
 3. False positives are allowed; false negatives are not. A source triangle may
    be removed only when a geometry certificate proves that the retained proxy
    union still covers its responsibility.
@@ -16,9 +19,9 @@ These rules are mandatory for every simplification change in this repository.
    output primitive. A distinct triangulation stage converts all surface
    primitives to the ordinary triangle OBJ consumed by PQSS; an n-vertex simple
    polygon must produce exactly n-2 triangles without Steiner vertices.
-5. All approximation error is global: planar added error is divided by the whole
-   model surface area and volumetric added error by the model-scale volume. Never
-   normalize a merge by only the participating local pieces.
+5. Every candidate and the final proxy must satisfy the same user-provided
+   directed proxy-to-phase1 Hausdorff limit. The limit is a feasibility
+   threshold, not a local, cumulative, normalized, or global error budget.
 6. Geometrically coplanar output patches must be unioned before triangulation.
    Internal edges and overlapping coplanar faces must not survive merely because
    the source OBJ uses different vertex indices or disconnected topology.
@@ -52,3 +55,10 @@ These rules are mandatory for every simplification change in this repository.
 14. A watertight mesh may be built as an offline occupancy/error reference, but
     it is never a required input property or a final-output property. The final
     conservative OBJ must remain certified directly against source triangles.
+15. The optimization objective is the minimum actual triangle count in the
+    final OBJ after coplanar union, exposed-boundary extraction, and semantic
+    primitive triangulation, subject to every hard coverage and directed
+    Hausdorff constraint. The Hausdorff limit is a feasibility threshold, not
+    a local, cumulative, or global error budget. Target reduction ratios, QEM,
+    Chamfer distance, primitive count, and PQSS workload may not replace this
+    objective or authorize/reject a geometric merge.

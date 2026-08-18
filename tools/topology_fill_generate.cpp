@@ -94,6 +94,8 @@ int main(int argc, char** argv)
                 options.padding = static_cast<std::uint32_t>(std::stoul(value()));
             else if (argument == "--maximum-steps")
                 options.maximum_steps = static_cast<std::uint32_t>(std::stoul(value()));
+            else if (argument == "--trace-face")
+                options.trace_face = static_cast<std::uint32_t>(std::stoul(value()));
             else
             {
                 usage();

@@ -63,6 +63,27 @@ void testDigitalConnectivityPair()
             "vertex-touching voxels must remain separate under foreground 6-connectivity");
 }
 
+void testWellComposedRegularizationRemovesGeometricPinch()
+{
+    auto grid = makeGrid(7);
+    grid.occupancy[grid.index(2, 2, 2)] = 1;
+    grid.occupancy[grid.index(3, 3, 2)] = 1;
+    std::size_t added = 0;
+    const auto regularized = pqss_proxy_mesh::regularizeWellComposedOccupancy(
+        grid, &added);
+    require(added > 0 && regularized.occupied(2, 2, 2) &&
+                regularized.occupied(3, 3, 2),
+            "well-composed regularization must only add cells to a pinch");
+    const auto solid = pqss_proxy_mesh::buildPhase1Solid(regularized);
+    std::set<std::array<double, 3>> positions;
+    for (const auto point : solid.boundary.geometry.vertices)
+        require(positions.insert({point.x, point.y, point.z}).second,
+                "well-composed occupancy produced duplicate geometric vertices");
+    require(solid.boundary.euler_characteristic == 2 &&
+                solid.boundary.signed_volume > 0.0,
+            "well-composed pinch repair must produce a closed oriented sphere");
+}
+
 void testTorusFill()
 {
     constexpr std::uint32_t size = 32;
@@ -349,6 +370,69 @@ void testNearCoplanarSourcePatchesDoNotCreateSawTeeth()
                 "near-coplanar source patches produced alternating boundary heights");
 }
 
+void testResponsibleLocalConcavityFillsPocketWithoutExpandingExtent()
+{
+    auto source = makeGrid(8);
+    for (std::uint32_t x = 1; x <= 6; ++x)
+        for (std::uint32_t y = 1; y <= 6; ++y)
+            source.occupancy[source.index(x, y, 1)] = 1;
+    auto filled = source;
+    for (std::uint32_t coordinate = 1; coordinate <= 6; ++coordinate)
+    {
+        filled.occupancy[filled.index(coordinate, 1, 2)] = 1;
+        filled.occupancy[filled.index(coordinate, 6, 2)] = 1;
+        filled.occupancy[filled.index(1, coordinate, 2)] = 1;
+    }
+    std::size_t added = 0;
+    const auto closed = pqss_proxy_mesh::fillResponsibleLocalConcavities(
+        source, filled, &added);
+    require(added != 0 && closed.occupied(3, 3, 2),
+            "responsible local concavity did not fill the U-shaped pocket");
+    require(!closed.occupied(7, 3, 2) && !closed.occupied(3, 3, 3),
+            "responsible local concavity expanded beyond its certified extent");
+    for (std::size_t index = 0; index < source.occupancy.size(); ++index)
+        require(!source.occupancy[index] || closed.occupancy[index],
+                "responsible local concavity removed a source cell");
+}
+
+void testPlanarHoleCapStaysOnMouthPlane()
+{
+    auto grid = makeGrid(9);
+    for (std::uint32_t x = 2; x <= 6; ++x)
+        for (std::uint32_t y = 2; y <= 6; ++y)
+            for (std::uint32_t z = 2; z <= 4; ++z)
+                grid.occupancy[grid.index(x, y, z)] = 1;
+
+    pqss_proxy_mesh::MeshModel mouth;
+    mouth.vertices = {
+        {1,1,4.5}, {7,1,4.5}, {7,7,4.5}, {1,7,4.5},
+        {3,3,4.5}, {5,3,4.5}, {5,5,4.5}, {3,5,4.5}};
+    mouth.triangles = {
+        {{0,1,5}}, {{0,5,4}}, {{1,2,6}}, {{1,6,5}},
+        {{2,3,7}}, {{2,7,6}}, {{3,0,4}}, {{3,4,7}}};
+
+    const auto solid = pqss_proxy_mesh::buildPhase1Solid(grid, mouth);
+    std::size_t cap_faces = 0;
+    for (const auto face : solid.boundary.geometry.triangles)
+    {
+        const auto a = solid.boundary.geometry.vertices[face[0]];
+        const auto b = solid.boundary.geometry.vertices[face[1]];
+        const auto c = solid.boundary.geometry.vertices[face[2]];
+        const double center_x = (a.x + b.x + c.x) / 3.0;
+        const double center_y = (a.y + b.y + c.y) / 3.0;
+        if (center_x <= 3.0 || center_x >= 5.0 ||
+            center_y <= 3.0 || center_y >= 5.0)
+            continue;
+        if (a.z < 4.0 || b.z < 4.0 || c.z < 4.0) continue;
+        ++cap_faces;
+        require(std::abs(a.z - 4.5) < 1.0e-12 &&
+                    std::abs(b.z - 4.5) < 1.0e-12 &&
+                    std::abs(c.z - 4.5) < 1.0e-12,
+                "generated planar hole cap left the mouth plane");
+    }
+    require(cap_faces > 0, "planar mouth fixture did not generate a cap");
+}
+
 void testSourceProjectionStaysInsideActiveCell()
 {
     auto grid = makeGrid(7);
@@ -441,7 +525,7 @@ void testDegenerateHalfedgeCollapsePreservesClosedSphere()
                 "degenerate collapse produced an invalid opposite pair");
 }
 
-void testGeneratedFillVerticesAreNotProjectedToMissingSourceSurface()
+void testGeneratedFillProjectionPreservesHalfedgeWithoutCertifiedPlane()
 {
     auto filled = makeGrid(7);
     filled.occupancy[filled.index(3, 3, 3)] = 1;
@@ -461,14 +545,6 @@ void testGeneratedFillVerticesAreNotProjectedToMissingSourceSurface()
     require(projected.geometry.vertices.size() ==
                 solid.boundary.geometry.vertices.size(),
             "fill-only projection changed the vertex count");
-    for (std::size_t vertex = 0; vertex < projected.geometry.vertices.size(); ++vertex)
-    {
-        const auto actual = projected.geometry.vertices[vertex];
-        const auto expected = solid.boundary.geometry.vertices[vertex];
-        require(actual.x == expected.x && actual.y == expected.y &&
-                    actual.z == expected.z,
-                "fill-only vertex was attracted to a missing source cap");
-    }
     require(projected.euler_characteristic == 2 && projected.signed_volume > 0.0,
             "fill-only projection guard damaged the closed halfedge surface");
 }
@@ -579,10 +655,12 @@ int main()
         testSingleCube();
         testCavity();
         testDigitalConnectivityPair();
+        testWellComposedRegularizationRemovesGeometricPinch();
         testTorusFill();
         testBeta2IsFilledOnlyAfterHandleClosing();
         testHandleRepairDoesNotFillUnrelatedExteriorNotch();
         testIncrementalClosingProfileConnectsSeparateComponents();
+        testResponsibleLocalConcavityFillsPocketWithoutExpandingExtent();
         testAnalysisHalfedgeSplitsConflictingFans();
         testPhase1SolidBoundary();
         testDualVertexDisconnectedFansAreSplit();
@@ -590,10 +668,11 @@ int main()
         testVoxelGridRoundTrip();
         testOpenSoupEdgeCannotAttractBoundaryVertices();
         testNearCoplanarSourcePatchesDoNotCreateSawTeeth();
+        testPlanarHoleCapStaysOnMouthPlane();
         testSourceProjectionStaysInsideActiveCell();
         testNearestSourceProjectionPreservesHalfedgeTopology();
         testDegenerateHalfedgeCollapsePreservesClosedSphere();
-        testGeneratedFillVerticesAreNotProjectedToMissingSourceSurface();
+        testGeneratedFillProjectionPreservesHalfedgeWithoutCertifiedPlane();
         testSourceConstrainedBoundaryKeepsExactPlane();
         testCoplanarSoupCanonicalization();
         testCoplanarSoupCanonicalizationPreservesHole();

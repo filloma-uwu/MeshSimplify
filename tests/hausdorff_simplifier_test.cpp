@@ -1,4 +1,5 @@
 #include "pqss_proxy_mesh/hausdorff_simplifier.hpp"
+#include "pqss_proxy_mesh/halfedge_validation.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -43,14 +44,41 @@ int main()
         cube.triangles = {{{0,2,3}},{{0,3,1}},{{4,5,7}},{{4,7,6}},
                           {{0,1,5}},{{0,5,4}},{{2,6,7}},{{2,7,3}},
                           {{0,4,6}},{{0,6,2}},{{1,3,7}},{{1,7,5}}};
+        for (auto& triangle : cube.triangles)
+            std::swap(triangle[1], triangle[2]);
         pqss_proxy_mesh::AnalysisHalfedgeStats halfedge_stats;
         const auto cube_halfedge = pqss_proxy_mesh::buildAnalysisHalfedgeMesh(cube, &halfedge_stats);
         require(halfedge_stats.boundary_halfedges == 0,
                 "cube regression must form a closed halfedge mesh");
+        const auto validation =
+            pqss_proxy_mesh::validatePhase1HalfedgeTopology(cube_halfedge);
+        require(validation.euler_characteristic == 2 &&
+                    validation.face_components == 1,
+                "explicit halfedge validation must accept the closed cube");
         const auto temporary = std::filesystem::temp_directory_path() /
             "pqss_hausdorff_simplifier_cube";
         std::filesystem::create_directories(temporary);
         pqss_proxy_mesh::writeAnalysisHalfedgeMesh(temporary / "phase1.bin", cube_halfedge);
+        auto damaged = cube_halfedge;
+        damaged.halfedges.front().opposite = pqss_proxy_mesh::invalid_surface_index;
+        pqss_proxy_mesh::writeAnalysisHalfedgeMesh(
+            temporary / "unchecked_phase1.bin", damaged);
+        const auto unchecked = pqss_proxy_mesh::readAnalysisHalfedgeMesh(
+            temporary / "unchecked_phase1.bin");
+        require(unchecked.halfedges.front().opposite ==
+                    pqss_proxy_mesh::invalid_surface_index,
+                "production halfedge loading must not run topology validation");
+        bool rejected = false;
+        try
+        {
+            (void)pqss_proxy_mesh::validatePhase1HalfedgeTopology(unchecked);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejected = true;
+        }
+        require(rejected,
+                "explicit halfedge validation must reject a damaged opposite relation");
         {
             std::ofstream source(temporary / "source.obj");
             source << "o cube\n";

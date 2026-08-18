@@ -1,4 +1,5 @@
 /build/
+/build*/
 /out/
 /.cache/
 .vs/
@@ -8,6 +9,11 @@ __pycache__/
 *.pyc
 node_modules/
 
+# Local third-party source probes and downloaded archives
+/deps/*_upstream/
+/deps/mpir_win64/
+/deps/*.tar
+
 # Generated analysis and benchmark artifacts
 /outputs/
 /build-profile/
@@ -15,6 +21,12 @@ node_modules/
 /viewer/screenshots/
 /reports/profiles/
 /*.log
+/*.err
+/*.out
+/*.pid
+/*.stderr.txt
+/*.stdout.txt
+/model*_timing*.json
 /stage*.obj
 
 # Local real-scene query corpus (127 MB, reproducible from PQSS assets)

@@ -95,8 +95,8 @@ void writeAnalysisHalfedgeMesh(
     const OrientedSurfaceMesh& mesh);
 
 // A source-constrained volumetric complex is the reconstruction domain for
-// phase 1.  Unlike the old dual grid, its geometry is cut by source triangles;
-// the frozen voxels label cells but do not place boundary vertices.
+// phase 1. Unlike the old dual grid, its geometry is cut by source triangles;
+// temporary occupancy labels cells but does not place boundary vertices.
 struct SourceConstrainedCell
 {
     std::array<std::uint32_t, 4> vertices{};
@@ -125,7 +125,13 @@ struct SourceConstrainedCellComplex
     const SourceConstrainedCellComplex& complex);
 [[nodiscard]] MeshModel canonicalizeCoplanarTriangleSoup(
     const MeshModel& source,
-    double relative_tolerance = 1.0e-9);
+    double relative_tolerance = 1.0e-9,
+    bool preserve_collinear_boundary_vertices = false);
+// Diagnostic source-preserving preview. Temporary occupancy selects exterior
+// source patches and planar inner loops to cap; this is not a formal phase result.
+[[nodiscard]] MeshModel buildPlanarHoleCapPreview(
+    const VoxelGrid& filled,
+    const MeshModel& source);
 
 struct BettiNumbers
 {
@@ -172,6 +178,7 @@ struct TopologyFillStats
     std::size_t dropped_degenerate_triangles = 0;
     std::size_t halfedge_face_components = 0;
     std::size_t dropped_duplicate_triangles = 0;
+    bool halfedge_validation_performed = false;
     bool mesh_watertight = false;
     bool mesh_oriented = false;
     bool mesh_manifold = false;
@@ -190,9 +197,22 @@ struct TopologyFillOptions
     std::size_t maximum_grid_voxels = 12'000'000;
     std::uint32_t padding = 4;
     std::uint32_t maximum_steps = 32;
+    // Optional runtime diagnostic.  It affects logging only, never geometry.
+    std::uint32_t trace_face = invalid_surface_index;
 };
 
 [[nodiscard]] BettiNumbers voxelBettiNumbers(const VoxelGrid& grid);
+// Adds cells until every 2x2x2 neighborhood has connected occupied and empty
+// corner sets. This removes cubical edge/vertex pinches before surface extraction.
+[[nodiscard]] VoxelGrid regularizeWellComposedOccupancy(
+    const VoxelGrid& grid,
+    std::size_t* added_voxels = nullptr);
+// Additively removes digital reflex corners only inside connected phase-1
+// responsibility extents. Source occupancy is immutable.
+[[nodiscard]] VoxelGrid fillResponsibleLocalConcavities(
+    const VoxelGrid& source,
+    const VoxelGrid& filled,
+    std::size_t* added_voxels = nullptr);
 [[nodiscard]] VoxelGrid enclosingTopologyFill(
     const VoxelGrid& source,
     std::uint32_t maximum_steps,
@@ -203,9 +223,8 @@ struct TopologyFillOptions
     std::size_t maximum_grid_voxels,
     std::uint32_t padding,
     TriangleVoxelProvenance* provenance = nullptr);
-// Rasterizes and flood-classifies the source on an existing grid. This does
-// not run topology repair; it is used to compare a frozen filled solid with
-// the original triangle soup on exactly the same cells.
+// Rasterizes and flood-classifies the source on an existing temporary grid.
+// This does not run topology repair.
 [[nodiscard]] VoxelGrid voxelizeTriangleSoupOnGrid(
     const MeshModel& mesh,
     const VoxelGrid& grid_template,
@@ -228,7 +247,7 @@ struct OriginalObjHoleSurgeryStats
     std::size_t cap_triangles = 0;
 };
 
-// Uses the frozen filled occupancy only as an inside/outside certificate.
+// Uses phase-1 temporary occupancy only as an inside/outside certificate.
 // Existing boundary geometry comes directly from the input OBJ; only
 // certified internal walls are removed and their source-edge loops are capped.
 [[nodiscard]] MeshModel buildOriginalObjHoleSurgery(
@@ -238,6 +257,8 @@ struct OriginalObjHoleSurgeryStats
     const TriangleVoxelProvenance& provenance,
     const MeshModel& source,
     OriginalObjHoleSurgeryStats* stats = nullptr);
+// Constructs a boundary from phase-1 internal occupancy. This is an internal
+// generation step, not a way to reconstruct a formal phase-1 artifact.
 [[nodiscard]] Phase1Solid buildPhase1Solid(
     VoxelGrid occupancy,
     const MeshModel& source);
@@ -246,14 +267,16 @@ struct OriginalObjHoleSurgeryStats
     const OrientedSurfaceMesh& boundary,
     const VoxelGrid& filled_occupancy,
     const VoxelGrid& source_occupancy,
-    const MeshModel& source);
+    const MeshModel& source,
+    std::vector<std::array<std::uint32_t, 3>>* concavity_fill_cells = nullptr,
+    std::uint32_t trace_face = invalid_surface_index);
 // Removes zero-area faces by topology-preserving halfedge edge collapses.
-// Every collapse must satisfy the closed triangular-manifold link condition;
-// the returned mesh is rebuilt and strictly validated.
+// Every collapse must satisfy the closed triangular-manifold link condition.
+// The returned mesh is rebuilt but not passed through offline validation.
 [[nodiscard]] OrientedSurfaceMesh collapseDegenerateHalfedges(
     const OrientedSurfaceMesh& surface);
 // Visual inspection mesh that keeps certified source-boundary triangles exact
-// and uses the frozen topology surface only where the source has no support.
+// and uses the temporary topology surface only where the source has no support.
 [[nodiscard]] MeshModel buildSourceDominatedPhase1Preview(
     const VoxelGrid& occupancy,
     const MeshModel& source);

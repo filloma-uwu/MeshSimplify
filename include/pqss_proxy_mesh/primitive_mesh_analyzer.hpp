@@ -93,6 +93,7 @@ struct PrimitiveMeshAnalysisStats
     double filled_cavity_volume_ratio = 0.0;
     std::size_t filled_boundary_voids = 0;
     std::size_t filled_intercomponent_gaps = 0;
+    std::size_t filled_volume_covered_source_faces = 0;
     double filled_boundary_void_area = 0.0;
     std::size_t removed_contained_primitives = 0;
     std::size_t removed_sealed_void_wall_primitives = 0;

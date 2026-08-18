@@ -120,6 +120,15 @@
       border-radius: 4px; font-variant-numeric: tabular-nums;
     }
     #regenerateStatus { min-height: 18px; margin-top: 6px; color: var(--muted); }
+    .inspection-grid { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 6px; align-items: center; }
+    .inspection-grid input, .inspection-grid select {
+      width: 100%; min-width: 0; min-height: 32px; padding: 5px 8px;
+      color: var(--text); background: #202529; border: 1px solid var(--line); border-radius: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+    #halfedgeStats { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; margin-top: 9px; }
+    #halfedgeStats dt { color: var(--muted); }
+    #halfedgeStats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     .range-head { display: flex; justify-content: space-between; margin-bottom: 3px; }
     #stats { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; }
     #stats dt { margin: 0; color: var(--muted); }
@@ -178,7 +187,7 @@
 <body>
   <div id="viewport"></div>
   <header id="topbar">
-    <div class="brand">四阶段代理 Mesh</div>
+    <div class="brand">阶段 1 / 阶段 2 检查</div>
     <div class="model-nav">
       <button id="previousButton" class="icon-button" title="上一个模型" aria-label="上一个模型">&larr;</button>
       <select id="modelSelect" aria-label="模型"></select>
@@ -186,10 +195,11 @@
     </div>
     <div class="modes" aria-label="查看模式">
       <button data-mode="source">原模型</button>
-      <button data-mode="phase1">1 填洞</button>
-      <button data-mode="phase2">2 几何面合并</button>
-      <button data-mode="phase3">3 误差合并</button>
-      <button data-mode="phase4">4 三角化</button>
+      <button data-mode="phase0">阶段 0：原始 OBJ 开放洞覆盖</button>
+      <button data-mode="phase1">阶段 1：填洞结果</button>
+      <button data-mode="phase2">阶段 2：保守外扩</button>
+      <button data-mode="phase3">阶段 3：面数最小化</button>
+      <button data-mode="phase4">阶段 4：三角化</button>
       <button data-mode="error">误差位置</button>
       <button data-mode="split" class="active">原始/最终对比</button>
     </div>
@@ -197,6 +207,28 @@
   </header>
 
   <aside id="panel">
+    <section class="section">
+      <h2 class="section-title">阶段 1 半边逐项检查</h2>
+      <div class="inspection-grid">
+        <label for="inspectionStage">检查对象</label>
+        <select id="inspectionStage"><option value="phase1">阶段 1 半边</option><option value="phase2">阶段 2 半边</option></select>
+        <span></span><span></span>
+        <label for="halfedgeFilter">筛选</label>
+        <select id="halfedgeFilter"><option value="all">全部半边</option><option value="unpaired">无对边</option></select>
+        <button id="previousHalfedgeButton" type="button" title="当前面上一条半边">←</button>
+        <button id="nextHalfedgeButton" type="button" title="当前面下一条半边">→</button>
+        <label for="halfedgeInput">边 ID</label>
+        <input id="halfedgeInput" type="number" min="0" step="1" inputmode="numeric">
+        <button id="inspectOppositeButton" type="button" title="跳转到当前半边的对边">对边</button>
+        <button id="inspectHalfedgeButton" type="button">查看</button>
+        <label for="faceInput">面 ID</label>
+        <input id="faceInput" type="number" min="0" step="1" inputmode="numeric">
+        <button id="previousFaceButton" type="button" title="上一面">←</button>
+        <button id="nextFaceButton" type="button" title="下一面">→</button>
+      </div>
+      <div style="margin-top:7px;color:var(--muted)">Shift + 单击当前半边表面可直接选择面。</div>
+      <dl id="halfedgeStats"></dl>
+    </section>
     <section class="section">
       <h2 class="section-title">图元类型</h2>
       <div class="check-row">
@@ -218,6 +250,14 @@
       <input id="otherOpacity" type="range" min="0" max="100" value="15">
       <label class="check" style="margin-top:8px"><input id="wireframe" type="checkbox">线框</label>
     </section>
+    <section id="phase2RoundSection" class="section" hidden>
+      <h2 class="section-title">阶段 2 外扩轮次</h2>
+      <div class="primitive-navigation">
+        <button id="previousPhase2RoundButton" type="button">上一轮</button>
+        <button id="nextPhase2RoundButton" type="button">下一轮</button>
+      </div>
+      <dl id="phase2RoundStats" style="display:grid;grid-template-columns:1fr auto;gap:6px 12px;margin-top:9px"></dl>
+    </section>
     <section class="section">
       <h2 class="section-title">最大误差约束</h2>
       <label for="maximumErrorInput">模型单位</label>
@@ -232,9 +272,9 @@
       <dl id="stats"></dl>
     </section>
     <section id="errorSection" class="section" hidden>
-      <h2 class="section-title">简化误差（阶段 3 → 阶段 1）</h2>
+      <h2 class="section-title">误差认证（阶段 2 → 阶段 1）</h2>
       <div id="legend">
-        <span class="swatch" style="background:#ffb33c"></span><span>最大误差代理点</span><span></span>
+        <span class="swatch" style="background:#ffb33c"></span><span>最大观测误差代理点</span><span></span>
         <span class="swatch" style="background:#43d6db"></span><span>最近填洞后表面点</span><span></span>
       </div>
       <button id="focusErrorButton" type="button" style="width:100%;margin-top:10px">定位最大误差</button>
@@ -245,7 +285,7 @@
     </section>
   </aside>
 
-  <div id="labels"><span>原模型</span><span>阶段 4：三角化结果</span></div>
+  <div id="labels"><span id="sourceComparisonLabel">原模型</span><span id="comparisonLabel">阶段 4：三角化结果</span></div>
   <div id="loading"><div id="loadingText">正在加载分析结果...</div></div>
 
   <script type="importmap">
@@ -256,7 +296,9 @@
     import { OrbitControls } from './lib/OrbitControls.js';
 
     const params = new URLSearchParams(location.search);
-    const manifestUrl = new URL(params.get('manifest') || '/outputs/unified_surface_fix_full_parallel_v2/viewer_manifest.json', location.href);
+    const manifestUrl = new URL(params.get('manifest') || '/outputs/direct_coverage_uniform_closed_responsibility_full_v13/viewer_manifest.json', location.href);
+    document.querySelector('#wireframe').checked = ['1', 'true', 'yes'].includes(
+      (params.get('wireframe') || '').toLowerCase());
     const viewport = document.querySelector('#viewport');
     const loading = document.querySelector('#loading');
     const loadingText = document.querySelector('#loadingText');
@@ -268,9 +310,18 @@
     const regenerateButton = document.querySelector('#regenerateButton');
     const regenerateStatus = document.querySelector('#regenerateStatus');
     const labels = document.querySelector('#labels');
+    const halfedgeStatsElement = document.querySelector('#halfedgeStats');
+    let halfedgeInspection = null;
+    const halfedgeInspections = { phase1: null, phase2: null };
+    let inspectionRole = 'phase1';
+    let halfedgeOverlay = null;
+    let currentMetadataUrl = null;
+    let phase2RoundRecords = [];
+    let currentPhase2Round = null;
+    let phase2RoundCache = new Map();
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setPixelRatio(1);
     renderer.setSize(innerWidth, innerHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setClearColor(0x121518, 1);
@@ -290,6 +341,7 @@
 
     const roots = {
       source: new THREE.Group(),
+      phase0: new THREE.Group(),
       phase1: new THREE.Group(),
       phase2: new THREE.Group(),
       phase3: new THREE.Group(),
@@ -297,6 +349,9 @@
       error: new THREE.Group(),
     };
     Object.values(roots).forEach(root => scene.add(root));
+    const inspectionRoot = new THREE.Group();
+    inspectionRoot.name = 'halfedge_inspection';
+    scene.add(inspectionRoot);
 
     let manifest;
     let metadata;
@@ -304,9 +359,11 @@
     let mode = 'split';
     let selectedPrimitive = 'all';
     let fitPending = true;
+    let renderDirty = true;
     let loadGeneration = 0;
     let openError = null;
     const batchedPrimitiveData = {
+      phase0: new Map(),
       phase1: new Map(),
       phase2: new Map(),
       phase3: new Map(),
@@ -320,6 +377,7 @@
     const enabledTypes = new Set(primitiveTypes);
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    controls.addEventListener('change', () => { renderDirty = true; });
 
     const palette = [
       0x49b894, 0xe4aa55, 0x5fa8d3, 0xe46f61, 0xa48ad4, 0x8fc66b,
@@ -337,13 +395,281 @@
     function attachTriangleWireframe(mesh) {
       const geometry = new THREE.WireframeGeometry(mesh.geometry);
       const material = new THREE.LineBasicMaterial({
-        color: 0x172126, transparent: true, opacity: 0.82,
+        color: 0xffd54f, transparent: true, opacity: 1.0,
         depthTest: true, depthWrite: false,
       });
       const wireframe = new THREE.LineSegments(geometry, material);
       wireframe.userData.triangleWireframe = true;
       wireframe.renderOrder = 2;
       mesh.add(wireframe);
+    }
+
+    function ensureOccludedWireframe(mesh) {
+      let wireframe = mesh.children.find(child => child.userData.occludedWireframe);
+      if (wireframe) return wireframe;
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffd54f,
+        wireframe: true,
+        transparent: true,
+        opacity: 1.0,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      // Share the indexed surface buffer. The parent performs a colorless
+      // depth pre-pass; this child then draws only fragments on visible
+      // surfaces, so back-side/internal triangle edges cannot bleed through.
+      wireframe = new THREE.Mesh(mesh.geometry, material);
+      wireframe.userData.occludedWireframe = true;
+      wireframe.userData.sharedGeometry = true;
+      wireframe.visible = false;
+      wireframe.renderOrder = 2;
+      wireframe.raycast = () => {};
+      mesh.add(wireframe);
+      return wireframe;
+    }
+
+    function clearHalfedgeInspection() {
+      for (const child of [...inspectionRoot.children]) {
+        inspectionRoot.remove(child);
+        child.traverse(object => {
+          object.geometry?.dispose();
+          const materials = Array.isArray(object.material)
+            ? object.material : [object.material];
+          for (const material of materials) material?.dispose?.();
+        });
+      }
+      halfedgeStatsElement.replaceChildren();
+      halfedgeOverlay = null;
+    }
+
+    function inspectionPoint(vertex) {
+      const data = halfedgeInspection;
+      return new THREE.Vector3(
+        data.positions[3 * vertex], data.positions[3 * vertex + 1], data.positions[3 * vertex + 2]);
+    }
+
+    function inspectionRow(label, value) {
+      statRow(label, String(value), '', halfedgeStatsElement);
+    }
+
+    function formatVector(vector) {
+      return [vector.x, vector.y, vector.z]
+        .map(value => Number(value).toFixed(6)).join(', ');
+    }
+
+    function faceVertices(faceId) {
+      const data = halfedgeInspection;
+      return [
+        data.indices[3 * faceId],
+        data.indices[3 * faceId + 1],
+        data.indices[3 * faceId + 2],
+      ];
+    }
+
+    function faceNormal(faceId) {
+      const vertices = faceVertices(faceId).map(inspectionPoint);
+      return vertices[1].clone().sub(vertices[0]).cross(
+        vertices[2].clone().sub(vertices[0])).normalize();
+    }
+
+    function faceCenter(faceId) {
+      const vertices = faceVertices(faceId).map(inspectionPoint);
+      return vertices[0].clone().add(vertices[1]).add(vertices[2]).multiplyScalar(1 / 3);
+    }
+
+    function faceScale(faceId) {
+      const vertices = faceVertices(faceId).map(inspectionPoint);
+      return Math.max(
+        vertices[0].distanceTo(vertices[1]),
+        vertices[1].distanceTo(vertices[2]),
+        vertices[2].distanceTo(vertices[0]),
+        1e-6);
+    }
+
+    function addInspectionArrow(origin, direction, length, color, renderOrder = 206) {
+      if (!(length > 0) || direction.lengthSq() <= 0) return null;
+      const arrow = new THREE.ArrowHelper(
+        direction.clone().normalize(), origin, length, color,
+        Math.min(Math.max(length * 0.22, 4), 24),
+        Math.min(Math.max(length * 0.12, 2), 12));
+      arrow.renderOrder = renderOrder;
+      arrow.traverse(object => {
+        if (!object.material) return;
+        object.material.depthTest = false;
+        object.material.depthWrite = false;
+      });
+      inspectionRoot.add(arrow);
+      return arrow;
+    }
+
+    function addFaceNormalArrow(faceId, color = 0x66ff8a, lengthScale = 0.75) {
+      const normal = faceNormal(faceId);
+      addInspectionArrow(faceCenter(faceId), normal, faceScale(faceId) * lengthScale, color);
+      return normal;
+    }
+
+    function showHalfedgeSummary() {
+      clearHalfedgeInspection();
+      const data = halfedgeInspection;
+      if (!data) {
+        inspectionRow('状态', '未加载 Halfedge');
+        return;
+      }
+      let unpaired = 0;
+      for (let id = 0; id < data.halfedgeCount; ++id)
+        if (data.halfedges[id * 4 + 3] === 0xffffffff) ++unpaired;
+      inspectionRow('vertices', data.vertexCount.toLocaleString());
+      inspectionRow('faces', data.faceCount.toLocaleString());
+      inspectionRow('halfedges', data.halfedgeCount.toLocaleString());
+      inspectionRow('无 opposite', unpaired.toLocaleString());
+    }
+
+    function setInspectionRole(role, updateMode = true) {
+      if (!Object.prototype.hasOwnProperty.call(halfedgeInspections, role)) return;
+      clearHalfedgeInspection();
+      inspectionRole = role;
+      halfedgeInspection = halfedgeInspections[role];
+      document.querySelector('#inspectionStage').value = role;
+      document.querySelector('#halfedgeInput').max = Math.max(0,
+        (halfedgeInspection?.halfedgeCount || 1) - 1);
+      document.querySelector('#faceInput').max = Math.max(0,
+        (halfedgeInspection?.faceCount || 1) - 1);
+      params.set('inspect', role);
+      showHalfedgeSummary();
+      if (updateMode && halfedgeInspection) setMode(role);
+    }
+
+    function highlightFace(faceId, includeStats = true) {
+      const data = halfedgeInspection;
+      if (!data || !Number.isInteger(faceId) || faceId < 0 || faceId >= data.faceCount) {
+        clearHalfedgeInspection();
+        inspectionRow('错误', `face ID 必须在 0..${Math.max(0, (data?.faceCount || 1) - 1)}`);
+        return false;
+      }
+      clearHalfedgeInspection();
+      const vertices = faceVertices(faceId);
+      const geometry = new THREE.BufferGeometry().setFromPoints(vertices.map(inspectionPoint));
+      geometry.setIndex([0, 1, 2]);
+      geometry.computeVertexNormals();
+      const face = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+        color: 0xff4f3d, transparent: true, opacity: 0.72, side: THREE.DoubleSide,
+        depthTest: false, depthWrite: false,
+      }));
+      face.renderOrder = 200;
+      inspectionRoot.add(face);
+      const boundary = new THREE.LineLoop(
+        new THREE.BufferGeometry().setFromPoints(vertices.map(inspectionPoint)),
+        new THREE.LineBasicMaterial({ color: 0xffe36a, depthTest: false, depthWrite: false }));
+      boundary.renderOrder = 201;
+      inspectionRoot.add(boundary);
+      const normal = addFaceNormalArrow(faceId, 0x66ff8a);
+      if (includeStats) {
+        const firstHalfedge = data.faceHalfedges[faceId];
+        inspectionRow('face', faceId);
+        inspectionRow('vertices', vertices.join(', '));
+        inspectionRow('face normal', formatVector(normal));
+        inspectionRow('face_halfedge', firstHalfedge);
+        inspectionRow('halfedge cycle', [firstHalfedge,
+          data.halfedges[firstHalfedge * 4 + 2],
+          data.halfedges[data.halfedges[firstHalfedge * 4 + 2] * 4 + 2]].join(' → '));
+        document.querySelector('#faceInput').value = faceId;
+        params.set('face', faceId);
+        params.delete('halfedge');
+        history.replaceState(null, '', `${location.pathname}?${params}`);
+      }
+      halfedgeOverlay = { type: 'face', id: faceId };
+      renderDirty = true;
+      return true;
+    }
+
+    function highlightHalfedge(halfedgeId) {
+      const data = halfedgeInspection;
+      if (!data || !Number.isInteger(halfedgeId) || halfedgeId < 0 ||
+          halfedgeId >= data.halfedgeCount) {
+        clearHalfedgeInspection();
+        inspectionRow('错误', `halfedge ID 必须在 0..${Math.max(0, (data?.halfedgeCount || 1) - 1)}`);
+        return false;
+      }
+      const base = halfedgeId * 4;
+      const origin = data.halfedges[base];
+      const faceId = data.halfedges[base + 1];
+      const next = data.halfedges[base + 2];
+      const opposite = data.halfedges[base + 3];
+      if (!highlightFace(faceId, false)) return false;
+      const destination = data.halfedges[next * 4];
+      const start = inspectionPoint(origin);
+      const end = inspectionPoint(destination);
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([start, end]),
+        new THREE.LineBasicMaterial({ color: 0x36e6ff, depthTest: false, depthWrite: false }));
+      line.renderOrder = 203;
+      inspectionRoot.add(line);
+      const direction = end.clone().sub(start);
+      const length = direction.length();
+      if (length > 0) {
+        addInspectionArrow(start, direction, length, 0x36e6ff, 204);
+      }
+      const originMarker = new THREE.Points(
+        new THREE.BufferGeometry().setFromPoints([start]),
+        new THREE.PointsMaterial({ color: 0x66ff8a, size: 11, sizeAttenuation: false,
+          depthTest: false, depthWrite: false }));
+      originMarker.renderOrder = 205;
+      inspectionRoot.add(originMarker);
+      const destinationMarker = new THREE.Points(
+        new THREE.BufferGeometry().setFromPoints([end]),
+        new THREE.PointsMaterial({ color: 0xff70d7, size: 11, sizeAttenuation: false,
+          depthTest: false, depthWrite: false }));
+      destinationMarker.renderOrder = 205;
+      inspectionRoot.add(destinationMarker);
+      const currentNormal = faceNormal(faceId);
+      const edgeDirection = end.clone().sub(start).normalize();
+      let signedSine = null;
+      let normalDot = null;
+      if (opposite !== 0xffffffff) {
+        const oppositeFace = data.halfedges[opposite * 4 + 1];
+        const oppositeNormal = addFaceNormalArrow(oppositeFace, 0xff70d7, 0.65);
+        signedSine = edgeDirection.dot(currentNormal.clone().cross(oppositeNormal));
+        normalDot = currentNormal.dot(oppositeNormal);
+      }
+      inspectionRow('halfedge', halfedgeId);
+      inspectionRow('origin → destination', `${origin} → ${destination}`);
+      inspectionRow('face', faceId);
+      inspectionRow('face normal', formatVector(currentNormal));
+      inspectionRow('edge direction', formatVector(edgeDirection));
+      inspectionRow('next', next);
+      inspectionRow('opposite', opposite === 0xffffffff ? 'INVALID (unpaired)' : opposite);
+      if (opposite !== 0xffffffff) {
+        inspectionRow('opposite face', data.halfedges[opposite * 4 + 1]);
+        inspectionRow('opposite normal',
+          formatVector(faceNormal(data.halfedges[opposite * 4 + 1])));
+        inspectionRow('dihedral signed sine', signedSine.toFixed(12));
+        inspectionRow('normal dot', normalDot.toFixed(12));
+      }
+      document.querySelector('#halfedgeInput').value = halfedgeId;
+      document.querySelector('#faceInput').value = faceId;
+      params.set('halfedge', halfedgeId);
+      params.delete('face');
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+      halfedgeOverlay = { type: 'halfedge', id: halfedgeId };
+      renderDirty = true;
+      return true;
+    }
+
+    function adjacentInspectableHalfedge(offset) {
+      const data = halfedgeInspection;
+      if (!data) return;
+      const filter = document.querySelector('#halfedgeFilter').value;
+      let current = Number(document.querySelector('#halfedgeInput').value);
+      if (!Number.isInteger(current)) current = offset > 0 ? -1 : 0;
+      for (let attempt = 0; attempt < data.halfedgeCount; ++attempt) {
+        current = (current + offset + data.halfedgeCount) % data.halfedgeCount;
+        const unpaired = data.halfedges[current * 4 + 3] === 0xffffffff;
+        if (filter === 'all' || unpaired) { highlightHalfedge(current); return; }
+      }
+      clearHalfedgeInspection();
+      inspectionRow('筛选结果', '无匹配 halfedge');
+      renderDirty = true;
     }
 
     function addOpenErrorVisualization(data) {
@@ -369,27 +695,82 @@
       }
       if (!pair || !(Number(pair.distance) > 0) ||
           !Array.isArray(pair.proxy) || !Array.isArray(pair.source)) return;
-      const positions = [...pair.proxy, ...pair.source];
       const lineGeometry = new THREE.BufferGeometry();
-      lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-      const line = new THREE.Line(lineGeometry, new THREE.LineBasicMaterial({
-        color: 0xffe26a, depthTest: false, depthWrite: false,
-      }));
+      lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+        0, -1, 0,  1, -1, 0,  1, 1, 0,
+        0, -1, 0,  1,  1, 0,  0, 1, 0,
+      ], 3));
+      const lineMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          startPoint: { value: new THREE.Vector3().fromArray(pair.proxy) },
+          endPoint: { value: new THREE.Vector3().fromArray(pair.source) },
+          resolution: { value: new THREE.Vector2(renderer.domElement.width, renderer.domElement.height) },
+          lineWidthPixels: { value: 6 },
+          lineColor: { value: new THREE.Color(0xffe26a) },
+        },
+        vertexShader: `
+          uniform vec3 startPoint;
+          uniform vec3 endPoint;
+          uniform vec2 resolution;
+          uniform float lineWidthPixels;
+          void main() {
+            vec4 startClip = projectionMatrix * modelViewMatrix * vec4(startPoint, 1.0);
+            vec4 endClip = projectionMatrix * modelViewMatrix * vec4(endPoint, 1.0);
+            vec2 startNdc = startClip.xy / startClip.w;
+            vec2 endNdc = endClip.xy / endClip.w;
+            vec2 screenDirection = (endNdc - startNdc) * resolution;
+            float screenLength = max(length(screenDirection), 1.0e-6);
+            vec2 perpendicular = vec2(-screenDirection.y, screenDirection.x) / screenLength;
+            vec4 clipPoint = mix(startClip, endClip, position.x);
+            vec2 ndcOffset = perpendicular * position.y * lineWidthPixels / resolution;
+            clipPoint.xy += ndcOffset * clipPoint.w;
+            gl_Position = clipPoint;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 lineColor;
+          void main() { gl_FragColor = vec4(lineColor, 1.0); }
+        `,
+        depthTest: false,
+        depthWrite: false,
+        transparent: false,
+      });
+      const line = new THREE.Mesh(lineGeometry, lineMaterial);
       line.name = 'maximum_error_segment';
-      line.renderOrder = 8;
+      line.renderOrder = 100;
+      line.frustumCulled = false;
       roots.error.add(line);
-      const radius = Math.max(modelScale * 0.0015, Number(pair.distance || 0) * 0.025, 1e-7);
-      const sphereGeometry = new THREE.SphereGeometry(radius, 18, 12);
       for (const [role, point, color] of [
         ['maximum_proxy_point', pair.proxy, 0xffb33c],
         ['maximum_source_point', pair.source, 0x43d6db],
       ]) {
-        const marker = new THREE.Mesh(sphereGeometry.clone(), new THREE.MeshBasicMaterial({
-          color, depthTest: false, depthWrite: false,
+        const markerGeometry = new THREE.BufferGeometry();
+        markerGeometry.setAttribute('position', new THREE.Float32BufferAttribute(point, 3));
+        const marker = new THREE.Points(markerGeometry, new THREE.ShaderMaterial({
+          uniforms: { markerColor: { value: new THREE.Color(color) } },
+          vertexShader: `
+            void main() {
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              gl_PointSize = 18.0;
+            }
+          `,
+          fragmentShader: `
+            uniform vec3 markerColor;
+            void main() {
+              vec2 centered = gl_PointCoord - vec2(0.5);
+              float radius = length(centered);
+              if (radius > 0.5) discard;
+              float edge = smoothstep(0.5, 0.42, radius);
+              gl_FragColor = vec4(markerColor, edge);
+            }
+          `,
+          depthTest: false,
+          depthWrite: false,
+          transparent: true,
         }));
-        marker.position.fromArray(point);
         marker.name = role;
-        marker.renderOrder = 9;
+        marker.renderOrder = 101;
+        marker.frustumCulled = false;
         roots.error.add(marker);
       }
     }
@@ -398,6 +779,12 @@
       const response = await fetch(url, { cache: 'no-store' });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${url}`);
       return response.text();
+    }
+
+    async function fetchArrayBuffer(url) {
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${url}`);
+      return response.arrayBuffer();
     }
 
     async function fetchJson(url) {
@@ -412,7 +799,7 @@
     function parseOBJ(text, role) {
       const positions = [];
       const groups = [];
-      let current = { name: role, indices: [] };
+      let current = { name: role, indices: [], lines: [], points: [] };
       groups.push(current);
       for (const raw of text.split(/\r?\n/)) {
         const line = raw.trim();
@@ -421,9 +808,9 @@
         if (fields[0] === 'v' && fields.length >= 4) {
           positions.push(Number(fields[1]), Number(fields[2]), Number(fields[3]));
         } else if ((fields[0] === 'g' || fields[0] === 'o') && fields[1]) {
-          if (current.indices.length === 0 && current.name === role) current.name = fields[1];
+          if (current.indices.length === 0 && current.lines.length === 0 && current.points.length === 0 && current.name === role) current.name = fields[1];
           else {
-            current = { name: fields[1], indices: [] };
+            current = { name: fields[1], indices: [], lines: [], points: [] };
             groups.push(current);
           }
         } else if (fields[0] === 'f' && fields.length >= 4) {
@@ -434,10 +821,89 @@
           });
           const triangles = triangulateObjFace(polygon, positions);
           triangles.forEach(triangle => current.indices.push(...triangle));
+        } else if (fields[0] === 'l' && fields.length >= 3) {
+          const count = positions.length / 3;
+          const line = fields.slice(1).map(token => {
+            const rawIndex = Number(token.split('/')[0]);
+            return rawIndex > 0 ? rawIndex - 1 : count + rawIndex;
+          });
+          for (let index = 0; index + 1 < line.length; ++index)
+            current.lines.push(line[index], line[index + 1]);
+        } else if (fields[0] === 'p' && fields.length >= 2) {
+          const count = positions.length / 3;
+          for (const token of fields.slice(1)) {
+            const rawIndex = Number(token.split('/')[0]);
+            current.points.push(rawIndex > 0 ? rawIndex - 1 : count + rawIndex);
+          }
         }
       }
-      const populated = groups.filter(group => group.indices.length);
-      if ((role === 'phase1' || role === 'phase2' || role === 'phase3' || role === 'phase4') && populated.length > 2000) {
+      const populated = groups.filter(group => group.indices.length || group.lines.length || group.points.length);
+      if (populated.length && populated.every(group => !group.indices.length && (group.lines.length || group.points.length))) {
+        batchedPrimitiveData[role].clear();
+        const objects = [];
+        for (const group of populated) {
+          const identity = identityFromGroup(group.name);
+          if (group.lines.length) {
+            const linePositions = [];
+            for (const sourceIndex of group.lines) {
+              linePositions.push(
+                positions[3 * sourceIndex],
+                positions[3 * sourceIndex + 1],
+                positions[3 * sourceIndex + 2],
+              );
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
+            geometry.computeBoundingBox();
+            geometry.computeBoundingSphere();
+            const material = new THREE.LineBasicMaterial({
+              color: colorFor(identity.id || 0),
+              depthTest: false,
+              depthWrite: false,
+              transparent: true,
+              opacity: 1,
+            });
+            const lines = new THREE.LineSegments(geometry, material);
+            lines.name = `${group.name}_edges`;
+            lines.renderOrder = 50;
+            lines.userData = { role, primitiveId: identity.id, primitiveType: identity.type };
+            objects.push(lines);
+          }
+          if (group.points.length) {
+            const pointPositions = [];
+            for (const sourceIndex of group.points) {
+              pointPositions.push(
+                positions[3 * sourceIndex],
+                positions[3 * sourceIndex + 1],
+                positions[3 * sourceIndex + 2],
+              );
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(pointPositions, 3));
+            geometry.computeBoundingBox();
+            geometry.computeBoundingSphere();
+            const material = new THREE.PointsMaterial({
+              color: colorFor(identity.id || 0),
+              size: 7,
+              sizeAttenuation: false,
+              depthTest: false,
+              depthWrite: false,
+              transparent: true,
+              opacity: 1,
+            });
+            const points = new THREE.Points(geometry, material);
+            points.name = `${group.name}_points`;
+            points.renderOrder = 51;
+            points.userData = { role, primitiveId: identity.id, primitiveType: identity.type };
+            objects.push(points);
+          }
+        }
+        return objects;
+      }
+      const componentDiagnostic = populated.some(group =>
+        identityFromGroup(group.name).type === 'component');
+      if ((role === 'phase0' || role === 'phase1' || role === 'phase2' || role === 'phase3' || role === 'phase4') &&
+          (populated.length > 2000 || componentDiagnostic)) {
         batchedPrimitiveData[role].clear();
         const buckets = new Map();
         for (const group of populated) {
@@ -469,7 +935,9 @@
           geometry.computeBoundingBox();
           geometry.computeBoundingSphere();
           const material = new THREE.MeshStandardMaterial({
-            vertexColors: true, roughness: 0.66, metalness: 0.04,
+            vertexColors: true,
+            roughness: 0.68,
+            metalness: 0.03,
             transparent: role === 'phase2',
             opacity: role === 'phase2' ? 0.72 : 1,
             depthWrite: role !== 'phase2', side: THREE.DoubleSide,
@@ -511,14 +979,19 @@
         let material;
         if (role === 'source') {
           material = new THREE.MeshStandardMaterial({ color: 0xb7bec2, roughness: 0.78, metalness: 0.02, side: THREE.DoubleSide });
+        } else if (role === 'phase0') {
+          material = new THREE.MeshStandardMaterial({
+            color: 0xff9f32, roughness: 0.68, metalness: 0.03,
+            side: THREE.DoubleSide,
+          });
         } else {
           material = new THREE.MeshStandardMaterial({
             color: colorFor(identity.id || 0),
-            roughness: 0.66,
-            metalness: 0.04,
-          transparent: role === 'phase2',
-          opacity: role === 'phase2' ? 0.72 : 1,
-          depthWrite: role !== 'phase2',
+            roughness: 0.68,
+            metalness: 0.03,
+            transparent: role === 'phase2',
+            opacity: role === 'phase2' ? 0.72 : 1,
+            depthWrite: role !== 'phase2',
             side: THREE.DoubleSide,
           });
         }
@@ -530,6 +1003,134 @@
         mesh.userData = { role, primitiveId: identity.id, primitiveType: identity.type };
         return mesh;
       });
+    }
+
+    function parseHalfedge(buffer, role, componentDiagnostic = false) {
+      if (buffer.byteLength < 28) throw new Error('Halfedge file header is incomplete');
+      const bytes = new Uint8Array(buffer);
+      const magic = new TextDecoder('ascii').decode(bytes.subarray(0, 8));
+      if (magic !== 'PQSSHED1') throw new Error(`Unknown Halfedge format ${magic}`);
+      const view = new DataView(buffer);
+      const vertexCount = view.getUint32(8, true);
+      const faceCount = view.getUint32(12, true);
+      const halfedgeCount = view.getUint32(16, true);
+      const vertexHalfedgeCount = view.getUint32(20, true);
+      const faceHalfedgeCount = view.getUint32(24, true);
+      if (halfedgeCount !== faceCount * 3 || vertexHalfedgeCount !== vertexCount ||
+          faceHalfedgeCount !== faceCount) throw new Error('Halfedge array counts are inconsistent');
+      const expected = 28 + vertexCount * 24 + faceCount * 12 +
+        halfedgeCount * 16 + vertexHalfedgeCount * 4 + faceHalfedgeCount * 4;
+      if (buffer.byteLength !== expected) throw new Error('Halfedge payload size is inconsistent');
+      let offset = 28;
+      const precisePositions = new Float64Array(vertexCount * 3);
+      const localOrigin = new THREE.Vector3();
+      for (let index = 0; index < precisePositions.length; ++index, offset += 8) {
+        precisePositions[index] = view.getFloat64(offset, true);
+        localOrigin.setComponent(index % 3,
+          localOrigin.getComponent(index % 3) + precisePositions[index] / vertexCount);
+      }
+      const positions = new Float32Array(vertexCount * 3);
+      for (let index = 0; index < positions.length; ++index)
+        positions[index] = precisePositions[index] - localOrigin.getComponent(index % 3);
+      const indices = new Uint32Array(faceCount * 3);
+      for (let index = 0; index < indices.length; ++index, offset += 4) {
+        indices[index] = view.getUint32(offset, true);
+        if (indices[index] >= vertexCount) throw new Error('Halfedge face has an invalid vertex');
+      }
+      const halfedges = new Uint32Array(halfedgeCount * 4);
+      for (let index = 0; index < halfedges.length; ++index, offset += 4)
+        halfedges[index] = view.getUint32(offset, true);
+      const vertexHalfedges = new Uint32Array(vertexHalfedgeCount);
+      for (let index = 0; index < vertexHalfedges.length; ++index, offset += 4)
+        vertexHalfedges[index] = view.getUint32(offset, true);
+      const faceHalfedges = new Uint32Array(faceHalfedgeCount);
+      for (let index = 0; index < faceHalfedges.length; ++index, offset += 4)
+        faceHalfedges[index] = view.getUint32(offset, true);
+      if (!componentDiagnostic) {
+        halfedgeInspections[role] = {
+        positions: precisePositions, localOrigin, indices, halfedges,
+        vertexHalfedges, faceHalfedges, vertexCount, faceCount, halfedgeCount,
+        };
+        if (role === inspectionRole) halfedgeInspection = halfedgeInspections[role];
+      }
+      if (componentDiagnostic) {
+        const opposites = new Uint32Array(halfedgeCount);
+        for (let index = 0; index < halfedgeCount; ++index)
+          opposites[index] = halfedges[index * 4 + 3];
+        const visited = new Uint8Array(faceCount);
+        const components = [];
+        for (let seed = 0; seed < faceCount; ++seed) {
+          if (visited[seed]) continue;
+          const faces = [];
+          const queue = [seed];
+          visited[seed] = 1;
+          let area = 0;
+          for (let cursor = 0; cursor < queue.length; ++cursor) {
+            const face = queue[cursor];
+            faces.push(face);
+            const ia = indices[3 * face], ib = indices[3 * face + 1], ic = indices[3 * face + 2];
+            const ax = positions[3 * ia], ay = positions[3 * ia + 1], az = positions[3 * ia + 2];
+            const ux = positions[3 * ib] - ax, uy = positions[3 * ib + 1] - ay, uz = positions[3 * ib + 2] - az;
+            const vx = positions[3 * ic] - ax, vy = positions[3 * ic + 1] - ay, vz = positions[3 * ic + 2] - az;
+            const cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
+            area += 0.5 * Math.hypot(cx, cy, cz);
+            for (let local = 0; local < 3; ++local) {
+              const opposite = opposites[3 * face + local];
+              if (opposite === 0xffffffff) continue;
+              const neighbor = Math.floor(opposite / 3);
+              if (!visited[neighbor]) { visited[neighbor] = 1; queue.push(neighbor); }
+            }
+          }
+          components.push({ faces, area, minimumFace: Math.min(...faces) });
+        }
+        components.sort((a, b) => b.area - a.area || a.minimumFace - b.minimumFace);
+        const diagnosticPositions = [];
+        const colors = [];
+        const primitiveIds = [];
+        batchedPrimitiveData[role].clear();
+        components.forEach((component, id) => {
+          const color = colorFor(id);
+          const selectedPositions = [];
+          for (const face of component.faces) for (let local = 0; local < 3; ++local) {
+            const vertex = indices[3 * face + local];
+            const point = [positions[3 * vertex], positions[3 * vertex + 1], positions[3 * vertex + 2]];
+            diagnosticPositions.push(...point);
+            selectedPositions.push(...point);
+            colors.push(color.r, color.g, color.b);
+            primitiveIds.push(id);
+          }
+          batchedPrimitiveData[role].set(id, { type: 'component', positions: selectedPositions });
+        });
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(diagnosticPositions, 3));
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        geometry.setAttribute('primitiveId', new THREE.Float32BufferAttribute(primitiveIds, 1));
+        geometry.computeVertexNormals();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+        const material = new THREE.MeshStandardMaterial({
+          vertexColors: true, roughness: 0.66, metalness: 0.04, side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.copy(localOrigin);
+        mesh.name = 'batched_component_diagnostic';
+        mesh.userData = { role, primitiveId: null, primitiveType: 'component', batched: true };
+        return [mesh];
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+      geometry.computeVertexNormals();
+      geometry.computeBoundingBox();
+      geometry.computeBoundingSphere();
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x42b892, roughness: 0.66, metalness: 0.04, side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.copy(localOrigin);
+      mesh.name = `${role}_halfedge`;
+      mesh.userData = { role, halfedge: true, vertexCount, faceCount, halfedgeCount };
+      return [mesh];
     }
 
     function triangulateObjFace(polygon, positions) {
@@ -589,8 +1190,10 @@
       for (const child of [...root.children]) {
         root.remove(child);
         child.traverse(object => {
-          object.geometry?.dispose();
-          object.material?.dispose();
+          if (!object.userData.sharedGeometry) object.geometry?.dispose();
+          const materials = Array.isArray(object.material)
+            ? object.material : [object.material];
+          for (const material of materials) material?.dispose?.();
         });
       }
       root.position.set(0, 0, 0);
@@ -672,15 +1275,36 @@
       const opacity = Number(document.querySelector('#opacity').value) / 100;
       const otherOpacity = Number(document.querySelector('#otherOpacity').value) / 100;
       const wireframe = document.querySelector('#wireframe').checked;
-      for (const role of ['phase2', 'phase3']) roots[role].children.forEach(mesh => {
+      for (const role of ['phase0', 'phase1', 'phase2', 'phase3']) roots[role].children.forEach(mesh => {
+        if (mesh.isLineSegments || mesh.isPoints) {
+          mesh.visible = visiblePrimitive(mesh);
+          mesh.material.opacity = 1;
+          mesh.material.transparent = false;
+          mesh.material.depthTest = false;
+          mesh.material.depthWrite = false;
+          mesh.renderOrder = mesh.isPoints ? 51 : 50;
+          return;
+        }
         const selected = mesh.userData.selectionOverlay || selectedPrimitive === 'all' ||
           mesh.userData.primitiveId === Number(selectedPrimitive);
         const meshOpacity = mesh.userData.batched && selectedPrimitive !== 'all'
           ? otherOpacity : (selected ? opacity : otherOpacity);
-        mesh.material.opacity = meshOpacity;
-        mesh.material.transparent = meshOpacity < 1;
-        mesh.material.depthWrite = meshOpacity >= 1;
-        mesh.material.wireframe = wireframe;
+        const occludedWireframe = wireframe
+          ? ensureOccludedWireframe(mesh)
+          : mesh.children.find(child => child.userData.occludedWireframe);
+        mesh.material.wireframe = false;
+        mesh.material.colorWrite = !wireframe;
+        mesh.material.opacity = wireframe ? 1 : meshOpacity;
+        mesh.material.transparent = wireframe ? false : meshOpacity < 1;
+        mesh.material.depthWrite = wireframe ? true : meshOpacity >= 1;
+        mesh.material.depthTest = true;
+        if (occludedWireframe) {
+          occludedWireframe.visible = wireframe;
+          occludedWireframe.material.opacity = Math.max(meshOpacity, 0.72);
+          occludedWireframe.material.transparent = true;
+          occludedWireframe.material.depthTest = true;
+          occludedWireframe.material.depthWrite = false;
+        }
         mesh.renderOrder = selected ? 2 : 0;
       });
       roots.phase4.children.forEach(mesh => {
@@ -703,15 +1327,50 @@
         });
       });
       roots.source.children.forEach(mesh => {
-        mesh.material.opacity = mode === 'error' ? 0.24 : 1;
-        mesh.material.transparent = mode === 'error';
-        mesh.material.depthWrite = mode !== 'error';
+        const meshOpacity = mode === 'error' ? 0.24 : 1;
+        const occludedWireframe = wireframe
+          ? ensureOccludedWireframe(mesh)
+          : mesh.children.find(child => child.userData.occludedWireframe);
+        mesh.material.wireframe = false;
+        mesh.material.colorWrite = !wireframe;
+        mesh.material.opacity = wireframe ? 1 : meshOpacity;
+        mesh.material.transparent = wireframe ? false : meshOpacity < 1;
+        mesh.material.depthTest = true;
+        mesh.material.depthWrite = wireframe ? true : meshOpacity >= 1;
+        if (occludedWireframe) {
+          occludedWireframe.visible = wireframe;
+          occludedWireframe.material.opacity = Math.max(meshOpacity, 0.72);
+          occludedWireframe.material.transparent = true;
+          occludedWireframe.material.depthTest = true;
+          occludedWireframe.material.depthWrite = false;
+        }
       });
-      roots.phase1.children.forEach(mesh => {
-        mesh.material.opacity = mode === 'error' ? 0.24 : 1;
-        mesh.material.transparent = mode === 'error';
-        mesh.material.depthWrite = mode !== 'error';
+      if (mode === 'error') roots.phase1.children.forEach(mesh => {
+        mesh.material.opacity = 0.24;
+        mesh.material.transparent = true;
+        mesh.material.depthWrite = false;
       });
+      if (wireframe) {
+        for (const role of ['phase0', 'phase1', 'phase2', 'phase3']) {
+          roots[role].children.forEach(mesh => {
+            if (mesh.isLineSegments || mesh.isPoints) {
+              mesh.visible = visiblePrimitive(mesh);
+              mesh.material.opacity = 1;
+              mesh.material.transparent = false;
+              mesh.material.depthTest = false;
+              mesh.material.depthWrite = false;
+              mesh.renderOrder = mesh.isPoints ? 51 : 50;
+              return;
+            }
+            mesh.material.colorWrite = false;
+            mesh.material.transparent = false;
+            mesh.material.opacity = 1;
+            mesh.material.depthTest = true;
+            mesh.material.depthWrite = true;
+          });
+        }
+      }
+      renderDirty = true;
     }
 
     function setLoading(message) {
@@ -727,7 +1386,9 @@
     }
 
     function visiblePrimitive(mesh) {
-      const typeAllowed = !mesh.userData.primitiveType || enabledTypes.has(mesh.userData.primitiveType);
+      const typeAllowed = !mesh.userData.primitiveType ||
+        mesh.userData.primitiveType === 'component' ||
+        enabledTypes.has(mesh.userData.primitiveType);
       if (mesh.userData.selectionOverlay)
         return typeAllowed && selectedPrimitive !== 'all' &&
           mesh.userData.primitiveId === Number(selectedPrimitive);
@@ -738,16 +1399,29 @@
     }
 
     function updateVisibility() {
+      const comparisonRoot = roots.phase4.children.length ? roots.phase4
+        : roots.phase3.children.length ? roots.phase3
+        : roots.phase2.children.length ? roots.phase2
+        : roots.phase1.children.length ? roots.phase1 : roots.phase0;
       roots.source.visible = mode === 'source' || mode === 'split';
-      roots.phase1.visible = mode === 'phase1' || mode === 'error';
-      roots.phase2.visible = mode === 'phase2';
-      roots.phase3.visible = mode === 'phase3';
-      roots.phase4.visible = mode === 'phase4' || mode === 'split' || mode === 'error';
+      roots.phase0.visible = mode === 'phase0' ||
+        (mode === 'split' && comparisonRoot === roots.phase0);
+      const concavityDiagnostic = Boolean(metadata?.stats?.phase2_concavity);
+      roots.phase1.visible = mode === 'phase1' || mode === 'error' ||
+        (concavityDiagnostic && mode === 'phase3') ||
+        (mode === 'split' && comparisonRoot === roots.phase1);
+      roots.phase2.visible = mode === 'phase2' ||
+        (mode === 'split' && comparisonRoot === roots.phase2);
+      roots.phase3.visible = mode === 'phase3' ||
+        (mode === 'split' && comparisonRoot === roots.phase3);
+      roots.phase4.visible = (mode === 'phase4' || mode === 'split' || mode === 'error') &&
+        comparisonRoot === roots.phase4;
       roots.error.visible = mode === 'error';
       roots.phase2.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
       roots.phase3.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
       roots.phase4.children.forEach(mesh => { mesh.visible = visiblePrimitive(mesh); });
       roots.source.position.set(0, 0, 0);
+      roots.phase0.position.set(0, 0, 0);
       roots.phase1.position.set(0, 0, 0);
       roots.phase2.position.set(0, 0, 0);
       roots.phase3.position.set(0, 0, 0);
@@ -762,8 +1436,9 @@
         const gap = Math.max(size.x, size.y, size.z) * 0.18;
         const shift = 0.5 * (size[axis] + gap);
         roots.source.position[axis] = -shift;
-        roots.phase4.position[axis] = shift;
+        comparisonRoot.position[axis] = shift;
       }
+      renderDirty = true;
     }
 
     function fitView() {
@@ -772,15 +1447,34 @@
       for (const root of Object.values(roots)) if (root.visible) box.expandByObject(root);
       if (box.isEmpty()) return;
       const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-      const radius = Math.max(size.length() * 0.5, 1e-6);
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const radius = Math.max(sphere.radius, 1e-6);
+      const topbarBox = document.querySelector('#topbar').getBoundingClientRect();
+      const panelBox = document.querySelector('#panel').getBoundingClientRect();
+      const safe = { left: 12, top: topbarBox.bottom + 12, right: innerWidth - 12, bottom: innerHeight - 12 };
+      if (panelBox.width > innerWidth * 0.7) safe.bottom = panelBox.top - 12;
+      else safe.right = panelBox.left - 12;
+      const safeWidth = Math.max(safe.right - safe.left, 80);
+      const safeHeight = Math.max(safe.bottom - safe.top, 80);
+      const safeCenterX = safe.left + safeWidth * 0.5;
+      const safeCenterY = safe.top + safeHeight * 0.5;
       const direction = new THREE.Vector3(1.25, -1.55, 1.05).normalize();
-      const distance = radius / Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 1.22;
-      camera.position.copy(center).addScaledVector(direction, distance);
+      const tangentHalfVertical = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+      const tangentHalfSafe = tangentHalfVertical *
+        Math.min(safeWidth, safeHeight) / innerHeight;
+      const safeHalfAngle = Math.atan(Math.max(tangentHalfSafe, 1e-6));
+      const distance = radius / Math.sin(safeHalfAngle) * 1.12;
+      const worldPerPixel = 2 * distance * tangentHalfVertical / innerHeight;
+      const screenRight = new THREE.Vector3().crossVectors(camera.up, direction).normalize();
+      const screenUp = new THREE.Vector3().crossVectors(direction, screenRight).normalize();
+      const viewOffset = screenRight.multiplyScalar((innerWidth * 0.5 - safeCenterX) * worldPerPixel)
+        .addScaledVector(screenUp, (safeCenterY - innerHeight * 0.5) * worldPerPixel);
+      const viewCenter = center.clone().add(viewOffset);
+      camera.position.copy(viewCenter).addScaledVector(direction, distance);
       camera.near = Math.max(distance / 10000, 1e-6);
       camera.far = Math.max(distance * 100, 1000);
       camera.updateProjectionMatrix();
-      controls.target.copy(center);
+      controls.target.copy(viewCenter);
       controls.update();
       fitPending = false;
     }
@@ -792,6 +1486,57 @@
       dd.textContent = value;
       if (className) dd.className = className;
       target.append(dt, dd);
+    }
+
+    function phase2RoundRecord(index = currentPhase2Round) {
+      if (!Number.isInteger(index) || index < 0 || index >= phase2RoundRecords.length)
+        return null;
+      return phase2RoundRecords[index];
+    }
+
+    function updatePhase2RoundUi() {
+      const section = document.querySelector('#phase2RoundSection');
+      const stats = document.querySelector('#phase2RoundStats');
+      section.hidden = phase2RoundRecords.length === 0;
+      stats.replaceChildren();
+      if (!phase2RoundRecords.length) return;
+      const record = phase2RoundRecord();
+      statRow('当前轮次', record ? `${currentPhase2Round} / ${phase2RoundRecords.length - 1}` : '-', '', stats);
+      statRow('累计移动点', record ? Number(record.cumulative_moved_vertices).toLocaleString() : '-', '', stats);
+      statRow('共面合并评分', record ? Number(record.scored_coplanar_triangles).toLocaleString() : '-', '', stats);
+      statRow('是否选中', record?.selected ? '是' : '否', record?.selected ? 'valid' : '', stats);
+      document.querySelector('#previousPhase2RoundButton').disabled =
+        !Number.isInteger(currentPhase2Round) || currentPhase2Round <= 0;
+      document.querySelector('#nextPhase2RoundButton').disabled =
+        !Number.isInteger(currentPhase2Round) ||
+        currentPhase2Round + 1 >= phase2RoundRecords.length;
+    }
+
+    async function setPhase2Round(index) {
+      if (!Number.isInteger(index) || index < 0 || index >= phase2RoundRecords.length)
+        return;
+      const record = phase2RoundRecords[index];
+      if (!record?.halfedge || !currentMetadataUrl) return;
+      setLoading(`正在加载阶段 2 第 ${index} 轮...`);
+      try {
+        const key = `${currentMetadataUrl.href}#phase2_round_${index}`;
+        let buffer = phase2RoundCache.get(key);
+        if (!buffer) {
+          buffer = await fetchArrayBuffer(new URL(record.halfedge, currentMetadataUrl));
+          phase2RoundCache.set(key, buffer);
+        }
+        disposeRoot(roots.phase2);
+        addMeshes(roots.phase2, parseHalfedge(buffer, 'phase2'));
+        currentPhase2Round = index;
+        params.set('round', String(index));
+        params.set('stage', 'phase2');
+        history.replaceState(null, '', `${location.pathname}?${params}`);
+        setMode('phase2');
+        updatePhase2RoundUi();
+        applyMaterialControls();
+      } finally {
+        loading.classList.add('hidden');
+      }
     }
 
     function secondsValue(value) {
@@ -824,6 +1569,11 @@
       statRow('类型', primitiveTypeNames[record.type] || record.type, '', primitiveStatsElement);
       if (record.type === 'polygon') statRow('边界顶点', Number(record.vertex_count).toLocaleString(), '', primitiveStatsElement);
       statRow('三角化面数', Number(record.triangulated_face_count).toLocaleString(), '', primitiveStatsElement);
+      if (record.type === 'component') {
+        statRow('面积', scalarValue(record.area), '', primitiveStatsElement);
+        statRow('面积占比', percentValue(record.area_fraction), '', primitiveStatsElement);
+        statRow('未配对半边', Number(record.boundary_halfedges).toLocaleString(), '', primitiveStatsElement);
+      }
     }
 
     function updateMetadata() {
@@ -833,6 +1583,11 @@
       statRow('图元数', Number(s.primitive_count).toLocaleString());
       if (Number.isFinite(Number(s.proxy_triangles)))
         statRow('三角化后三角形数', Number(s.proxy_triangles).toLocaleString());
+      if (s.topology_fill?.representation) {
+        statRow('阶段 1 表示', '冻结 halfedge');
+        statRow('占据体素', Number(s.topology_fill.output_voxels).toLocaleString());
+        statRow('边界体素', Number(s.topology_fill.boundary_voxels).toLocaleString());
+      }
       statRow('耗时', secondsValue(s.timings_seconds?.total));
       const containment = s.containment_validation;
       if (containment) statRow('严格包围验证', containment.passed ? '通过' : '失败',
@@ -841,11 +1596,39 @@
       if (error) {
         statRow('最大误差上限', scalarValue(error.maximum_distance_limit));
         statRow('平均误差', scalarValue(error.mean_distance));
-        statRow('最大误差', scalarValue(error.maximum_distance));
+        statRow(error.maximum_is_certified_upper_bound ? '认证误差上界' : '最大误差',
+          scalarValue(error.maximum_distance));
+        if (Number.isFinite(Number(error.observed_lower_bound)))
+          statRow('最大观测误差', scalarValue(error.observed_lower_bound));
         statRow('误差统计耗时', secondsValue(error.seconds));
       }
+      updatePhase2RoundUi();
       document.querySelector('#errorSection').hidden = !error;
-      document.querySelector('[data-mode="error"]').disabled = !error;
+      const declaredStages = new Set(metadata.viewer_stages || [
+        'source', 'phase0', 'phase1', 'phase2', 'phase3', 'phase4', 'split',
+      ]);
+      document.querySelector('[data-mode="phase0"]').textContent = '阶段 0：原始 OBJ 开放洞覆盖';
+      document.querySelector('[data-mode="phase1"]').textContent = '阶段 1：填洞结果';
+      document.querySelector('[data-mode="phase2"]').textContent = '阶段 2：保守外扩';
+      for (const stage of ['source', 'phase0', 'phase1', 'phase2', 'phase3', 'phase4', 'split']) {
+        const button = document.querySelector(`[data-mode="${stage}"]`);
+        button.hidden = !declaredStages.has(stage);
+        button.disabled = !declaredStages.has(stage);
+      }
+      document.querySelector('#comparisonLabel').textContent = declaredStages.has('phase4')
+        ? '阶段 4：三角化结果'
+        : declaredStages.has('phase3')
+          ? '阶段 3：面数最小化结果'
+          : declaredStages.has('phase2')
+            ? '阶段 2：保守外扩结果'
+            : declaredStages.has('phase1')
+              ? '阶段 1：填洞结果'
+              : '阶段 0：原始 OBJ 开放洞覆盖';
+      document.querySelector('#sourceComparisonLabel').textContent =
+        metadata.comparison_source_label || '原模型';
+      const errorButton = document.querySelector('[data-mode="error"]');
+      errorButton.hidden = !error || !declaredStages.has('error');
+      errorButton.disabled = errorButton.hidden;
       document.querySelector('#focusErrorButton').disabled =
         !error || !(Number(error.maximum_distance) > 0);
       if (error && Number.isFinite(Number(error.maximum_distance_limit))) {
@@ -871,7 +1654,12 @@
 
     async function loadModel(modelId, options = {}) {
       const generation = ++loadGeneration;
+      window.__viewerLoadStage = 'metadata';
       resetPrimitiveSelection();
+      clearHalfedgeInspection();
+      halfedgeInspection = null;
+      halfedgeInspections.phase1 = null;
+      halfedgeInspections.phase2 = null;
       setLoading(`正在加载模型 ${modelId}...`);
       const requestedModel = manifest.models.find(
         model => Number(model.id) === Number(modelId));
@@ -879,33 +1667,103 @@
       const metadataUrl = new URL(
         options.metadata || requestedModel.metadata, manifestUrl);
       const loadedMetadata = await fetchJson(metadataUrl);
-      const [sourceText, phase1Text, phase2Text, phase3Text, phase4Text, errorData] = await Promise.all([
+      window.__viewerLoadStage = 'assets';
+      const declaredStages = new Set(loadedMetadata.viewer_stages || [
+        'source', 'phase0', 'phase1', 'phase2', 'phase3', 'phase4', 'split',
+      ]);
+      const hasPhase1 = declaredStages.has('phase1');
+      const halfedgePhase1 = hasPhase1 && Boolean(loadedMetadata.phase1_halfedge);
+      const halfedgePhase2 = declaredStages.has('phase2') &&
+        Boolean(loadedMetadata.phase2_halfedge);
+      if (hasPhase1 && !halfedgePhase1) {
+        throw new Error('阶段 1 缺少正式 phase1_halfedge.bin');
+      }
+      const diagnosticHalfedge = Boolean(loadedMetadata.diagnostic_halfedge);
+      const [sourceText, phase0Text, phase1Data, phase2Data, phase3Text, phase4Text, errorData] = await Promise.all([
         fetchText(new URL(loadedMetadata.source, metadataUrl)),
-        fetchText(new URL(
-          loadedMetadata.phase1_hole_filled || loadedMetadata.source, metadataUrl)),
-        fetchText(new URL(
-          loadedMetadata.phase2_recognized_surfaces ||
-            loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
-        fetchText(new URL(
-          loadedMetadata.phase3_simplified_surfaces ||
-            loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl)),
-        fetchText(new URL(
-          loadedMetadata.phase4_triangulated ||
-            loadedMetadata.triangulated_proxy || loadedMetadata.proxy, metadataUrl)),
-        loadedMetadata.open_error_visualization
+        declaredStages.has('phase0')
+          ? fetchText(new URL(
+              loadedMetadata.phase0_combined ||
+                loadedMetadata.phase0_caps || loadedMetadata.phase0,
+              metadataUrl))
+          : Promise.resolve(null),
+        halfedgePhase1
+          ? fetchArrayBuffer(new URL(loadedMetadata.phase1_halfedge, metadataUrl))
+          : Promise.resolve(null),
+        declaredStages.has('phase2')
+          ? halfedgePhase2
+            ? fetchArrayBuffer(new URL(loadedMetadata.phase2_halfedge, metadataUrl))
+            : fetchText(new URL(
+                loadedMetadata.phase2_recognized_surfaces ||
+                  loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl))
+          : Promise.resolve(null),
+        declaredStages.has('phase3')
+          ? diagnosticHalfedge
+            ? fetchArrayBuffer(new URL(loadedMetadata.diagnostic_halfedge, metadataUrl))
+            : fetchText(new URL(
+              loadedMetadata.phase3_simplified_surfaces ||
+                loadedMetadata.primitive_analysis || loadedMetadata.proxy, metadataUrl))
+          : Promise.resolve(null),
+        declaredStages.has('phase4')
+          ? fetchText(new URL(
+              loadedMetadata.phase4_triangulated ||
+                loadedMetadata.triangulated_proxy || loadedMetadata.proxy, metadataUrl))
+          : Promise.resolve(null),
+        loadedMetadata.open_error_visualization && declaredStages.has('error')
           ? fetchJson(new URL(loadedMetadata.open_error_visualization, metadataUrl))
           : Promise.resolve(null),
       ]);
+      window.__viewerLoadStage = 'parse-source';
       if (generation !== loadGeneration) return;
       currentModel = requestedModel;
       metadata = loadedMetadata;
+      currentMetadataUrl = metadataUrl;
+      phase2RoundCache = new Map();
+      phase2RoundRecords = Array.isArray(loadedMetadata.stats?.phase2?.rounds)
+        ? loadedMetadata.stats.phase2.rounds
+        : [];
+      currentPhase2Round = phase2RoundRecords.length
+        ? Number(loadedMetadata.stats?.phase2?.selected_round ?? 0)
+        : null;
       Object.values(roots).forEach(disposeRoot);
       addMeshes(roots.source, parseOBJ(sourceText, 'source'));
-      addMeshes(roots.phase1, parseOBJ(phase1Text, 'phase1'));
-      addMeshes(roots.phase2, parseOBJ(phase2Text, 'phase2'));
-      addMeshes(roots.phase3, parseOBJ(phase3Text, 'phase3'));
-      addMeshes(roots.phase4, parseOBJ(phase4Text, 'phase4'));
+      if (phase0Text) addMeshes(roots.phase0, parseOBJ(phase0Text, 'phase0'));
+      window.__viewerLoadStage = 'parse-diagnostic';
+      if (halfedgePhase1) addMeshes(roots.phase1, parseHalfedge(phase1Data, 'phase1'));
+      if (phase2Data) addMeshes(roots.phase2, halfedgePhase2
+        ? parseHalfedge(phase2Data, 'phase2')
+        : parseOBJ(phase2Data, 'phase2'));
+      if (phase3Text) addMeshes(roots.phase3, diagnosticHalfedge
+        ? parseHalfedge(phase3Text, 'phase3', true)
+        : parseOBJ(phase3Text, 'phase3'));
+      if (phase4Text) addMeshes(roots.phase4, parseOBJ(phase4Text, 'phase4'));
+      window.__viewerLoadStage = 'fit';
       addOpenErrorVisualization(errorData);
+      const requestedInspection = params.get('inspect') === 'phase2' &&
+        halfedgeInspections.phase2 ? 'phase2' : halfedgeInspections.phase1
+          ? 'phase1' : halfedgeInspections.phase2 ? 'phase2' : 'phase1';
+      setInspectionRole(requestedInspection, false);
+      const requestedMode = params.get('stage');
+      if (['source', 'phase0', 'phase1', 'phase2', 'phase3', 'phase4', 'split', 'error'].includes(requestedMode))
+        setMode(requestedMode);
+      const requestedRound = Number(params.get('round'));
+      if (phase2RoundRecords.length && Number.isInteger(requestedRound) &&
+          requestedRound >= 0 && requestedRound < phase2RoundRecords.length) {
+        await setPhase2Round(requestedRound);
+      }
+      document.querySelector('#inspectionStage').querySelector(
+        'option[value="phase1"]').disabled = !halfedgeInspections.phase1;
+      document.querySelector('#inspectionStage').querySelector(
+        'option[value="phase2"]').disabled = !halfedgeInspections.phase2;
+      const requestedHalfedge = Number(params.get('halfedge'));
+      const requestedFace = Number(params.get('face'));
+      if (params.has('halfedge') && Number.isInteger(requestedHalfedge)) {
+        setMode(inspectionRole);
+        highlightHalfedge(requestedHalfedge);
+      } else if (params.has('face') && Number.isInteger(requestedFace)) {
+        setMode(inspectionRole);
+        highlightFace(requestedFace);
+      }
       modelSelect.value = String(modelId);
       params.set('model', modelId);
       history.replaceState(null, '', `${location.pathname}?${params}`);
@@ -916,6 +1774,7 @@
         fitView();
       }
       loading.classList.add('hidden');
+      window.__viewerLoadStage = 'complete';
       updateNavigation();
     }
 
@@ -936,10 +1795,42 @@
     }
 
     function setMode(nextMode) {
+      clearHalfedgeInspection();
       mode = nextMode;
       document.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
       updateVisibility();
       applyMaterialControls();
+    }
+
+    function faceHalfedgeCycle(faceId) {
+      const data = halfedgeInspection;
+      if (!data || !Number.isInteger(faceId) || faceId < 0 || faceId >= data.faceCount)
+        return [];
+      const first = data.faceHalfedges[faceId];
+      if (!Number.isInteger(first) || first < 0 || first >= data.halfedgeCount) return [];
+      const second = data.halfedges[first * 4 + 2];
+      const third = data.halfedges[second * 4 + 2];
+      return [first, second, third];
+    }
+
+    function adjacentFaceHalfedge(offset) {
+      const data = halfedgeInspection;
+      if (!data) return;
+      const faceId = Number(document.querySelector('#faceInput').value);
+      if (!Number.isInteger(faceId) || faceId < 0 || faceId >= data.faceCount) {
+        inspectionRow('错误', `face ID 必须在 0..${Math.max(0, data.faceCount - 1)}`);
+        return;
+      }
+      const cycle = faceHalfedgeCycle(faceId);
+      if (cycle.length !== 3) {
+        inspectionRow('错误', '当前面没有可遍历的 halfedge');
+        return;
+      }
+      const currentHalfedge = Number(document.querySelector('#halfedgeInput').value);
+      const currentIndex = Number.isInteger(currentHalfedge) ? cycle.indexOf(currentHalfedge) : -1;
+      const next = cycle[(Math.max(0, currentIndex) + offset + 3) % 3];
+      setMode(inspectionRole);
+      highlightHalfedge(next);
     }
 
     async function regenerateWithMaximumError() {
@@ -1015,6 +1906,78 @@
       primitiveSelect.selectedIndex = nextIndex;
       setPrimitiveSelection(primitiveSelect.value);
     });
+    document.querySelector('#inspectHalfedgeButton').addEventListener('click', () => {
+      setMode(inspectionRole);
+      highlightHalfedge(Number(document.querySelector('#halfedgeInput').value));
+    });
+    document.querySelector('#inspectOppositeButton').addEventListener('click', () => {
+      const data = halfedgeInspection;
+      const current = Number(document.querySelector('#halfedgeInput').value);
+      if (!data || !Number.isInteger(current) || current < 0 || current >= data.halfedgeCount) {
+        highlightHalfedge(current);
+        return;
+      }
+      const opposite = data.halfedges[current * 4 + 3];
+      if (opposite === 0xffffffff) {
+        highlightHalfedge(current);
+        inspectionRow('opposite', 'INVALID (unpaired)');
+        return;
+      }
+      setMode(inspectionRole);
+      highlightHalfedge(opposite);
+    });
+    document.querySelector('#inspectionStage').addEventListener('change', event => {
+      setInspectionRole(event.target.value);
+    });
+    document.querySelector('#previousFaceButton').addEventListener('click', () => {
+      if (!halfedgeInspection) return;
+      const current = Number(document.querySelector('#faceInput').value) || 0;
+      setMode(inspectionRole);
+      highlightFace((current - 1 + halfedgeInspection.faceCount) % halfedgeInspection.faceCount);
+    });
+    document.querySelector('#nextFaceButton').addEventListener('click', () => {
+      if (!halfedgeInspection) return;
+      const current = Number(document.querySelector('#faceInput').value) || 0;
+      setMode(inspectionRole);
+      highlightFace((current + 1) % halfedgeInspection.faceCount);
+    });
+    document.querySelector('#previousHalfedgeButton').addEventListener('click', () => {
+      const faceId = Number(document.querySelector('#faceInput').value);
+      if (halfedgeInspection && Number.isInteger(faceId) &&
+          faceId >= 0 && faceId < halfedgeInspection.faceCount) {
+        adjacentFaceHalfedge(-1);
+        return;
+      }
+      setMode(inspectionRole);
+      adjacentInspectableHalfedge(-1);
+    });
+    document.querySelector('#nextHalfedgeButton').addEventListener('click', () => {
+      const faceId = Number(document.querySelector('#faceInput').value);
+      if (halfedgeInspection && Number.isInteger(faceId) &&
+          faceId >= 0 && faceId < halfedgeInspection.faceCount) {
+        adjacentFaceHalfedge(1);
+        return;
+      }
+      setMode(inspectionRole);
+      adjacentInspectableHalfedge(1);
+    });
+    for (const id of ['halfedgeInput', 'faceInput'])
+      document.querySelector(`#${id}`).addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        setMode(inspectionRole);
+        if (id === 'halfedgeInput') highlightHalfedge(Number(event.target.value));
+        else highlightFace(Number(event.target.value));
+      });
+    renderer.domElement.addEventListener('click', event => {
+      const inspectionRoot = roots[inspectionRole];
+      if (!event.shiftKey || !inspectionRoot?.visible || !halfedgeInspection) return;
+      const bounds = renderer.domElement.getBoundingClientRect();
+      pointer.x = 2 * (event.clientX - bounds.left) / bounds.width - 1;
+      pointer.y = 1 - 2 * (event.clientY - bounds.top) / bounds.height;
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(inspectionRoot.children, false)[0];
+      if (hit && Number.isInteger(hit.faceIndex)) highlightFace(hit.faceIndex);
+    });
     document.querySelectorAll('[data-type]').forEach(input => input.addEventListener('change', () => {
       if (input.checked) enabledTypes.add(input.dataset.type); else enabledTypes.delete(input.dataset.type);
       updateVisibility();
@@ -1029,6 +1992,12 @@
       applyMaterialControls();
     });
     document.querySelector('#wireframe').addEventListener('change', applyMaterialControls);
+    document.querySelector('#previousPhase2RoundButton').addEventListener('click', () => {
+      if (Number.isInteger(currentPhase2Round)) setPhase2Round(currentPhase2Round - 1);
+    });
+    document.querySelector('#nextPhase2RoundButton').addEventListener('click', () => {
+      if (Number.isInteger(currentPhase2Round)) setPhase2Round(currentPhase2Round + 1);
+    });
 
     renderer.domElement.addEventListener('dblclick', event => {
       const selectableRoot = roots.phase3.visible ? roots.phase3 : roots.phase4;
@@ -1053,11 +2022,19 @@
       camera.aspect = innerWidth / innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(innerWidth, innerHeight);
+      const errorLine = roots.error.children.find(
+        object => object.name === 'maximum_error_segment');
+      errorLine?.material?.uniforms?.resolution?.value.set(
+        renderer.domElement.width, renderer.domElement.height);
+      renderDirty = true;
     });
 
     function animate() {
-      controls.update();
-      renderer.render(scene, camera);
+      const controlsChanged = controls.update();
+      if (renderDirty || controlsChanged) {
+        renderer.render(scene, camera);
+        renderDirty = false;
+      }
       requestAnimationFrame(animate);
     }
     animate();
@@ -1067,6 +2044,7 @@
       mode,
       sourceMeshes: roots.source.children.length,
       phase1Meshes: roots.phase1.children.length,
+      phase1Representation: roots.phase1.children.length ? 'halfedge' : null,
       phase2Meshes: roots.phase2.children.length,
       primitiveMeshes: roots.phase3.children.length,
       triangulatedMeshes: roots.phase4.children.length,
@@ -1085,6 +2063,21 @@
       regenerateStatus: regenerateStatus.textContent,
       maximumErrorSegmentCount: roots.error.children.filter(
         object => object.name === 'maximum_error_segment').length,
+      maximumErrorLinePixels: roots.error.children.find(
+        object => object.name === 'maximum_error_segment')?.material?.uniforms
+          ?.lineWidthPixels?.value ?? null,
+      maximumErrorOverlayDepthTest: roots.error.children
+        .filter(object => object.name === 'maximum_error_segment' ||
+          object.name === 'maximum_proxy_point' || object.name === 'maximum_source_point')
+        .every(object => object.material.depthTest === false &&
+          object.material.depthWrite === false),
+      maximumErrorOverlayOrder: Math.min(...roots.error.children
+        .filter(object => object.name === 'maximum_error_segment' ||
+          object.name === 'maximum_proxy_point' || object.name === 'maximum_source_point')
+        .map(object => object.renderOrder)),
+      maximumErrorEndpointCount: roots.error.children.filter(
+        object => object.name === 'maximum_proxy_point' ||
+          object.name === 'maximum_source_point').length,
       errorBoundaryVisible: roots.error.children.find(
         object => object.name === 'open_error_boundary')?.visible ?? false,
       primitiveCount: metadata?.stats?.primitive_count || 0,
@@ -1117,6 +2110,14 @@
           mesh.userData.primitiveId !== Number(selectedPrimitive))
         .every(mesh => Math.abs(mesh.material.opacity - 0.15) < 1e-8),
       primitiveWireframe: roots.phase3.children[0]?.material.wireframe ?? null,
+      phase1Wireframe: roots.phase1.children[0]?.material.wireframe ?? null,
+      phase1WireframeDepthOccluder: roots.phase1.children[0]
+        ? roots.phase1.children[0].material.colorWrite === false &&
+          roots.phase1.children[0].material.depthTest === true &&
+          roots.phase1.children[0].material.depthWrite === true
+        : null,
+      phase1OccludedWireframeVisible: roots.phase1.children[0]?.children
+        .some(child => child.userData.occludedWireframe && child.visible) ?? null,
       manifestModelCount: manifest?.models?.length || 0,
       manifestComplete: manifest?.complete ?? null,
       loading: !loading.classList.contains('hidden'),

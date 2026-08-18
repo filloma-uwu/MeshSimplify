@@ -48,8 +48,10 @@ let browser;
     await page.click('#fitButton');
 
     let state = await page.evaluate(() => window.__primitiveViewerDiagnostics());
+    const expectsOpaqueBase = !['error', 'split'].includes(requestedMode);
     if (state.primitiveOptionCount !== state.primitiveCount ||
-        state.selectedPrimitive !== 'all' || !state.allBaseMaterialsOpaque) {
+        state.selectedPrimitive !== 'all' ||
+        (expectsOpaqueBase && !state.allBaseMaterialsOpaque)) {
       throw new Error(`initial state failed for model ${modelId}: ${JSON.stringify(state)}`);
     }
     const pixels = await page.evaluate(() => window.__primitiveViewerPixelSample());
@@ -66,12 +68,13 @@ let browser;
       throw new Error(`primitive ${last} is not selectable for model ${modelId}`);
     }
     await page.selectOption('#primitiveSelect', 'all');
-    await page.waitForFunction(() => {
+    await page.waitForFunction(expectOpaque => {
       const current = window.__primitiveViewerDiagnostics?.();
-      return current?.selectedPrimitive === 'all' && current.allBaseMaterialsOpaque;
-    });
+      return current?.selectedPrimitive === 'all' &&
+        (!expectOpaque || current.allBaseMaterialsOpaque);
+    }, expectsOpaqueBase);
     await page.screenshot({
-      path: path.join(outputDir, `model-${modelId}.png`),
+      path: path.join(outputDir, `model-${modelId}-${requestedMode}.png`),
       fullPage: true,
     });
     records.push({ modelId, primitiveCount: state.primitiveCount, pixels });

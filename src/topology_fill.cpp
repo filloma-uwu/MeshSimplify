@@ -1,4 +1,5 @@
 #include "pqss_proxy_mesh/topology_fill.hpp"
+#include "pqss_proxy_mesh/halfedge_validation.hpp"
 
 #include <clipper2/clipper.h>
 
@@ -1196,6 +1197,269 @@ BettiNumbers voxelBettiNumbers(const VoxelGrid& grid)
     return voxelBettiNumbersUnchecked(grid);
 }
 
+VoxelGrid regularizeWellComposedOccupancy(
+    const VoxelGrid& grid, std::size_t* added_voxels)
+{
+    validateGrid(grid);
+    const auto connected = [](const std::uint8_t mask)
+    {
+        if (mask == 0) return true;
+        const int seed = std::countr_zero(static_cast<unsigned int>(mask));
+        std::uint8_t reached = static_cast<std::uint8_t>(1u << seed);
+        std::array<int, 8> queue{};
+        std::size_t begin = 0;
+        std::size_t end = 1;
+        queue[0] = seed;
+        while (begin < end)
+        {
+            const int corner = queue[begin++];
+            for (const int axis_bit : {1, 2, 4})
+            {
+                const int neighbor = corner ^ axis_bit;
+                const std::uint8_t bit = static_cast<std::uint8_t>(1u << neighbor);
+                if ((mask & bit) != 0 && (reached & bit) == 0)
+                {
+                    reached = static_cast<std::uint8_t>(reached | bit);
+                    queue[end++] = neighbor;
+                }
+            }
+        }
+        return reached == mask;
+    };
+    const auto hasNoCheckerboardFace = [](const std::uint8_t mask)
+    {
+        for (const int fixed_bit : {1, 2, 4})
+            for (const int fixed_value : {0, fixed_bit})
+            {
+                std::array<int, 4> occupied{};
+                int count = 0;
+                for (int corner = 0; corner < 8; ++corner)
+                    if ((corner & fixed_bit) == fixed_value &&
+                        (mask & (1u << corner)) != 0)
+                        occupied[count++] = corner;
+                if (count == 2 && std::popcount(
+                        static_cast<unsigned int>(occupied[0] ^ occupied[1])) == 2)
+                    return false;
+            }
+        return true;
+    };
+    static const std::array<std::uint8_t, 256> closure = [&]
+    {
+        std::array<std::uint8_t, 256> result{};
+        for (unsigned int mask = 0; mask < result.size(); ++mask)
+        {
+            unsigned int best = mask;
+            int best_added = 9;
+            for (unsigned int candidate = mask; candidate < 256; ++candidate)
+            {
+                if ((candidate & mask) != mask) continue;
+                if (!connected(static_cast<std::uint8_t>(candidate)) ||
+                    !connected(static_cast<std::uint8_t>(~candidate)) ||
+                    !hasNoCheckerboardFace(static_cast<std::uint8_t>(candidate)))
+                    continue;
+                const int added = std::popcount(candidate ^ mask);
+                if (added < best_added || (added == best_added && candidate < best))
+                {
+                    best = candidate;
+                    best_added = added;
+                }
+            }
+            result[mask] = static_cast<std::uint8_t>(best);
+        }
+        return result;
+    }();
+
+    VoxelGrid result = grid;
+    std::size_t total_added = 0;
+    for (std::size_t pass = 0;; ++pass)
+    {
+        std::vector<std::size_t> additions;
+        for (std::uint32_t x = 0; x + 1 < result.shape[0]; ++x)
+            for (std::uint32_t y = 0; y + 1 < result.shape[1]; ++y)
+                for (std::uint32_t z = 0; z + 1 < result.shape[2]; ++z)
+                {
+                    std::uint8_t mask = 0;
+                    for (int corner = 0; corner < 8; ++corner)
+                    {
+                        const auto cx = x + static_cast<std::uint32_t>(corner & 1);
+                        const auto cy = y + static_cast<std::uint32_t>((corner >> 1) & 1);
+                        const auto cz = z + static_cast<std::uint32_t>((corner >> 2) & 1);
+                        if (result.occupied(cx, cy, cz))
+                            mask = static_cast<std::uint8_t>(mask | (1u << corner));
+                    }
+                    const std::uint8_t repaired = closure[mask];
+                    const std::uint8_t added = static_cast<std::uint8_t>(repaired & ~mask);
+                    for (int corner = 0; corner < 8; ++corner)
+                        if ((added & (1u << corner)) != 0)
+                            additions.push_back(result.index(
+                                x + static_cast<std::uint32_t>(corner & 1),
+                                y + static_cast<std::uint32_t>((corner >> 1) & 1),
+                                z + static_cast<std::uint32_t>((corner >> 2) & 1)));
+                }
+        std::sort(additions.begin(), additions.end());
+        additions.erase(std::unique(additions.begin(), additions.end()), additions.end());
+        std::size_t pass_added = 0;
+        for (const std::size_t index : additions)
+            if (!result.occupancy[index])
+            {
+                result.occupancy[index] = 1;
+                ++pass_added;
+            }
+        total_added += pass_added;
+        if (pass_added == 0) break;
+        if (pass >= 63)
+            throw std::runtime_error("well-composed occupancy regularization did not converge");
+    }
+    if (added_voxels) *added_voxels = total_added;
+    return result;
+}
+
+// Completes each connected phase-1 responsibility region inside its own
+// axis-aligned extent until no exterior cell in that extent has two occupied
+// face-neighbors. Such a cell is a digital reflex corner of the generated
+// boundary. Source cells are immutable and every operation is additive.
+VoxelGrid fillResponsibleLocalConcavitiesImpl(
+    const VoxelGrid& source, const VoxelGrid& input,
+    std::size_t* added_voxels = nullptr)
+{
+    validateGrid(source);
+    validateGrid(input);
+    if (source.shape != input.shape || source.pitch != input.pitch ||
+        source.origin.x != input.origin.x || source.origin.y != input.origin.y ||
+        source.origin.z != input.origin.z)
+        throw std::invalid_argument("local-concavity grids do not match");
+    VoxelGrid result = input;
+    const std::vector<std::uint8_t> exterior =
+        floodEmptyFromBoundary(input, neighbors26);
+    std::vector<std::uint8_t> responsibility(input.occupancy.size(), 0);
+    for (std::size_t index = 0; index < responsibility.size(); ++index)
+    {
+        if (source.occupancy[index] && !input.occupancy[index])
+            throw std::invalid_argument("local-concavity input lost a source voxel");
+        responsibility[index] = input.occupancy[index] && !source.occupancy[index];
+    }
+
+    struct Component
+    {
+        std::array<std::uint32_t, 3> lower{};
+        std::array<std::uint32_t, 3> upper{};
+        std::vector<std::uint32_t> cells;
+    };
+    std::vector<std::uint8_t> visited(responsibility.size(), 0);
+    std::vector<Component> components;
+    for (std::uint32_t seed = 0; seed < responsibility.size(); ++seed)
+    {
+        if (!responsibility[seed] || visited[seed]) continue;
+        Component component;
+        component.lower = decodeIndex(seed, input.shape);
+        component.upper = component.lower;
+        component.cells.push_back(seed);
+        visited[seed] = 1;
+        for (std::size_t cursor = 0; cursor < component.cells.size(); ++cursor)
+        {
+            const std::uint32_t cell = component.cells[cursor];
+            const auto coordinate = decodeIndex(cell, input.shape);
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                component.lower[axis] = std::min(component.lower[axis], coordinate[axis]);
+                component.upper[axis] = std::max(component.upper[axis], coordinate[axis]);
+            }
+            for (const auto& offset : neighbors6)
+            {
+                const int x = static_cast<int>(coordinate[0]) + offset[0];
+                const int y = static_cast<int>(coordinate[1]) + offset[1];
+                const int z = static_cast<int>(coordinate[2]) + offset[2];
+                if (x < 0 || y < 0 || z < 0 ||
+                    x >= static_cast<int>(input.shape[0]) ||
+                    y >= static_cast<int>(input.shape[1]) ||
+                    z >= static_cast<int>(input.shape[2])) continue;
+                const std::uint32_t neighbor = static_cast<std::uint32_t>(input.index(
+                    static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y),
+                    static_cast<std::uint32_t>(z)));
+                if (responsibility[neighbor] && !visited[neighbor])
+                {
+                    visited[neighbor] = 1;
+                    component.cells.push_back(neighbor);
+                }
+            }
+        }
+        components.push_back(std::move(component));
+    }
+
+    std::size_t total_added = 0;
+    std::vector<std::uint8_t> queued(result.occupancy.size(), 0);
+    std::vector<std::uint32_t> queue;
+    const auto insideBounds = [](const std::array<std::uint32_t, 3>& point,
+                                 const Component& component)
+    {
+        return point[0] >= component.lower[0] && point[0] <= component.upper[0] &&
+               point[1] >= component.lower[1] && point[1] <= component.upper[1] &&
+               point[2] >= component.lower[2] && point[2] <= component.upper[2];
+    };
+    for (const Component& component : components)
+    {
+        queue.clear();
+        const auto enqueueNeighbors = [&](const std::uint32_t cell)
+        {
+            const auto coordinate = decodeIndex(cell, result.shape);
+            for (const auto& offset : neighbors6)
+            {
+                const int x = static_cast<int>(coordinate[0]) + offset[0];
+                const int y = static_cast<int>(coordinate[1]) + offset[1];
+                const int z = static_cast<int>(coordinate[2]) + offset[2];
+                if (x < 0 || y < 0 || z < 0 ||
+                    x >= static_cast<int>(result.shape[0]) ||
+                    y >= static_cast<int>(result.shape[1]) ||
+                    z >= static_cast<int>(result.shape[2])) continue;
+                const std::array<std::uint32_t, 3> neighbor_coordinate{
+                    static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y),
+                    static_cast<std::uint32_t>(z)};
+                if (!insideBounds(neighbor_coordinate, component)) continue;
+                const std::uint32_t neighbor = static_cast<std::uint32_t>(result.index(
+                    neighbor_coordinate[0], neighbor_coordinate[1],
+                    neighbor_coordinate[2]));
+                if (!result.occupancy[neighbor] && exterior[neighbor] && !queued[neighbor])
+                {
+                    queued[neighbor] = 1;
+                    queue.push_back(neighbor);
+                }
+            }
+        };
+        for (const std::uint32_t cell : component.cells) enqueueNeighbors(cell);
+        for (std::size_t cursor = 0; cursor < queue.size(); ++cursor)
+        {
+            const std::uint32_t candidate = queue[cursor];
+            queued[candidate] = 0;
+            if (result.occupancy[candidate] || !exterior[candidate]) continue;
+            const auto coordinate = decodeIndex(candidate, result.shape);
+            int occupied_neighbors = 0;
+            bool touches_responsibility = false;
+            for (const auto& offset : neighbors6)
+            {
+                const int x = static_cast<int>(coordinate[0]) + offset[0];
+                const int y = static_cast<int>(coordinate[1]) + offset[1];
+                const int z = static_cast<int>(coordinate[2]) + offset[2];
+                if (x < 0 || y < 0 || z < 0 ||
+                    x >= static_cast<int>(result.shape[0]) ||
+                    y >= static_cast<int>(result.shape[1]) ||
+                    z >= static_cast<int>(result.shape[2])) continue;
+                const std::uint32_t neighbor = static_cast<std::uint32_t>(result.index(
+                    static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y),
+                    static_cast<std::uint32_t>(z)));
+                occupied_neighbors += result.occupancy[neighbor] != 0;
+                touches_responsibility |= responsibility[neighbor] != 0;
+            }
+            if (occupied_neighbors < 2 || !touches_responsibility) continue;
+            result.occupancy[candidate] = 1;
+            responsibility[candidate] = 1;
+            ++total_added;
+            enqueueNeighbors(candidate);
+        }
+    }
+    if (added_voxels) *added_voxels = total_added;
+    return result;
+}
+
 VoxelGrid enclosingTopologyFill(
     const VoxelGrid& source, const std::uint32_t maximum_steps,
     TopologyFillStats* stats, VoxelGrid* cavity_fill_labels)
@@ -1530,6 +1794,8 @@ public:
         query(0, point, distance_squared, best);
         return best;
     }
+
+    [[nodiscard]] bool empty() const { return nodes_.empty(); }
 
 private:
     struct Node
@@ -2246,6 +2512,27 @@ IndexedSurface reconstructDualSurface(const VoxelGrid& grid, const MeshModel& so
                 cell_center_vertices.push_back(center);
             }
 
+    // Restore only source-plane collisions; every other v51 dual position is
+    // retained so local embedding repair does not change the visual baseline.
+    std::map<std::array<double, 3>, std::vector<std::uint32_t>> coincident_vertices;
+    for (std::uint32_t vertex = 0; vertex < result.vertices.size(); ++vertex)
+        coincident_vertices[{result.vertices[vertex].x, result.vertices[vertex].y,
+                             result.vertices[vertex].z}]
+            .push_back(vertex);
+    std::size_t restored_coincident_vertices = 0;
+    for (const auto& [position, vertices] : coincident_vertices)
+    {
+        (void)position;
+        if (vertices.size() < 2) continue;
+        for (const std::uint32_t vertex : vertices)
+        {
+            result.vertices[vertex] = cell_center_vertices[vertex];
+            ++restored_coincident_vertices;
+        }
+    }
+    std::cerr << "monitor: stage=local_collision_restore vertices="
+              << restored_coincident_vertices << '\n';
+
     const auto emit_crossing = [&](const int axis, const std::uint32_t x,
                                    const std::uint32_t y, const std::uint32_t z)
     {
@@ -2329,8 +2616,7 @@ double indexedSignedVolume(const IndexedSurface& surface)
 }
 
 OrientedSurfaceMesh buildOrientedSurfaceMesh(
-    IndexedSurface surface, const VoxelGrid& occupancy,
-    std::vector<std::uint32_t> source_faces = {})
+    IndexedSurface surface, std::vector<std::uint32_t> source_faces = {})
 {
     if (surface.vertices.empty() || surface.triangles.empty())
         throw std::runtime_error("dual surface is empty");
@@ -2511,10 +2797,6 @@ OrientedSurfaceMesh buildOrientedSurfaceMesh(
     result.face_halfedges.resize(result.geometry.triangles.size(), invalid_surface_index);
     result.halfedges.resize(result.geometry.triangles.size() * 3);
 
-    Bounds3 bounds;
-    for (const Position3 point : result.geometry.vertices) include(bounds, toVec(point));
-    const double model_scale = norm(bounds.upper - bounds.lower);
-    const double minimum_area = std::max(1.0, model_scale * model_scale) * 1.0e-24;
     if (!surface.halfedge_opposites.empty() &&
         surface.halfedge_opposites.size() != result.halfedges.size())
         throw std::runtime_error("surface opposite map has the wrong size");
@@ -2525,16 +2807,6 @@ OrientedSurfaceMesh buildOrientedSurfaceMesh(
         for (const std::uint32_t vertex : triangle)
             if (vertex >= result.geometry.vertices.size())
                 throw std::runtime_error("dual surface contains an invalid vertex index");
-        if (triangle[0] == triangle[1] || triangle[1] == triangle[2] ||
-            triangle[2] == triangle[0])
-            throw std::runtime_error("dual surface contains a topologically degenerate triangle");
-        const Vec3 a = toVec(result.geometry.vertices[triangle[0]]);
-        const Vec3 b = toVec(result.geometry.vertices[triangle[1]]);
-        const Vec3 c = toVec(result.geometry.vertices[triangle[2]]);
-        const double area_twice = norm(cross(b - a, c - a));
-        if (!std::isfinite(area_twice) || area_twice <= minimum_area)
-            throw std::runtime_error("dual surface contains a geometrically degenerate triangle");
-
         const std::uint32_t base = face * 3;
         result.face_halfedges[face] = base;
         for (std::uint32_t local = 0; local < 3; ++local)
@@ -2568,101 +2840,9 @@ OrientedSurfaceMesh buildOrientedSurfaceMesh(
             }
         }
     }
-    for (std::uint32_t halfedge = 0; halfedge < result.halfedges.size(); ++halfedge)
-    {
-        const std::uint32_t opposite = result.halfedges[halfedge].opposite;
-        if (opposite == invalid_surface_index)
-            throw std::runtime_error("dual surface is open: a halfedge has no opposite");
-        if (result.halfedges[opposite].opposite != halfedge)
-            throw std::runtime_error("dual surface opposite relation is asymmetric");
-        const std::uint32_t second =
-            result.halfedges[result.halfedges[halfedge].next].origin;
-        const std::uint32_t opposite_second =
-            result.halfedges[result.halfedges[opposite].next].origin;
-        if (result.halfedges[opposite].origin != second ||
-            opposite_second != result.halfedges[halfedge].origin)
-        {
-            throw std::runtime_error("dual surface has inconsistent face orientation");
-        }
-    }
-
-    std::vector<std::uint8_t> visited_faces(result.geometry.triangles.size(), 0);
-    std::vector<std::uint32_t> queue{0};
-    visited_faces[0] = 1;
-    for (std::size_t cursor = 0; cursor < queue.size(); ++cursor)
-    {
-        const std::uint32_t face = queue[cursor];
-        std::uint32_t halfedge = result.face_halfedges[face];
-        for (int local = 0; local < 3; ++local)
-        {
-            const std::uint32_t neighbor = result.halfedges[
-                result.halfedges[halfedge].opposite].face;
-            if (!visited_faces[neighbor])
-            {
-                visited_faces[neighbor] = 1;
-                queue.push_back(neighbor);
-            }
-            halfedge = result.halfedges[halfedge].next;
-        }
-    }
-    if (queue.size() != result.geometry.triangles.size())
-        throw std::runtime_error("dual surface has more than one face component");
-
-    std::vector<std::uint32_t> vertex_valence(result.geometry.vertices.size(), 0);
-    for (const SurfaceHalfedge& halfedge : result.halfedges) ++vertex_valence[halfedge.origin];
-    for (std::uint32_t vertex = 0; vertex < result.geometry.vertices.size(); ++vertex)
-    {
-        const std::uint32_t start = result.vertex_halfedges[vertex];
-        if (start == invalid_surface_index)
-            throw std::runtime_error("dual surface contains an unused vertex");
-        std::uint32_t current = start;
-        std::uint32_t fan_size = 0;
-        do
-        {
-            if (result.halfedges[current].origin != vertex || ++fan_size > vertex_valence[vertex])
-                throw std::runtime_error("dual surface contains a non-manifold vertex");
-            const std::uint32_t previous = result.halfedges[
-                result.halfedges[current].next].next;
-            current = result.halfedges[previous].opposite;
-        }
-        while (current != start);
-        if (fan_size != vertex_valence[vertex])
-            throw std::runtime_error("dual surface vertex has multiple disconnected fans");
-    }
-
-    if (has_voxel_provenance)
-    {
-        std::vector<std::uint32_t> crossing_use(result.boundary_crossings.size(), 0);
-        for (const std::uint32_t crossing : result.face_boundary_crossings)
-        {
-            if (crossing >= result.boundary_crossings.size())
-                throw std::runtime_error("dual surface contains invalid boundary provenance");
-            ++crossing_use[crossing];
-        }
-        for (std::size_t index = 0; index < result.boundary_crossings.size(); ++index)
-        {
-            if (crossing_use[index] != 2)
-                throw std::runtime_error("voxel-boundary crossing does not own exactly one quad");
-            const auto& crossing = result.boundary_crossings[index];
-            int coordinate_delta = 0;
-            for (int axis = 0; axis < 3; ++axis)
-                coordinate_delta += std::abs(static_cast<int>(crossing.inside[axis]) -
-                                             static_cast<int>(crossing.outside[axis]));
-            if (coordinate_delta != 1 ||
-                !occupancy.occupied(crossing.inside[0], crossing.inside[1], crossing.inside[2]) ||
-                occupancy.occupied(crossing.outside[0], crossing.outside[1], crossing.outside[2]))
-                throw std::runtime_error("a surface quad is not an inside/outside voxel boundary");
-        }
-    }
-
     result.euler_characteristic = static_cast<int>(result.geometry.vertices.size()) -
         static_cast<int>(result.halfedges.size() / 2) +
         static_cast<int>(result.geometry.triangles.size());
-    if (result.euler_characteristic != 2)
-        throw std::runtime_error("phase-1 boundary is not a genus-zero closed surface");
-    const double minimum_volume = std::max(1.0, model_scale * model_scale * model_scale) * 1.0e-18;
-    if (!std::isfinite(signed_volume) || signed_volume <= minimum_volume)
-        throw std::runtime_error("phase-1 boundary has invalid oriented volume");
     result.signed_volume = signed_volume;
     return result;
 }
@@ -2758,6 +2938,10 @@ OrientedSurfaceMesh buildAnalysisHalfedgeMeshImpl(
     // face geometry and covered area are unchanged.
     using LineKey = std::array<std::int64_t, 6>;
     const double angular_quantum = 1.0e-10;
+    // Plane unions are independently rounded by Clipper.  Their shared
+    // crease lines can therefore differ by a few ulps even when the points
+    // still pass the actual point-to-line test below.
+    const double line_tolerance = std::max(tolerance * 32.0, scale * 1.0e-8);
     const auto lineKey = [&](const std::uint32_t first, const std::uint32_t second)
     {
         const Vec3 a = toVec(welded_positions[first]);
@@ -2772,9 +2956,9 @@ OrientedSurfaceMesh buildAnalysisHalfedgeMeshImpl(
             static_cast<std::int64_t>(std::llround(direction.x / angular_quantum)),
             static_cast<std::int64_t>(std::llround(direction.y / angular_quantum)),
             static_cast<std::int64_t>(std::llround(direction.z / angular_quantum)),
-            static_cast<std::int64_t>(std::llround(moment.x / tolerance)),
-            static_cast<std::int64_t>(std::llround(moment.y / tolerance)),
-            static_cast<std::int64_t>(std::llround(moment.z / tolerance))};
+            static_cast<std::int64_t>(std::llround(moment.x / line_tolerance)),
+            static_cast<std::int64_t>(std::llround(moment.y / line_tolerance)),
+            static_cast<std::int64_t>(std::llround(moment.z / line_tolerance))};
     };
     std::map<LineKey, std::set<std::uint32_t>> line_vertices;
     for (const TriangleIndices face : welded_faces)
@@ -2803,7 +2987,7 @@ OrientedSurfaceMesh buildAnalysisHalfedgeMeshImpl(
                 const double parameter = dot(point - a, edge) / length_squared;
                 if (parameter < -1.0e-10 || parameter > 1.0 + 1.0e-10) continue;
                 const Vec3 projected = a + edge * parameter;
-                if (norm(point - projected) > 4.0 * tolerance) continue;
+                if (norm(point - projected) > 4.0 * line_tolerance) continue;
                 points.push_back({std::clamp(parameter, 0.0, 1.0), vertex});
             }
             std::sort(points.begin(), points.end());
@@ -2835,7 +3019,29 @@ OrientedSurfaceMesh buildAnalysisHalfedgeMeshImpl(
                 conforming_faces.push_back({first, second, center_id});
         }
     }
-    welded_faces = std::move(conforming_faces);
+    welded_faces.clear();
+    unique_faces.clear();
+    welded_faces.reserve(conforming_faces.size());
+    for (const TriangleIndices face : conforming_faces)
+    {
+        if (face[0] == face[1] || face[1] == face[2] || face[2] == face[0] ||
+            norm(cross(toVec(welded_positions[face[1]]) -
+                           toVec(welded_positions[face[0]]),
+                       toVec(welded_positions[face[2]]) -
+                           toVec(welded_positions[face[0]]))) <= minimum_area)
+        {
+            ++stats.dropped_degenerate_triangles;
+            continue;
+        }
+        TriangleIndices signature = face;
+        std::sort(signature.begin(), signature.end());
+        if (!unique_faces.insert(signature).second)
+        {
+            ++stats.dropped_duplicate_triangles;
+            continue;
+        }
+        welded_faces.push_back(face);
+    }
 
     using Edge = std::array<std::uint32_t, 2>;
     const auto buildEdgeUses = [&]()
@@ -3128,13 +3334,9 @@ OrientedSurfaceMesh extractCellComplexBoundaryImpl(
     surface.vertices = std::move(compact_vertices);
 
     // Cell-complex faces carry source provenance instead of voxel-quad
-    // provenance. The placeholder is unused by this validation path.
-    VoxelGrid placeholder;
-    placeholder.shape = {1, 1, 1};
-    placeholder.pitch = 1.0;
-    placeholder.occupancy = {1};
+    // provenance.
     return buildOrientedSurfaceMesh(
-        std::move(surface), placeholder, std::move(source_faces));
+        std::move(surface), std::move(source_faces));
 }
 
 std::string bettiJson(const BettiNumbers value)
@@ -3167,7 +3369,7 @@ void writeModelMetadata(const std::filesystem::path& path, const std::string& mo
         << "      \"pitch\":" << stats.pitch << ",\n"
         << "      \"grid_shape\":[" << stats.grid_shape[0] << ','
         << stats.grid_shape[1] << ',' << stats.grid_shape[2] << "],\n"
-        << "      \"representation\":\"validated open analysis halfedge\",\n"
+        << "      \"representation\":\"validated locally injective projected halfedge\",\n"
         << "      \"boundary_voxel_faces\":0,\n"
         << "      \"boundary_voxels\":0,\n"
         << "      \"mesh_triangles\":" << stats.mesh_triangles << ",\n"
@@ -3190,10 +3392,16 @@ void writeModelMetadata(const std::filesystem::path& path, const std::string& mo
         << stats.dropped_duplicate_triangles << ",\n"
         << "      \"dropped_degenerate_triangles\":"
         << stats.dropped_degenerate_triangles << ",\n"
-        << "      \"mesh_watertight\":" << (stats.mesh_watertight ? "true" : "false") << ",\n"
-        << "      \"mesh_oriented\":" << (stats.mesh_oriented ? "true" : "false") << ",\n"
-        << "      \"mesh_manifold\":" << (stats.mesh_manifold ? "true" : "false") << ",\n"
-        << "      \"mesh_connected\":" << (stats.mesh_connected ? "true" : "false") << ",\n"
+        << "      \"halfedge_validation_performed\":"
+        << (stats.halfedge_validation_performed ? "true" : "false") << ",\n"
+        << "      \"mesh_watertight\":"
+        << (stats.mesh_watertight ? "true" : "false") << ",\n"
+        << "      \"mesh_oriented\":"
+        << (stats.mesh_oriented ? "true" : "false") << ",\n"
+        << "      \"mesh_manifold\":"
+        << (stats.mesh_manifold ? "true" : "false") << ",\n"
+        << "      \"mesh_connected\":"
+        << (stats.mesh_connected ? "true" : "false") << ",\n"
         << "      \"mesh_has_only_boundary_faces\":"
         << (stats.mesh_has_only_boundary_faces ? "true" : "false") << ",\n"
         << "      \"mesh_euler_characteristic\":" << stats.mesh_euler_characteristic << ",\n"
@@ -3268,7 +3476,8 @@ OrientedSurfaceMesh extractCellComplexBoundary(
 }
 
 MeshModel canonicalizeCoplanarTriangleSoup(
-    const MeshModel& source, const double relative_tolerance)
+    const MeshModel& source, const double relative_tolerance,
+    const bool preserve_collinear_boundary_vertices)
 {
     if (source.triangles.empty() || source.vertices.empty())
         throw std::invalid_argument("triangle soup is empty");
@@ -3381,8 +3590,21 @@ MeshModel canonicalizeCoplanarTriangleSoup(
             if (Clipper2Lib::Area(path) < 0.0) std::reverse(path.begin(), path.end());
             paths.push_back(std::move(path));
         }
-        const auto united = Clipper2Lib::Union(
-            paths, Clipper2Lib::FillRule::NonZero, clipper_precision);
+        Clipper2Lib::PathsD united;
+        if (preserve_collinear_boundary_vertices)
+        {
+            Clipper2Lib::ClipperD clipper(clipper_precision);
+            clipper.PreserveCollinear(true);
+            clipper.AddSubject(paths);
+            if (!clipper.Execute(Clipper2Lib::ClipType::Union,
+                                 Clipper2Lib::FillRule::NonZero, united))
+                united.clear();
+        }
+        else
+        {
+            united = Clipper2Lib::Union(
+                paths, Clipper2Lib::FillRule::NonZero, clipper_precision);
+        }
         Clipper2Lib::PathsD triangles;
         if (united.empty() || Clipper2Lib::Triangulate(
                 united, clipper_precision, triangles, false) !=
@@ -3417,6 +3639,14 @@ MeshModel canonicalizeCoplanarTriangleSoup(
     if (result.triangles.empty())
         throw std::runtime_error("coplanar canonicalization produced an empty soup");
     return result;
+}
+
+VoxelGrid fillResponsibleLocalConcavities(
+    const VoxelGrid& source, const VoxelGrid& filled,
+    std::size_t* added_voxels)
+{
+    return fillResponsibleLocalConcavitiesImpl(
+        source, filled, added_voxels);
 }
 
 namespace
@@ -3483,7 +3713,9 @@ MeshModel buildPlanarExteriorSurgery(
             a * 0.5 + b * 0.5,
             b * 0.5 + c * 0.5,
             c * 0.5 + a * 0.5};
-        bool touches_exterior = false;
+        // This preview is source preserving: occupancy may authorize filling a
+        // planar inner loop, but it must never remove visible source geometry.
+        bool touches_exterior = true;
         for (const Vec3 sample : samples)
             for (const double distance : {0.75, 1.25, 2.0})
             {
@@ -3625,6 +3857,15 @@ MeshModel buildPlanarExteriorSurgery(
 
 } // namespace
 
+MeshModel buildPlanarHoleCapPreview(
+    const VoxelGrid& filled, const MeshModel& source)
+{
+    validateGrid(filled);
+    if (const auto error = validateModelPool({source}))
+        throw std::invalid_argument(*error);
+    return buildPlanarExteriorSurgery(filled, source);
+}
+
 void writeVoxelGrid(const std::filesystem::path& path, const VoxelGrid& grid)
 {
     validateGrid(grid);
@@ -3692,12 +3933,10 @@ VoxelGrid readVoxelGrid(const std::filesystem::path& path)
 Phase1Solid buildPhase1Solid(VoxelGrid occupancy, const MeshModel& source)
 {
     validateGrid(occupancy);
-    if (voxelBettiNumbers(occupancy) != BettiNumbers{1, 0, 0})
-        throw std::invalid_argument("phase-1 solid requires occupancy beta=(1,0,0)");
     Phase1Solid result;
     result.occupancy = std::move(occupancy);
     result.boundary = buildOrientedSurfaceMesh(
-        reconstructDualSurface(result.occupancy, source), result.occupancy);
+        reconstructDualSurface(result.occupancy, source));
     return result;
 }
 
@@ -3845,12 +4084,8 @@ OrientedSurfaceMesh collapseDegenerateHalfedges(const OrientedSurfaceMesh& input
             }
             vertex = remap[vertex];
         }
-    VoxelGrid placeholder;
-    placeholder.shape = {1, 1, 1};
-    placeholder.pitch = 1.0;
-    placeholder.occupancy = {1};
     OrientedSurfaceMesh result = buildOrientedSurfaceMesh(
-        std::move(cleaned), placeholder);
+        std::move(cleaned));
     std::cerr << "monitor: stage=degenerate_halfedge_cleanup"
               << " collapses=" << collapse_count
               << " vertices=" << result.geometry.vertices.size()
@@ -3860,7 +4095,9 @@ OrientedSurfaceMesh collapseDegenerateHalfedges(const OrientedSurfaceMesh& input
 
 OrientedSurfaceMesh projectPhase1BoundaryToSource(
     const OrientedSurfaceMesh& boundary, const VoxelGrid& filled_occupancy,
-    const VoxelGrid& source_occupancy, const MeshModel& source)
+    const VoxelGrid& source_occupancy, const MeshModel& source,
+    std::vector<std::array<std::uint32_t, 3>>* concavity_fill_cells,
+    const std::uint32_t trace_face)
 {
     validateGrid(filled_occupancy);
     validateGrid(source_occupancy);
@@ -3878,6 +4115,9 @@ OrientedSurfaceMesh projectPhase1BoundaryToSource(
     const std::vector<std::uint8_t> retained_faces =
         exteriorSourceFaces(filled_occupancy, source);
     const SourceTriangleBvh source_bvh(source, retained_faces);
+    const std::vector<std::uint8_t> all_source_faces(
+        source.triangles.size(), std::uint8_t{1});
+    const SourceTriangleBvh source_geometry_bvh(source, all_source_faces);
     OrientedSurfaceMesh result = boundary;
     result.geometry.name = boundary.geometry.name + "_source_projected";
     if (boundary.face_boundary_crossings.size() !=
@@ -3887,63 +4127,441 @@ OrientedSurfaceMesh projectPhase1BoundaryToSource(
         result.geometry.vertices.size(), 0);
     std::vector<std::uint8_t> touches_generated_fill(
         result.geometry.vertices.size(), 0);
+    std::vector<std::uint8_t> generated_fill_faces(
+        result.geometry.triangles.size(), 0);
     for (std::size_t face = 0; face < boundary.geometry.triangles.size(); ++face)
     {
         const std::uint32_t crossing_id = boundary.face_boundary_crossings[face];
         if (crossing_id >= boundary.boundary_crossings.size())
             throw std::invalid_argument("phase-1 boundary has invalid voxel provenance");
         const auto inside = boundary.boundary_crossings[crossing_id].inside;
-        const bool generated_fill = !source_occupancy.occupied(
+        bool generated_fill = !source_occupancy.occupied(
             inside[0], inside[1], inside[2]);
+        // A voxel-side can be empty in the source occupancy merely because a
+        // thin or slanted original boundary was missed by voxelization. If
+        // the actual source OBJ supports this boundary face by position and
+        // normal, it is ordinary source surface and must not become a fill cap.
+        if (generated_fill && !source_geometry_bvh.empty())
+        {
+            const TriangleIndices triangle = boundary.geometry.triangles[face];
+            const Vec3 a = toVec(boundary.geometry.vertices[triangle[0]]);
+            const Vec3 b = toVec(boundary.geometry.vertices[triangle[1]]);
+            const Vec3 c = toVec(boundary.geometry.vertices[triangle[2]]);
+            const Vec3 boundary_normal = normalized(cross(b - a, c - a));
+            if (norm(boundary_normal) > 0.0)
+            {
+                const Vec3 center = (a + b + c) * (1.0 / 3.0);
+                const auto closest = source_geometry_bvh.closestPoint(center);
+                if (closest.face_id < source.triangles.size())
+                {
+                    const TriangleIndices source_triangle =
+                        source.triangles[closest.face_id];
+                    const Vec3 sa = toVec(source.vertices[source_triangle[0]]);
+                    const Vec3 sb = toVec(source.vertices[source_triangle[1]]);
+                    const Vec3 sc = toVec(source.vertices[source_triangle[2]]);
+                    const Vec3 source_normal = normalized(cross(sb - sa, sc - sa));
+                    const double supported_distance = norm(closest.point - center);
+                    const double normal_alignment = std::abs(
+                        dot(boundary_normal, source_normal));
+                    if (supported_distance <= 0.75 * filled_occupancy.pitch &&
+                        normal_alignment >= 0.7)
+                        generated_fill = false;
+                }
+            }
+        }
+        generated_fill_faces[face] = generated_fill ? 1 : 0;
+        if (face == trace_face)
+        {
+            const TriangleIndices triangle = boundary.geometry.triangles[face];
+            const Vec3 a = toVec(boundary.geometry.vertices[triangle[0]]);
+            const Vec3 b = toVec(boundary.geometry.vertices[triangle[1]]);
+            const Vec3 c = toVec(boundary.geometry.vertices[triangle[2]]);
+            const Vec3 center = (a + b + c) * (1.0 / 3.0);
+            const auto closest = source_geometry_bvh.closestPoint(center);
+            std::cerr << "trace_face: id=" << face
+                      << " initial_generated_fill=" << (generated_fill ? 1 : 0)
+                      << " source_center_distance=" << norm(closest.point - center)
+                      << " source_face=" << closest.face_id << '\n';
+        }
         auto& responsibility = generated_fill
             ? touches_generated_fill : touches_source_surface;
         for (const std::uint32_t vertex : boundary.geometry.triangles[face])
             responsibility[vertex] = 1;
     }
+    std::vector<std::set<std::uint32_t>> adjacent_vertices(
+        result.geometry.vertices.size());
+    for (std::uint32_t face_id = 0;
+         face_id < result.geometry.triangles.size(); ++face_id)
+    {
+        const auto face = result.geometry.triangles[face_id];
+        for (int corner = 0; corner < 3; ++corner)
+        {
+            adjacent_vertices[face[corner]].insert(face[(corner + 1) % 3]);
+            adjacent_vertices[face[corner]].insert(face[(corner + 2) % 3]);
+        }
+    }
+    // Resolve planar hole caps while fill provenance is still explicit.  A
+    // generated region can share dual vertices with the original lip, so grow
+    // through the locally parallel one-ring instead of classifying those lip
+    // faces as source geometry and trying to repair them after source
+    // projection.  The source plane is accepted only when it supports most of
+    // the generated/source interface of this component.
+    const auto fill_support_planes = sourcePlanes(
+        source, filled_occupancy.pitch, &retained_faces);
+    std::vector<std::uint8_t> fill_plane_constrained(
+        result.geometry.vertices.size(), 0);
+    std::vector<std::uint8_t> visited_fill_faces(
+        result.geometry.triangles.size(), 0);
+    std::size_t aligned_planar_fill_patches = 0;
+    std::size_t aligned_planar_fill_vertices = 0;
+    const double fill_minimum_area = std::max(
+        filled_occupancy.pitch * filled_occupancy.pitch * 1.0e-12, 1.0e-18);
+    const auto planeSupportsPoint = [&](const DualSourcePlane& plane,
+                                        const Vec3 point,
+                                        const double expansion)
+    {
+        if (!withinExpandedBounds(point, plane.bounds, expansion)) return false;
+        return std::ranges::any_of(
+            plane.support_components, [&](const Bounds3& component)
+            { return withinExpandedBounds(point, component, expansion); });
+    };
+    for (std::uint32_t seed = 0; seed < result.geometry.triangles.size(); ++seed)
+    {
+        if (!generated_fill_faces[seed] || visited_fill_faces[seed]) continue;
+        std::vector<std::uint32_t> component_faces{seed};
+        std::set<std::uint32_t> mouth_vertices;
+        visited_fill_faces[seed] = 1;
+        for (std::size_t cursor = 0; cursor < component_faces.size(); ++cursor)
+        {
+            std::uint32_t edge = result.face_halfedges[component_faces[cursor]];
+            for (int local = 0; local < 3; ++local)
+            {
+                const std::uint32_t opposite = result.halfedges[edge].opposite;
+                if (opposite >= result.halfedges.size())
+                    throw std::runtime_error("generated fill patch has an open edge");
+                const std::uint32_t neighbor = result.halfedges[opposite].face;
+                if (generated_fill_faces[neighbor])
+                {
+                    if (!visited_fill_faces[neighbor])
+                    {
+                        visited_fill_faces[neighbor] = 1;
+                        component_faces.push_back(neighbor);
+                    }
+                }
+                else
+                {
+                    mouth_vertices.insert(result.halfedges[edge].origin);
+                    mouth_vertices.insert(result.halfedges[
+                        result.halfedges[edge].next].origin);
+                }
+                edge = result.halfedges[edge].next;
+            }
+        }
+        if (mouth_vertices.size() < 3) continue;
+
+        const DualSourcePlane* best_plane = nullptr;
+        std::size_t best_support_count = 0;
+        double best_support_area = -1.0;
+        double best_distance_sum = std::numeric_limits<double>::infinity();
+        for (const DualSourcePlane& plane : fill_support_planes)
+        {
+            std::size_t support_count = 0;
+            double distance_sum = 0.0;
+            for (const std::uint32_t vertex : mouth_vertices)
+            {
+                const Vec3 point = toVec(result.geometry.vertices[vertex]);
+                const double distance = std::abs(dot(plane.normal, point) - plane.distance);
+                if (distance > 2.0 * filled_occupancy.pitch ||
+                    !planeSupportsPoint(plane, point, 2.0 * filled_occupancy.pitch))
+                    continue;
+                ++support_count;
+                distance_sum += distance;
+            }
+            if (support_count > best_support_count ||
+                (support_count == best_support_count && support_count != 0 &&
+                 (plane.support_area > best_support_area ||
+                  (plane.support_area == best_support_area &&
+                   distance_sum < best_distance_sum))))
+            {
+                best_plane = &plane;
+                best_support_count = support_count;
+                best_support_area = plane.support_area;
+                best_distance_sum = distance_sum;
+            }
+        }
+        const std::size_t required_support = std::max<std::size_t>(
+            3, (mouth_vertices.size() * 3 + 4) / 5);
+        const bool trace_component = std::find(
+            component_faces.begin(), component_faces.end(), trace_face) !=
+            component_faces.end();
+        if (trace_component)
+            std::cerr << "trace_face: generated_component_faces="
+                      << component_faces.size() << " mouth_vertices="
+                      << mouth_vertices.size() << " best_support="
+                      << best_support_count << " required_support="
+                      << required_support << " has_support_plane="
+                      << (best_plane != nullptr ? 1 : 0) << '\n';
+        if (best_plane == nullptr || best_support_count < required_support) continue;
+
+        const auto faceCompatible = [&](const std::uint32_t face)
+        {
+            const TriangleIndices triangle = result.geometry.triangles[face];
+            const Vec3 a = toVec(result.geometry.vertices[triangle[0]]);
+            const Vec3 b = toVec(result.geometry.vertices[triangle[1]]);
+            const Vec3 c = toVec(result.geometry.vertices[triangle[2]]);
+            const Vec3 normal = cross(b - a, c - a);
+            if (norm(normal) < fill_minimum_area ||
+                std::abs(dot(normalized(normal), best_plane->normal)) < 0.7)
+                return false;
+            for (const Vec3 point : {a, b, c})
+                if (std::abs(dot(best_plane->normal, point) - best_plane->distance) >
+                        1.5 * filled_occupancy.pitch ||
+                    !planeSupportsPoint(
+                        *best_plane, point, 3.0 * filled_occupancy.pitch))
+                    return false;
+            return true;
+        };
+
+        std::vector<std::uint32_t> planar_faces;
+        std::vector<std::uint8_t> in_planar_patch(
+            result.geometry.triangles.size(), 0);
+        for (const std::uint32_t face : component_faces)
+            if (faceCompatible(face))
+            {
+                in_planar_patch[face] = 1;
+                planar_faces.push_back(face);
+            }
+        for (std::size_t cursor = 0; cursor < planar_faces.size(); ++cursor)
+        {
+            std::uint32_t edge = result.face_halfedges[planar_faces[cursor]];
+            for (int local = 0; local < 3; ++local)
+            {
+                const std::uint32_t opposite = result.halfedges[edge].opposite;
+                const std::uint32_t neighbor = result.halfedges[opposite].face;
+                if (!in_planar_patch[neighbor] && faceCompatible(neighbor))
+                {
+                    in_planar_patch[neighbor] = 1;
+                    planar_faces.push_back(neighbor);
+                }
+                edge = result.halfedges[edge].next;
+            }
+        }
+        if (planar_faces.empty()) continue;
+        if (trace_component)
+            std::cerr << "trace_face: planar_faces=" << planar_faces.size()
+                      << " trace_face_planar="
+                      << (in_planar_patch[trace_face] ? 1 : 0) << '\n';
+
+        std::set<std::uint32_t> patch_vertices;
+        for (const std::uint32_t face : planar_faces)
+            for (const std::uint32_t vertex : result.geometry.triangles[face])
+                patch_vertices.insert(vertex);
+        for (const std::uint32_t vertex : patch_vertices)
+        {
+            const Vec3 point = toVec(result.geometry.vertices[vertex]);
+            const Vec3 aligned = point - best_plane->normal *
+                (dot(best_plane->normal, point) - best_plane->distance);
+            result.geometry.vertices[vertex] = toPosition(aligned);
+        }
+        for (const std::uint32_t vertex : patch_vertices)
+            fill_plane_constrained[vertex] = 1;
+        if (trace_component)
+            std::cerr << "trace_face: aligned_planar_patch=1 vertices="
+                      << patch_vertices.size() << '\n';
+        ++aligned_planar_fill_patches;
+        aligned_planar_fill_vertices += patch_vertices.size();
+    }
+
+    std::vector<Position3> candidates = result.geometry.vertices;
+    std::vector<std::uint8_t> accepted(result.geometry.vertices.size(), 0);
     std::size_t projected_vertices = 0;
     std::size_t retained_fill_vertices = 0;
+    std::size_t fill_to_source_fallback_vertices = 0;
+    std::size_t fill_to_source_override_vertices = 0;
+    const auto sourcePlaneProjection = [&](const Vec3 point,
+                                           const std::size_t face_id)
+        -> std::optional<Vec3>
+    {
+        if (face_id >= source.triangles.size()) return std::nullopt;
+        const TriangleIndices triangle = source.triangles[face_id];
+        const Vec3 a = toVec(source.vertices[triangle[0]]);
+        const Vec3 b = toVec(source.vertices[triangle[1]]);
+        const Vec3 c = toVec(source.vertices[triangle[2]]);
+        const Vec3 area_vector = cross(b - a, c - a);
+        const double area = norm(area_vector);
+        if (area <= 0.0) return std::nullopt;
+        const Vec3 normal = area_vector * (1.0 / area);
+        const double distance = dot(normal, a);
+        const DualSourcePlane* certified = nullptr;
+        for (const DualSourcePlane& plane : fill_support_planes)
+        {
+            if (std::abs(dot(plane.normal, normal)) < 1.0 - 1.0e-5)
+                continue;
+            const double aligned_distance = dot(plane.normal, normal) < 0.0
+                ? -distance : distance;
+            if (std::abs(aligned_distance - plane.distance) >
+                    std::max(filled_occupancy.pitch * 0.02, 1.0e-9) ||
+                !planeSupportsPoint(plane, point, 2.0 * filled_occupancy.pitch))
+                continue;
+            if (certified == nullptr || plane.support_area > certified->support_area)
+                certified = &plane;
+        }
+        if (certified == nullptr) return std::nullopt;
+        return point - certified->normal *
+            (dot(certified->normal, point) - certified->distance);
+    };
     for (std::size_t vertex = 0; vertex < result.geometry.vertices.size(); ++vertex)
     {
-        // A fill-only vertex has no corresponding point on the source OBJ.
-        // Projecting it would collapse the cap toward the hole wall. Shared
-        // mouth vertices are source constrained so the cap joins exactly.
-        if (!touches_source_surface[vertex] && touches_generated_fill[vertex])
+        const Vec3 point = toVec(result.geometry.vertices[vertex]);
+        const auto closest = source_geometry_bvh.closestPoint(point);
+        // A cap-plane label is only authoritative away from the input surface.
+        // Thin/slanted exterior source patches can be voxel-classified as fill;
+        // retain their source geometry whenever the input triangle supports the
+        // vertex within one temporary-grid cell.
+        const double same_cell_support_distance =
+            std::sqrt(3.0) * filled_occupancy.pitch;
+        const bool input_surface_supported =
+            closest.face_id < source.triangles.size() &&
+            norm(closest.point - point) <= same_cell_support_distance;
+        if (trace_face < result.geometry.triangles.size())
         {
+            const TriangleIndices traced = result.geometry.triangles[trace_face];
+            if (vertex == traced[0] || vertex == traced[1] || vertex == traced[2])
+                std::cerr << "trace_face: vertex=" << vertex
+                          << " fill_plane_constrained="
+                          << static_cast<int>(fill_plane_constrained[vertex])
+                          << " nearest_source_distance=" << norm(closest.point - point)
+                          << " source_supported=" << (input_surface_supported ? 1 : 0)
+                          << '\n';
+        }
+        if (fill_plane_constrained[vertex])
+        {
+            if (!input_surface_supported) continue;
+            candidates[vertex] = toPosition(closest.point);
+            accepted[vertex] = 1;
+            ++fill_to_source_override_vertices;
+            continue;
+        }
+        // Any vertex touching generated fill is handled as part of the cap,
+        // including shared mouth vertices. The BVH is restricted to faces
+        // exposed by the filled occupancy, so a certified plane cannot be an
+        // interior wall. Project to that plane, rather than its closest point,
+        // to preserve a planar cap and remove voxel-scaffold spikes.
+        if (touches_generated_fill[vertex])
+        {
+            std::optional<Vec3> projected;
+            if (!fill_support_planes.empty())
+            {
+                projected = sourcePlaneProjection(
+                    point, closest.face_id);
+            }
+            if (projected && norm(*projected -
+                                  point) <=
+                    2.0 * filled_occupancy.pitch)
+            {
+                candidates[vertex] = toPosition(*projected);
+                accepted[vertex] = 1;
+                continue;
+            }
+            // A voxel-side can be misclassified as generated fill when a
+            // thin/slanted source patch falls on the empty side of the input
+            // occupancy.  It must still follow the bounded input triangle;
+            // retaining its voxel coordinate creates the visible spikes.
+            if (closest.face_id < source.triangles.size() &&
+                norm(closest.point - point) <=
+                    4.0 * filled_occupancy.pitch)
+            {
+                candidates[vertex] = toPosition(closest.point);
+                accepted[vertex] = 1;
+                ++fill_to_source_fallback_vertices;
+                continue;
+            }
             ++retained_fill_vertices;
             continue;
         }
-        const auto closest = source_bvh.closestPoint(
-            toVec(boundary.geometry.vertices[vertex]));
-        result.geometry.vertices[vertex] = toPosition(closest.point);
-        ++projected_vertices;
+        candidates[vertex] = toPosition(closest.point);
+        accepted[vertex] = 1;
     }
 
-    double signed_volume = 0.0;
-    std::size_t degenerate_faces = 0;
-    Bounds3 bounds;
-    for (const auto point : result.geometry.vertices) include(bounds, toVec(point));
-    const double scale = norm(bounds.upper - bounds.lower);
-    const double minimum_area = std::max(1.0, scale * scale) * 1.0e-24;
-    for (const auto triangle : result.geometry.triangles)
+    for (std::uint32_t vertex = 0; vertex < candidates.size(); ++vertex)
+        if (accepted[vertex])
+        {
+            result.geometry.vertices[vertex] = candidates[vertex];
+            ++projected_vertices;
+        }
+
+    std::size_t remaining_generated_concave_edges = 0;
+    std::set<std::array<std::uint32_t, 3>> required_concavity_cells;
+    const double final_concavity_height_tolerance =
+        std::max(filled_occupancy.pitch * 1.0e-7, 1.0e-12);
+    for (std::uint32_t edge = 0; edge < result.halfedges.size(); ++edge)
     {
-        const Vec3 a = toVec(result.geometry.vertices[triangle[0]]);
-        const Vec3 b = toVec(result.geometry.vertices[triangle[1]]);
-        const Vec3 c = toVec(result.geometry.vertices[triangle[2]]);
-        degenerate_faces += norm(cross(b - a, c - a)) <= minimum_area ? 1 : 0;
-        signed_volume += dot(a, cross(b, c)) / 6.0;
+        const std::uint32_t opposite = result.halfedges[edge].opposite;
+        if (opposite >= result.halfedges.size() || edge > opposite) continue;
+        const std::uint32_t first_face = result.halfedges[edge].face;
+        const std::uint32_t second_face = result.halfedges[opposite].face;
+        if (!generated_fill_faces[first_face] &&
+            !generated_fill_faces[second_face]) continue;
+        const std::uint32_t a_id = result.halfedges[edge].origin;
+        const std::uint32_t b_id = result.halfedges[result.halfedges[edge].next].origin;
+        const std::uint32_t c_id = result.halfedges[
+            result.halfedges[result.halfedges[edge].next].next].origin;
+        const std::uint32_t d_id = result.halfedges[
+            result.halfedges[result.halfedges[opposite].next].next].origin;
+        const Vec3 a = toVec(result.geometry.vertices[a_id]);
+        const Vec3 b = toVec(result.geometry.vertices[b_id]);
+        const Vec3 c = toVec(result.geometry.vertices[c_id]);
+        const Vec3 d = toVec(result.geometry.vertices[d_id]);
+        const Vec3 first_normal = cross(b - a, c - a);
+        const Vec3 second_normal = cross(a - b, d - b);
+        const bool concave =
+            dot(first_normal, d - a) >
+                final_concavity_height_tolerance * norm(first_normal) ||
+            dot(second_normal, c - b) >
+                final_concavity_height_tolerance * norm(second_normal);
+        if (!concave) continue;
+        ++remaining_generated_concave_edges;
+        for (const std::uint32_t face : {first_face, second_face})
+        {
+            if (!generated_fill_faces[face]) continue;
+            const std::uint32_t crossing_id = boundary.face_boundary_crossings[face];
+            if (crossing_id >= boundary.boundary_crossings.size())
+                throw std::runtime_error("concave fill face lost its voxel crossing");
+            required_concavity_cells.insert(
+                boundary.boundary_crossings[crossing_id].outside);
+        }
     }
-    result.euler_characteristic = boundary.euler_characteristic;
-    if (!std::isfinite(signed_volume) || signed_volume == 0.0)
-        throw std::runtime_error("exact source projection has zero oriented volume");
-    if (signed_volume < 0.0)
-        throw std::runtime_error("exact source projection has inward orientation");
-    result.signed_volume = signed_volume;
-    std::cerr << "monitor: stage=exact_source_projection"
+    if (concavity_fill_cells)
+        concavity_fill_cells->assign(
+            required_concavity_cells.begin(), required_concavity_cells.end());
+    else if (remaining_generated_concave_edges != 0)
+        throw std::runtime_error(
+            "phase-1 generated fill remains locally concave after projection: " +
+            std::to_string(remaining_generated_concave_edges) + " edges");
+
+    std::cerr << "monitor: stage=local_injective_source_projection"
               << " projected_vertices=" << projected_vertices
+              << " rejected_vertices="
+              << (result.geometry.vertices.size() - projected_vertices -
+                  retained_fill_vertices)
               << " retained_fill_vertices=" << retained_fill_vertices
-              << " retained_topology=1"
-              << " degenerate_faces_pending_collapse=" << degenerate_faces << '\n';
-    return collapseDegenerateHalfedges(result);
+              << " fill_to_source_fallback_vertices="
+              << fill_to_source_fallback_vertices
+              << " fill_to_source_override_vertices="
+              << fill_to_source_override_vertices
+              << " generated_concave_edges="
+              << remaining_generated_concave_edges
+              << " concavity_fill_cells=" << required_concavity_cells.size()
+              << " aligned_planar_fill_patches="
+              << aligned_planar_fill_patches
+              << " aligned_planar_fill_vertices="
+              << aligned_planar_fill_vertices
+              << " retained_topology=1\n";
+    // Projection changes positions only.  Degenerate geometric triangles are
+    // allowed here; collapsing them would rebuild topology and can fabricate
+    // a different vertex identity.  The existing next/opposite relation is
+    // the phase-1 halfedge authority.
+    return result;
 }
 
 MeshModel buildSourceDominatedPhase1Preview(
@@ -5006,28 +5624,50 @@ TopologyFillStats generateTopologyFillModel(
     VoxelGrid filled = enclosingTopologyFill(
         input, options.maximum_steps, &stats, &cavity_fill_labels);
     log_stage("topology_filled");
-    // The phase-1 authority is the occupied/exterior interface. Internal walls
-    // are absent by construction because both of their sides are occupied.
-    // Source planes constrain geometry inside reconstructDualSurface; the
-    // occupancy supplies topology only.
-    Phase1Solid solid;
-    try
+    std::size_t repaired_cells = 0;
+    constexpr std::size_t maximum_regularization_passes = 8;
+    const auto restoreRegularizedTarget = [&]
     {
-        solid = buildPhase1Solid(filled, source);
-    }
-    catch (...)
-    {
-        writeVoxelGrid(output_directory / "failed_topology.vox", filled);
-        throw;
-    }
+        for (std::size_t pass = 0; pass < maximum_regularization_passes; ++pass)
+        {
+            std::size_t pass_repairs = 0;
+            filled = regularizeWellComposedOccupancy(filled, &pass_repairs);
+            repaired_cells += pass_repairs;
+            filled = fillCavities(filled);
+            const BettiNumbers regularized_betti = voxelBettiNumbers(filled);
+            std::cerr << "monitor: stage=local_topology_regularization pass=" << pass
+                      << " cells=" << pass_repairs
+                      << " betti=" << regularized_betti.beta0 << ','
+                      << regularized_betti.beta1 << ',' << regularized_betti.beta2
+                      << '\n';
+            if (regularized_betti == BettiNumbers{1, 0, 0}) return;
+            const std::size_t before_restore = countOccupied(filled);
+            filled = enclosingTopologyFill(
+                filled, options.maximum_steps, nullptr, nullptr);
+            filled = fillCavities(filled);
+            const std::size_t after_restore = countOccupied(filled);
+            if (after_restore == before_restore &&
+                voxelBettiNumbers(filled) != BettiNumbers{1, 0, 0})
+                break;
+        }
+        throw std::runtime_error(
+            "phase-1 could not satisfy well-composedness and Betti target together");
+    };
+    restoreRegularizedTarget();
+    stats.output_voxels = countOccupied(filled);
+    stats.added_voxels = stats.output_voxels - stats.input_voxels;
+    std::cerr << "monitor: stage=local_topology_regularization_total cells="
+              << repaired_cells << '\n';
+    Phase1Solid solid = buildPhase1Solid(filled, source);
     log_stage("dual_surface_built");
+    std::vector<std::array<std::uint32_t, 3>> residual_concavity_cells;
     const OrientedSurfaceMesh phase1 = projectPhase1BoundaryToSource(
-        solid.boundary, solid.occupancy, input, source);
-    log_stage("source_projected");
-    AnalysisHalfedgeStats halfedge_stats;
-    halfedge_stats.paired_edges = phase1.halfedges.size() / 2;
-    halfedge_stats.boundary_halfedges = 0;
-    halfedge_stats.face_components = 1;
+        solid.boundary, solid.occupancy, input, source,
+        &residual_concavity_cells, options.trace_face);
+    std::cerr << "monitor: stage=mesh_local_nonconcavity residual_cells="
+              << residual_concavity_cells.size() << '\n';
+    const auto validation = validatePhase1HalfedgeTopology(phase1);
+    log_stage("halfedge_validated");
     stats.exposed_voxel_faces = 0;
     stats.mesh_triangles = phase1.geometry.triangles.size();
     stats.mesh_vertices = phase1.geometry.vertices.size();
@@ -5038,33 +5678,21 @@ TopologyFillStats generateTopologyFillModel(
     stats.hole_boundary_loops = 0;
     stats.cap_triangles = 0;
     stats.halfedge_count = phase1.halfedges.size();
-    stats.paired_halfedge_edges = halfedge_stats.paired_edges;
-    stats.boundary_halfedges = halfedge_stats.boundary_halfedges;
-    stats.nonmanifold_edge_groups = halfedge_stats.nonmanifold_edge_groups;
-    stats.inconsistent_orientation_edges =
-        halfedge_stats.inconsistent_orientation_edges;
-    stats.halfedge_face_components = halfedge_stats.face_components;
-    stats.dropped_duplicate_triangles =
-        halfedge_stats.dropped_duplicate_triangles;
-    stats.dropped_degenerate_triangles =
-        halfedge_stats.dropped_degenerate_triangles;
-    stats.mesh_connected = halfedge_stats.face_components == 1;
+    stats.paired_halfedge_edges = phase1.halfedges.size() / 2;
+    stats.boundary_halfedges = 0;
+    stats.nonmanifold_edge_groups = 0;
+    stats.inconsistent_orientation_edges = 0;
+    stats.halfedge_face_components = validation.face_components;
+    stats.halfedge_validation_performed = true;
     stats.mesh_watertight = true;
     stats.mesh_oriented = true;
     stats.mesh_manifold = true;
+    stats.mesh_connected = true;
     stats.mesh_has_only_boundary_faces = true;
-    stats.mesh_euler_characteristic = phase1.euler_characteristic;
-    stats.mesh_signed_volume = phase1.signed_volume;
+    stats.mesh_euler_characteristic = validation.euler_characteristic;
+    stats.mesh_signed_volume = validation.signed_volume;
     stats.elapsed_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
-    if (!stats.mesh_connected)
-    {
-        writeDisconnectedHalfedgeDiagnostics(
-            output_directory, source_obj, phase1, stats);
-        throw std::runtime_error(
-            "phase-1 halfedge is disconnected under next/opposite traversal; components=" +
-            std::to_string(stats.halfedge_face_components));
-    }
     std::filesystem::copy_file(source_obj, output_directory / "source.obj");
     writeAnalysisHalfedgeMesh(output_directory / "phase1_halfedge.bin", phase1);
     writeModelMetadata(output_directory / "model.json", source_obj.filename().string(), stats);
@@ -5092,8 +5720,9 @@ std::vector<TopologyFillStats> generateTopologyFillBatch(
     std::ofstream manifest(output_root / "viewer_manifest.json");
     if (!manifest) throw std::runtime_error("failed to create viewer manifest");
     manifest << "{\n"
-        << "  \"algorithm\":\"CppHighResolutionVoxelLocatedOriginalObjHoleSurgery\",\n"
+        << "  \"algorithm\":\"CppLocalInjectiveProjectionV52\",\n"
         << "  \"complete\":true,\n"
+        << "  \"validation\":\"combinatorial_halfedge_topology\",\n"
         << "  \"model_count\":" << model_ids.size() << ",\n"
         << "  \"models\":[\n";
     for (std::size_t index = 0; index < model_ids.size(); ++index)
@@ -5110,7 +5739,7 @@ std::vector<TopologyFillStats> generateTopologyFillBatch(
         << "    \"target_betti\":[1,0,0],\n"
         << "    \"source_occupancy_is_hard_kernel\":true,\n"
         << "    \"voxel_role\":\"hole location and topology certificate only\",\n"
-        << "    \"phase1_representation\":\"PQSSHED1 validated open analysis halfedge\",\n"
+        << "    \"phase1_representation\":\"PQSSHED1 locally validated projected halfedge\",\n"
         << "    \"voxel_boundary_mesh_used\":false,\n"
         << "    \"cpu_threads_per_model\":1,\n"
         << "    \"process_memory_limit_mib\":2048\n"

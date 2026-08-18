@@ -1,4 +1,5 @@
 #include "pqss_proxy_mesh/hausdorff_simplifier.hpp"
+#include "pqss_proxy_mesh/halfedge_validation.hpp"
 
 #include "QuickHull.hpp"
 #include "clipper2/clipper.h"
@@ -12,17 +13,48 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
+
 namespace pqss_proxy_mesh
 {
 namespace
 {
+
+double workingSetMiB()
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+        return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
+#endif
+    return -1.0;
+}
+
+void logMonitor(const char* stage, const std::string& candidate = {})
+{
+    std::cerr << "monitor: stage=" << stage;
+    if (!candidate.empty()) std::cerr << " candidate=" << candidate;
+    const double working_set = workingSetMiB();
+    if (working_set >= 0.0)
+        std::cerr << " working_set_mib=" << working_set;
+    std::cerr << '\n';
+}
 
 struct Vec3
 {
@@ -121,7 +153,10 @@ public:
         if (mesh.triangles.empty()) throw std::invalid_argument("reference mesh is empty");
         ids_.resize(mesh.triangles.size());
         std::iota(ids_.begin(), ids_.end(), std::uint32_t{0});
-        nodes_.reserve(mesh.triangles.size() * 2);
+        // Reserve the exact node count produced by the median split. A loose
+        // per-triangle bound needlessly consumes hundreds of MiB on large
+        // phase-1 meshes.
+        nodes_.reserve(requiredNodeCount(mesh.triangles.size()));
         build(0, static_cast<std::uint32_t>(ids_.size()));
     }
 
@@ -164,6 +199,14 @@ public:
     }
 
 private:
+    static std::size_t requiredNodeCount(const std::size_t triangle_count)
+    {
+        if (triangle_count <= 8) return 1;
+        const std::size_t left = triangle_count / 2;
+        return 1 + requiredNodeCount(left) +
+               requiredNodeCount(triangle_count - left);
+    }
+
     struct Node
     {
         Bounds bounds;
@@ -230,15 +273,17 @@ private:
 DirectedHausdorffCertificate certifyWithBvh(
     const MeshModel& proxy, const TriangleBvh& reference_bvh,
     const double maximum_distance, const std::uint32_t maximum_depth,
-    const double numerical_tolerance)
+    const double numerical_tolerance, const bool tight_triangle_radius = true,
+    const bool collect_global_violation = false)
 {
     DirectedHausdorffCertificate result;
     result.passed = true;
     struct Node { Vec3 a,b,c; std::uint32_t depth; };
     std::vector<Node> stack;
     const double tolerance = numerical_tolerance * std::max(1.0, maximum_distance);
-    for (const auto face : proxy.triangles)
+    for (std::size_t proxy_face = 0; proxy_face < proxy.triangles.size(); ++proxy_face)
     {
+        const TriangleIndices face = proxy.triangles[proxy_face];
         stack.push_back({toVec(proxy.vertices[face[0]]), toVec(proxy.vertices[face[1]]),
                          toVec(proxy.vertices[face[2]]), 0});
         while (!stack.empty())
@@ -246,6 +291,7 @@ DirectedHausdorffCertificate certifyWithBvh(
             const Node node = stack.back();
             stack.pop_back();
             ++result.subdivision_nodes;
+            bool node_exceeds_limit = false;
             std::array<double, 4> distances{};
             std::array<Vec3, 4> nearest{};
             const std::array<Vec3, 4> samples{node.a, node.b, node.c,
@@ -259,19 +305,26 @@ DirectedHausdorffCertificate certifyWithBvh(
                     result.lower_bound = distances[i];
                     result.maximum_proxy_point = {samples[i].x, samples[i].y, samples[i].z};
                     result.nearest_reference_point = {nearest[i].x, nearest[i].y, nearest[i].z};
+                    result.maximum_proxy_face = proxy_face;
                 }
                 if (distances[i] > maximum_distance + tolerance)
                 {
                     result.passed = false;
                     result.failure_reason = "witness point exceeds the directed Hausdorff limit";
                     result.upper_bound = std::numeric_limits<double>::infinity();
-                    return result;
+                    node_exceeds_limit = true;
+                    if (!collect_global_violation) return result;
                 }
             }
-            const double radius = std::max({norm(node.a-node.b), norm(node.b-node.c),
-                                            norm(node.c-node.a)}) * (2.0 / 3.0);
+            if (node_exceeds_limit) continue;
+            const Vec3 centroid = (node.a + node.b + node.c) * (1.0 / 3.0);
+            const double radius = tight_triangle_radius
+                ? std::max({norm(node.a - centroid), norm(node.b - centroid),
+                            norm(node.c - centroid)})
+                : std::max({norm(node.a-node.b), norm(node.b-node.c),
+                            norm(node.c-node.a)}) * (2.0 / 3.0);
             const double local_upper = distances[3] + radius;
-            if (local_upper <= maximum_distance)
+            if (local_upper <= maximum_distance + tolerance)
             {
                 result.upper_bound = std::max(result.upper_bound, local_upper);
                 continue;
@@ -314,6 +367,187 @@ MeshModel makeBox(const MeshModel& reference)
     return box;
 }
 
+void orientPositiveVolume(MeshModel& mesh)
+{
+    double six_volume = 0.0;
+    for (const TriangleIndices face : mesh.triangles)
+    {
+        const Vec3 a = toVec(mesh.vertices[face[0]]);
+        const Vec3 b = toVec(mesh.vertices[face[1]]);
+        const Vec3 c = toVec(mesh.vertices[face[2]]);
+        six_volume += dot(a, cross(b, c));
+    }
+    if (six_volume < 0.0)
+        for (TriangleIndices& face : mesh.triangles) std::swap(face[1], face[2]);
+}
+
+void orientConvexFacesOutward(MeshModel& mesh)
+{
+    Vec3 center{};
+    for (const Position3 point : mesh.vertices) center = center + toVec(point);
+    center = center * (1.0 / mesh.vertices.size());
+    for (TriangleIndices& face : mesh.triangles)
+    {
+        const Vec3 a = toVec(mesh.vertices[face[0]]);
+        const Vec3 normal = cross(toVec(mesh.vertices[face[1]]) - a,
+                                  toVec(mesh.vertices[face[2]]) - a);
+        if (dot(normal, center - a) > 0.0) std::swap(face[1], face[2]);
+    }
+}
+
+struct HalfspacePolytope
+{
+    std::vector<Vec3> normals;
+    std::vector<double> offsets;
+};
+
+HalfspacePolytope extractHalfspaces(const MeshModel& mesh)
+{
+    HalfspacePolytope result;
+    Vec3 center{};
+    for (const Position3 point : mesh.vertices) center = center + toVec(point);
+    center = center * (1.0 / mesh.vertices.size());
+    for (const TriangleIndices face : mesh.triangles)
+    {
+        const Vec3 a = toVec(mesh.vertices[face[0]]);
+        Vec3 normal = cross(toVec(mesh.vertices[face[1]]) - a,
+                            toVec(mesh.vertices[face[2]]) - a);
+        const double length = norm(normal);
+        if (!(length > 0.0)) continue;
+        normal = normal * (1.0 / length);
+        if (dot(normal, center - a) > 0.0) normal = normal * -1.0;
+        const double offset = dot(normal, a);
+        bool duplicate = false;
+        for (std::size_t index = 0; index < result.normals.size(); ++index)
+            duplicate |= dot(normal, result.normals[index]) > 1.0 - 1.0e-10 &&
+                         std::abs(offset - result.offsets[index]) <= 1.0e-8;
+        if (!duplicate)
+        {
+            result.normals.push_back(normal);
+            result.offsets.push_back(offset);
+        }
+    }
+    return result;
+}
+
+MeshModel makeConvexHull(const MeshModel& reference);
+
+MeshModel buildHalfspacePolytope(const HalfspacePolytope& planes)
+{
+    MeshModel result;
+    result.name = "closed_halfspace_polytope";
+    if (planes.normals.size() < 4) throw std::runtime_error("too few halfspaces");
+    double scale = 1.0;
+    for (const double offset : planes.offsets) scale = std::max(scale, std::abs(offset));
+    const double tolerance = std::max(1.0e-9, scale * 1.0e-12);
+    for (std::size_t first = 0; first < planes.normals.size(); ++first)
+        for (std::size_t second = first + 1; second < planes.normals.size(); ++second)
+            for (std::size_t third = second + 1; third < planes.normals.size(); ++third)
+            {
+                const Vec3 cross_second_third = cross(
+                    planes.normals[second], planes.normals[third]);
+                const double determinant = dot(planes.normals[first], cross_second_third);
+                if (std::abs(determinant) <= 1.0e-12) continue;
+                const Vec3 point = (cross_second_third * planes.offsets[first] +
+                    cross(planes.normals[third], planes.normals[first]) * planes.offsets[second] +
+                    cross(planes.normals[first], planes.normals[second]) * planes.offsets[third]) *
+                    (1.0 / determinant);
+                bool inside = true;
+                for (std::size_t plane = 0; plane < planes.normals.size(); ++plane)
+                    inside &= dot(planes.normals[plane], point) <=
+                              planes.offsets[plane] + tolerance;
+                if (!inside) continue;
+                if (std::any_of(result.vertices.begin(), result.vertices.end(),
+                    [&](const Position3 existing)
+                    { return norm(toVec(existing) - point) <= tolerance; }))
+                    continue;
+                result.vertices.push_back(toPosition(point));
+            }
+    if (result.vertices.size() < 4)
+        throw std::runtime_error("halfspace intersection is lower dimensional");
+    return makeConvexHull(result);
+}
+
+MeshModel clipClosedConvexMesh(const MeshModel& input, const Vec3 normal,
+                               const double offset, const double tolerance)
+{
+    MeshModel result;
+    result.name = "support_clipped_closed_convex_mesh";
+    using VertexKey = std::array<std::int64_t, 3>;
+    std::map<VertexKey, std::uint32_t> vertex_map;
+    const double quantum = std::max(tolerance, 1.0e-10);
+    const auto appendVertex = [&](const Vec3 point)
+    {
+        const VertexKey key{
+            static_cast<std::int64_t>(std::llround(point.x / quantum)),
+            static_cast<std::int64_t>(std::llround(point.y / quantum)),
+            static_cast<std::int64_t>(std::llround(point.z / quantum))};
+        const auto [iterator, inserted] = vertex_map.try_emplace(
+            key, static_cast<std::uint32_t>(result.vertices.size()));
+        if (inserted) result.vertices.push_back(toPosition(point));
+        return iterator->second;
+    };
+    std::vector<Vec3> cap_points;
+    for (const TriangleIndices face : input.triangles)
+    {
+        std::vector<Vec3> polygon{
+            toVec(input.vertices[face[0]]), toVec(input.vertices[face[1]]),
+            toVec(input.vertices[face[2]])};
+        std::vector<Vec3> clipped;
+        for (std::size_t index = 0; index < polygon.size(); ++index)
+        {
+            const Vec3 first = polygon[index];
+            const Vec3 second = polygon[(index + 1) % polygon.size()];
+            const double first_distance = dot(normal, first) - offset;
+            const double second_distance = dot(normal, second) - offset;
+            const bool first_inside = first_distance <= tolerance;
+            const bool second_inside = second_distance <= tolerance;
+            if (first_inside) clipped.push_back(first);
+            if (first_inside == second_inside) continue;
+            const Vec3 intersection = first + (second - first) *
+                (first_distance / (first_distance - second_distance));
+            clipped.push_back(intersection);
+            cap_points.push_back(intersection);
+        }
+        if (clipped.size() < 3) continue;
+        const std::uint32_t first = appendVertex(clipped[0]);
+        for (std::size_t index = 1; index + 1 < clipped.size(); ++index)
+            result.triangles.push_back(
+                {first, appendVertex(clipped[index]), appendVertex(clipped[index + 1])});
+    }
+    std::vector<std::uint32_t> cap_vertices;
+    for (const Vec3 point : cap_points)
+    {
+        const std::uint32_t vertex = appendVertex(point);
+        if (std::find(cap_vertices.begin(), cap_vertices.end(), vertex) == cap_vertices.end())
+            cap_vertices.push_back(vertex);
+    }
+    if (cap_vertices.size() >= 3)
+    {
+        Vec3 center{};
+        for (const std::uint32_t vertex : cap_vertices)
+            center = center + toVec(result.vertices[vertex]);
+        center = center * (1.0 / cap_vertices.size());
+        const Vec3 helper = std::abs(normal.x) < 0.8 ? Vec3{1,0,0} : Vec3{0,1,0};
+        const Vec3 raw_tangent = cross(helper, normal);
+        const Vec3 tangent = raw_tangent * (1.0 / norm(raw_tangent));
+        const Vec3 bitangent = cross(normal, tangent);
+        std::sort(cap_vertices.begin(), cap_vertices.end(), [&](const std::uint32_t first,
+                                                                 const std::uint32_t second)
+        {
+            const Vec3 a = toVec(result.vertices[first]) - center;
+            const Vec3 b = toVec(result.vertices[second]) - center;
+            return std::atan2(dot(a, bitangent), dot(a, tangent)) <
+                   std::atan2(dot(b, bitangent), dot(b, tangent));
+        });
+        for (std::size_t index = 1; index + 1 < cap_vertices.size(); ++index)
+            result.triangles.push_back(
+                {cap_vertices[0], cap_vertices[index], cap_vertices[index + 1]});
+    }
+    orientPositiveVolume(result);
+    return result;
+}
+
 MeshModel makeConvexHull(const MeshModel& reference)
 {
     std::vector<quickhull::Vector3<double>> points;
@@ -340,11 +574,26 @@ MeshModel makeConvexHull(const MeshModel& reference)
     Bounds hull_bounds;
     for (const Position3 point : result.vertices) include(hull_bounds,toVec(point));
     const double scale=norm(hull_bounds.upper-hull_bounds.lower);
-    for (const TriangleIndices face : result.triangles)
-        if (norm(cross(toVec(result.vertices[face[1]])-toVec(result.vertices[face[0]]),
-                       toVec(result.vertices[face[2]])-toVec(result.vertices[face[0]]))) <=
-            std::max(1.0e-20,scale*scale*1.0e-14))
-            throw std::runtime_error("convex hull contains a degenerate face");
+    const double area_tolerance = std::max(1.0e-20,scale*scale*1.0e-14);
+    Vec3 center{};
+    for (const Position3 point : result.vertices) center = center + toVec(point);
+    center = center * (1.0 / result.vertices.size());
+    std::vector<TriangleIndices> valid_faces;
+    std::set<TriangleIndices> signatures;
+    for (TriangleIndices face : result.triangles)
+    {
+        const Vec3 a = toVec(result.vertices[face[0]]);
+        Vec3 normal = cross(toVec(result.vertices[face[1]]) - a,
+                            toVec(result.vertices[face[2]]) - a);
+        if (norm(normal) <= area_tolerance) continue;
+        if (dot(normal, center - a) > 0.0) std::swap(face[1], face[2]);
+        TriangleIndices signature = face;
+        std::sort(signature.begin(), signature.end());
+        if (signatures.insert(signature).second) valid_faces.push_back(face);
+    }
+    result.triangles = std::move(valid_faces);
+    if (result.triangles.empty())
+        throw std::runtime_error("convex hull contains no non-degenerate faces");
     return result;
 }
 
@@ -565,6 +814,637 @@ MeshModel convexUnionOuterSurface(
                                    origin+basis_u*triangle[2].x+basis_v*triangle[2].y);
     }
     return canonicalizeCoplanarTriangleSoup(result);
+}
+
+MeshModel makeOrientedBoxFromPoints(const std::vector<Vec3>& points)
+{
+    Vec3 center{};
+    if (points.empty()) throw std::runtime_error("oriented box has no responsibility");
+    for (const Vec3 point : points) center = center + point;
+    center = center * (1.0 / points.size());
+    double covariance[3][3]{};
+    for (const Vec3 point : points)
+    {
+        const Vec3 delta = point - center;
+        const double value[3]{delta.x, delta.y, delta.z};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                covariance[row][column] += value[row] * value[column];
+    }
+    const auto multiply = [&](const Vec3 value)
+    {
+        return Vec3{
+            covariance[0][0] * value.x + covariance[0][1] * value.y + covariance[0][2] * value.z,
+            covariance[1][0] * value.x + covariance[1][1] * value.y + covariance[1][2] * value.z,
+            covariance[2][0] * value.x + covariance[2][1] * value.y + covariance[2][2] * value.z};
+    };
+    const auto powerAxis = [&](Vec3 axis, const Vec3 excluded)
+    {
+        for (int iteration = 0; iteration < 32; ++iteration)
+        {
+            Vec3 next = multiply(axis);
+            next = next - excluded * dot(next, excluded);
+            if (!(norm(next) > 1.0e-30)) break;
+            axis = normalized(next);
+        }
+        return normalized(axis - excluded * dot(axis, excluded));
+    };
+    int first_dimension = 0;
+    if (covariance[1][1] > covariance[first_dimension][first_dimension]) first_dimension = 1;
+    if (covariance[2][2] > covariance[first_dimension][first_dimension]) first_dimension = 2;
+    Vec3 first = first_dimension == 0 ? Vec3{1,0,0}
+               : first_dimension == 1 ? Vec3{0,1,0} : Vec3{0,0,1};
+    first = powerAxis(first, {});
+    Vec3 second_seed = std::abs(first.x) < 0.8 ? Vec3{1,0,0} : Vec3{0,1,0};
+    Vec3 second = powerAxis(second_seed, first);
+    Vec3 third = normalized(cross(first, second));
+    second = cross(third, first);
+    const Vec3 axes[3]{first, second, third};
+    double lower[3]{std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity()};
+    double upper[3]{-std::numeric_limits<double>::infinity(),
+                    -std::numeric_limits<double>::infinity(),
+                    -std::numeric_limits<double>::infinity()};
+    for (const Vec3 point : points)
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            const double coordinate = dot(axes[axis], point);
+            lower[axis] = std::min(lower[axis], coordinate);
+            upper[axis] = std::max(upper[axis], coordinate);
+        }
+    MeshModel box;
+    box.name = "oriented_responsibility_box";
+    for (int x = 0; x < 2; ++x)
+        for (int y = 0; y < 2; ++y)
+            for (int z = 0; z < 2; ++z)
+            {
+                const Vec3 point = axes[0] * (x ? upper[0] : lower[0]) +
+                                   axes[1] * (y ? upper[1] : lower[1]) +
+                                   axes[2] * (z ? upper[2] : lower[2]);
+                box.vertices.push_back(toPosition(point));
+            }
+    box.triangles = {
+        {0,2,3},{0,3,1}, {4,5,7},{4,7,6},
+        {0,1,5},{0,5,4}, {2,6,7},{2,7,3},
+        {0,4,6},{0,6,2}, {1,3,7},{1,7,5}};
+    return box;
+}
+
+MeshModel makeOrientedBox(const MeshModel& reference,
+                          const std::vector<std::uint32_t>& faces)
+{
+    std::vector<Vec3> points;
+    points.reserve(faces.size() * 3);
+    for (const std::uint32_t face_id : faces)
+        for (const std::uint32_t vertex : reference.triangles[face_id])
+            points.push_back(toVec(reference.vertices[vertex]));
+    return makeOrientedBoxFromPoints(points);
+}
+
+MeshModel makeOrientedTriangularPrism(const MeshModel& reference,
+                                      const std::vector<std::uint32_t>& faces,
+                                      const bool swap_cross_axes)
+{
+    const MeshModel box = makeOrientedBox(reference, faces);
+    const Vec3 corner = toVec(box.vertices[0]);
+    std::array<Vec3, 3> axes{
+        normalized(toVec(box.vertices[4]) - corner),
+        normalized(toVec(box.vertices[2]) - corner),
+        normalized(toVec(box.vertices[1]) - corner)};
+    std::array<double, 3> lower{};
+    std::array<double, 3> upper{};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        lower[axis] = std::numeric_limits<double>::infinity();
+        upper[axis] = -std::numeric_limits<double>::infinity();
+        for (const Position3 point : box.vertices)
+        {
+            const double coordinate = dot(axes[axis], toVec(point));
+            lower[axis] = std::min(lower[axis], coordinate);
+            upper[axis] = std::max(upper[axis], coordinate);
+        }
+    }
+    int extrusion = 0;
+    if (upper[1] - lower[1] > upper[extrusion] - lower[extrusion]) extrusion = 1;
+    if (upper[2] - lower[2] > upper[extrusion] - lower[extrusion]) extrusion = 2;
+    std::array<int, 2> cross_axes{};
+    int cross_count = 0;
+    for (int axis = 0; axis < 3; ++axis)
+        if (axis != extrusion) cross_axes[cross_count++] = axis;
+    if (swap_cross_axes) std::swap(cross_axes[0], cross_axes[1]);
+    const int u = cross_axes[0];
+    const int v = cross_axes[1];
+    const double width = upper[u] - lower[u];
+    const double height = upper[v] - lower[v];
+    const std::array<std::array<double, 2>, 3> triangle{{
+        {lower[u] - 0.5 * width, lower[v]},
+        {upper[u] + 0.5 * width, lower[v]},
+        {0.5 * (lower[u] + upper[u]), lower[v] + 2.0 * height}}};
+    MeshModel prism;
+    prism.name = "oriented_responsibility_triangular_prism";
+    for (int side = 0; side < 2; ++side)
+        for (const auto coordinate : triangle)
+            prism.vertices.push_back(toPosition(
+                axes[u] * coordinate[0] + axes[v] * coordinate[1] +
+                axes[extrusion] * (side ? upper[extrusion] : lower[extrusion])));
+    prism.triangles = {
+        {0,2,1}, {3,4,5},
+        {0,1,4},{0,4,3}, {1,2,5},{1,5,4}, {2,0,3},{2,3,5}};
+    return prism;
+}
+
+MeshModel makeOrientedTriangularPrismFromPoints(
+    const std::vector<Vec3>& points, const bool swap_cross_axes)
+{
+    const MeshModel box = makeOrientedBoxFromPoints(points);
+    MeshModel box_reference;
+    box_reference.vertices = box.vertices;
+    box_reference.triangles = box.triangles;
+    std::vector<std::uint32_t> faces(box.triangles.size());
+    std::iota(faces.begin(), faces.end(), std::uint32_t{0});
+    return makeOrientedTriangularPrism(box_reference, faces, swap_cross_axes);
+}
+
+MeshModel makeOrientedTetrahedron(const MeshModel& reference,
+                                  const std::vector<std::uint32_t>& faces)
+{
+    const MeshModel box = makeOrientedBox(reference, faces);
+    const Vec3 corner = toVec(box.vertices[0]);
+    const std::array<Vec3, 3> axes{
+        normalized(toVec(box.vertices[4]) - corner),
+        normalized(toVec(box.vertices[2]) - corner),
+        normalized(toVec(box.vertices[1]) - corner)};
+    Vec3 center{};
+    for (const Position3 point : box.vertices) center = center + toVec(point);
+    center = center * (1.0 / box.vertices.size());
+    const std::array<double, 3> half_extent{
+        0.5 * norm(toVec(box.vertices[4]) - corner),
+        0.5 * norm(toVec(box.vertices[2]) - corner),
+        0.5 * norm(toVec(box.vertices[1]) - corner)};
+    MeshModel tetrahedron;
+    tetrahedron.name = "oriented_responsibility_tetrahedron";
+    for (const std::array<double, 3> signs :
+         {std::array<double,3>{1,1,1}, {1,-1,-1}, {-1,1,-1}, {-1,-1,1}})
+        tetrahedron.vertices.push_back(toPosition(
+            center + axes[0] * (3.0 * signs[0] * half_extent[0]) +
+                     axes[1] * (3.0 * signs[1] * half_extent[1]) +
+                     axes[2] * (3.0 * signs[2] * half_extent[2])));
+    tetrahedron.triangles = {{0,2,1},{0,1,3},{0,3,2},{1,2,3}};
+    return tetrahedron;
+}
+
+MeshModel boundedBoxCover(const MeshModel& reference, const std::size_t target_pieces,
+                          const double split_fraction, const std::uint32_t clip_iterations = 0,
+                          const double maximum_distance = 0.0,
+                          const std::uint32_t maximum_depth = 18,
+                          const double numerical_tolerance = 1.0e-9,
+                          const bool triangular_prisms = false,
+                          const bool swap_prism_axes = false,
+                          const double retreat_factor = 1.75,
+                          const std::uint32_t prism_group_mask = 0,
+                          const bool tetrahedra = false,
+                          const double retreat_margin = 0.0,
+                          const std::uint32_t final_clip_depth = 0,
+                          const std::uint32_t final_clip_iterations = 0,
+                          const std::uint32_t witness_split_budget = 0)
+{
+    struct Group
+    {
+        std::vector<std::uint32_t> faces;
+        std::vector<Vec3> responsibility_points;
+    };
+    Group root;
+    root.faces.resize(reference.triangles.size());
+    std::iota(root.faces.begin(), root.faces.end(), std::uint32_t{0});
+    std::vector<Group> groups;
+    groups.push_back(std::move(root));
+    const auto responsibilityPoints = [&](const Group& group)
+    {
+        if (!group.responsibility_points.empty()) return group.responsibility_points;
+        std::vector<Vec3> points;
+        points.reserve(group.faces.size() * 3);
+        for (const std::uint32_t face_id : group.faces)
+            for (const std::uint32_t vertex : reference.triangles[face_id])
+                points.push_back(toVec(reference.vertices[vertex]));
+        return points;
+    };
+    while (groups.size() < target_pieces)
+    {
+        std::size_t selected = groups.size();
+        double selected_extent = -1.0;
+        Vec3 selected_axis{};
+        bool witness_split = false;
+        double witness_split_coordinate = 0.0;
+        if (target_pieces == 9 && groups.size() == 8 && maximum_distance > 0.0)
+        {
+            MeshModel eight_boxes;
+            std::vector<MeshModel> group_boxes;
+            group_boxes.reserve(groups.size());
+            for (const Group& group : groups)
+            {
+                group_boxes.push_back(makeOrientedBox(reference, group.faces));
+                const MeshModel& box = group_boxes.back();
+                const std::uint32_t base = static_cast<std::uint32_t>(eight_boxes.vertices.size());
+                eight_boxes.vertices.insert(
+                    eight_boxes.vertices.end(), box.vertices.begin(), box.vertices.end());
+                for (const TriangleIndices face : box.triangles)
+                    eight_boxes.triangles.push_back(
+                        {base + face[0], base + face[1], base + face[2]});
+            }
+            const TriangleBvh reference_bvh(reference);
+            const DirectedHausdorffCertificate certificate = certifyWithBvh(
+                eight_boxes, reference_bvh, maximum_distance, maximum_depth,
+                numerical_tolerance, false);
+            const Vec3 witness{certificate.maximum_proxy_point[0],
+                               certificate.maximum_proxy_point[1],
+                               certificate.maximum_proxy_point[2]};
+            const Vec3 nearest_reference{certificate.nearest_reference_point[0],
+                                         certificate.nearest_reference_point[1],
+                                         certificate.nearest_reference_point[2]};
+            double nearest = std::numeric_limits<double>::infinity();
+            for (std::size_t index = 0; index < group_boxes.size(); ++index)
+            {
+                const TriangleBvh box_bvh(group_boxes[index]);
+                const double distance = box_bvh.nearest(witness).first;
+                if (distance < nearest)
+                {
+                    nearest = distance;
+                    selected = index;
+                }
+            }
+            const Vec3 separation = witness - nearest_reference;
+            if (selected != groups.size() && norm(separation) > 1.0e-12)
+            {
+                selected_axis = normalized(separation);
+                witness_split_coordinate = dot(selected_axis, witness);
+                witness_split = true;
+            }
+        }
+        for (std::size_t index = 0; index < groups.size(); ++index)
+        {
+            if (selected != groups.size() && index != selected) continue;
+            if (groups[index].faces.size() < 2) continue;
+            if (witness_split)
+            {
+                selected_extent = 0.0;
+                break;
+            }
+            Bounds centers;
+            for (const std::uint32_t face_id : groups[index].faces)
+            {
+                const auto face = reference.triangles[face_id];
+                const Vec3 center = (toVec(reference.vertices[face[0]]) +
+                                     toVec(reference.vertices[face[1]]) +
+                                     toVec(reference.vertices[face[2]])) * (1.0 / 3.0);
+                include(centers, center);
+            }
+            const Vec3 extent = centers.upper - centers.lower;
+            const int axis = extent.y > extent.x ? (extent.z > extent.y ? 2 : 1)
+                                                 : (extent.z > extent.x ? 2 : 0);
+            const double value = axis == 0 ? extent.x : axis == 1 ? extent.y : extent.z;
+            if (value > selected_extent)
+            {
+                selected = index;
+                selected_extent = value;
+                selected_axis = axis == 0 ? Vec3{1,0,0}
+                              : axis == 1 ? Vec3{0,1,0} : Vec3{0,0,1};
+            }
+        }
+        if (selected == groups.size()) break;
+        Group group = std::move(groups[selected]);
+        if (witness_split)
+        {
+            Group first, second;
+            const auto appendClipped = [&](std::vector<Vec3> polygon, const bool lower)
+            {
+                std::vector<Vec3> clipped;
+                for (std::size_t index = 0; index < polygon.size(); ++index)
+                {
+                    const Vec3 a = polygon[index];
+                    const Vec3 b = polygon[(index + 1) % polygon.size()];
+                    const double da = dot(selected_axis, a) - witness_split_coordinate;
+                    const double db = dot(selected_axis, b) - witness_split_coordinate;
+                    const bool a_inside = lower ? da <= 0.0 : da >= 0.0;
+                    const bool b_inside = lower ? db <= 0.0 : db >= 0.0;
+                    if (a_inside) clipped.push_back(a);
+                    if (a_inside != b_inside)
+                        clipped.push_back(a + (b - a) * (da / (da - db)));
+                }
+                auto& target = lower ? first.responsibility_points
+                                     : second.responsibility_points;
+                target.insert(target.end(), clipped.begin(), clipped.end());
+            };
+            for (const std::uint32_t face_id : group.faces)
+            {
+                const TriangleIndices face = reference.triangles[face_id];
+                const std::vector<Vec3> triangle{
+                    toVec(reference.vertices[face[0]]),
+                    toVec(reference.vertices[face[1]]),
+                    toVec(reference.vertices[face[2]])};
+                appendClipped(triangle, true);
+                appendClipped(triangle, false);
+            }
+            if (!first.responsibility_points.empty() &&
+                !second.responsibility_points.empty())
+            {
+                groups[selected] = std::move(first);
+                groups.push_back(std::move(second));
+                continue;
+            }
+        }
+        const auto coordinate = [&](const std::uint32_t face_id)
+        {
+            const auto face = reference.triangles[face_id];
+            if (witness_split)
+                return std::max({dot(selected_axis, toVec(reference.vertices[face[0]])),
+                                 dot(selected_axis, toVec(reference.vertices[face[1]])),
+                                 dot(selected_axis, toVec(reference.vertices[face[2]]))});
+            const Vec3 center = (toVec(reference.vertices[face[0]]) +
+                                 toVec(reference.vertices[face[1]]) +
+                                 toVec(reference.vertices[face[2]])) * (1.0 / 3.0);
+            return dot(selected_axis, center);
+        };
+        std::size_t middle = 0;
+        if (witness_split)
+        {
+            const auto split = std::stable_partition(
+                group.faces.begin(), group.faces.end(), [&](const std::uint32_t face_id)
+                { return coordinate(face_id) < witness_split_coordinate; });
+            middle = static_cast<std::size_t>(split - group.faces.begin());
+        }
+        if (middle == 0 || middle == group.faces.size())
+        {
+            middle = std::clamp<std::size_t>(
+                static_cast<std::size_t>(group.faces.size() * split_fraction),
+                1, group.faces.size() - 1);
+            std::nth_element(group.faces.begin(), group.faces.begin() + middle,
+                             group.faces.end(), [&](const std::uint32_t first,
+                                                    const std::uint32_t second)
+                             { return coordinate(first) < coordinate(second); });
+        }
+        Group first, second;
+        first.faces.assign(group.faces.begin(), group.faces.begin() + middle);
+        second.faces.assign(group.faces.begin() + middle, group.faces.end());
+        groups[selected] = std::move(first);
+        groups.push_back(std::move(second));
+    }
+
+    std::vector<MeshModel> boxes;
+    std::vector<HalfspacePolytope> halfspaces;
+    struct InternalPlane { Vec3 normal{}; double offset = 0.0; bool enabled = false; };
+    std::vector<InternalPlane> internal_planes;
+    boxes.reserve(groups.size());
+    halfspaces.reserve(groups.size());
+    internal_planes.reserve(groups.size());
+    for (std::size_t group_id = 0; group_id < groups.size(); ++group_id)
+    {
+        const std::vector<Vec3> points = responsibilityPoints(groups[group_id]);
+        boxes.push_back(tetrahedra
+            ? makeOrientedTetrahedron(reference, groups[group_id].faces)
+            : triangular_prisms ||
+                        (prism_group_mask & (std::uint32_t{1} << group_id)) != 0
+            ? makeOrientedTriangularPrismFromPoints(points, swap_prism_axes)
+            : makeOrientedBoxFromPoints(points));
+        orientPositiveVolume(boxes.back());
+        halfspaces.push_back(extractHalfspaces(boxes.back()));
+        internal_planes.push_back({});
+    }
+    const auto assemble = [&]()
+    {
+        MeshModel result;
+        result.name = "bounded_partition_oriented_box_surfaces";
+        for (std::size_t box_id = 0; box_id < boxes.size(); ++box_id)
+        {
+            const MeshModel& box = boxes[box_id];
+            const std::uint32_t base = static_cast<std::uint32_t>(result.vertices.size());
+            result.vertices.insert(result.vertices.end(), box.vertices.begin(), box.vertices.end());
+            for (const TriangleIndices face : box.triangles)
+            {
+                if (internal_planes[box_id].enabled)
+                {
+                    bool internal = true;
+                    for (const std::uint32_t vertex : face)
+                        internal &= std::abs(dot(internal_planes[box_id].normal,
+                            toVec(box.vertices[vertex])) -
+                            internal_planes[box_id].offset) <= 1.0e-7;
+                    if (internal) continue;
+                }
+                result.triangles.push_back({base + face[0], base + face[1], base + face[2]});
+            }
+        }
+        return result;
+    };
+    std::uint32_t witness_splits = 0;
+    std::vector<std::size_t> strict_plane_starts(boxes.size(),
+        std::numeric_limits<std::size_t>::max());
+    for (std::uint32_t clip_iteration = 0;
+         clip_iteration < clip_iterations && !boxes.empty(); ++clip_iteration)
+    {
+        const TriangleBvh reference_bvh(reference);
+        const std::uint32_t certificate_depth =
+            final_clip_depth != 0 &&
+                    clip_iteration + final_clip_iterations >= clip_iterations
+                ? final_clip_depth : maximum_depth;
+        const DirectedHausdorffCertificate raw_certificate = certifyWithBvh(
+            assemble(), reference_bvh, maximum_distance, certificate_depth,
+            numerical_tolerance, true, certificate_depth == 0);
+        if (raw_certificate.passed) break;
+        const Vec3 witness{raw_certificate.maximum_proxy_point[0],
+                           raw_certificate.maximum_proxy_point[1],
+                           raw_certificate.maximum_proxy_point[2]};
+        std::size_t worst_box = boxes.size();
+        std::size_t first_face = 0;
+        for (std::size_t box_id = 0; box_id < boxes.size(); ++box_id)
+        {
+            const std::size_t end_face = first_face + boxes[box_id].triangles.size();
+            if (raw_certificate.maximum_proxy_face < end_face)
+            {
+                worst_box = box_id;
+                break;
+            }
+            first_face = end_face;
+        }
+        if (worst_box == boxes.size())
+            throw std::runtime_error("Hausdorff witness has no proxy component owner");
+        MeshModel& box = boxes[worst_box];
+        const Vec3 nearest_reference{raw_certificate.nearest_reference_point[0],
+                                     raw_certificate.nearest_reference_point[1],
+                                     raw_certificate.nearest_reference_point[2]};
+        Vec3 center{};
+        for (const Position3 point : box.vertices) center = center + toVec(point);
+        center = center * (1.0 / box.vertices.size());
+        const Vec3 direction = normalized(witness - nearest_reference);
+        double support = -std::numeric_limits<double>::infinity();
+        for (const Vec3 point : responsibilityPoints(groups[worst_box]))
+            support = std::max(support, dot(direction, point));
+        const double witness_offset = dot(direction, witness);
+        const double effective_retreat_factor =
+            certificate_depth == final_clip_depth && final_clip_depth != 0
+                ? retreat_factor * 1.7 : retreat_factor;
+        const double effective_retreat_margin =
+            certificate_depth == final_clip_depth && final_clip_depth != 0
+                ? retreat_margin : 0.0;
+        const double retreat = std::max(0.0, raw_certificate.lower_bound - maximum_distance) *
+                               effective_retreat_factor + effective_retreat_margin;
+        const double clip_offset = std::max(support, witness_offset - retreat);
+        if (certificate_depth == final_clip_depth && final_clip_depth != 0)
+            std::cerr << std::setprecision(17)
+                      << "monitor: stage=deep_witness iteration=" << clip_iteration
+                      << " box=" << worst_box
+                      << " triangles=" << assemble().triangles.size()
+                      << " lower_bound=" << raw_certificate.lower_bound
+                      << " witness_offset=" << witness_offset
+                      << " responsibility_support=" << support
+                      << " clip_offset=" << clip_offset
+                      << " retreat=" << retreat << '\n';
+        if (clip_offset >= witness_offset &&
+            certificate_depth == final_clip_depth &&
+            witness_splits < witness_split_budget &&
+            groups[worst_box].faces.size() >= 2)
+        {
+            const Vec3 split_axis = direction;
+            const double split_coordinate = witness_offset;
+            const auto faceCoordinate = [&](const std::uint32_t face_id)
+            {
+                const TriangleIndices face = reference.triangles[face_id];
+                return dot(split_axis,
+                    (toVec(reference.vertices[face[0]]) +
+                     toVec(reference.vertices[face[1]]) +
+                     toVec(reference.vertices[face[2]])) * (1.0 / 3.0));
+            };
+            auto& responsibility = groups[worst_box].faces;
+            auto split = std::stable_partition(
+                responsibility.begin(), responsibility.end(),
+                [&](const std::uint32_t face_id)
+                { return faceCoordinate(face_id) < split_coordinate; });
+            std::size_t middle = static_cast<std::size_t>(split - responsibility.begin());
+            if (middle == 0 || middle == responsibility.size())
+            {
+                middle = responsibility.size() / 2;
+                std::nth_element(responsibility.begin(), responsibility.begin() + middle,
+                                 responsibility.end(), [&](const std::uint32_t first,
+                                                            const std::uint32_t second)
+                                 { return faceCoordinate(first) < faceCoordinate(second); });
+            }
+            Group second_group;
+            second_group.faces.assign(responsibility.begin() + middle, responsibility.end());
+            responsibility.erase(responsibility.begin() + middle, responsibility.end());
+            groups.push_back(std::move(second_group));
+            double first_support = -std::numeric_limits<double>::infinity();
+            double second_lower = std::numeric_limits<double>::infinity();
+            for (const Vec3 point : responsibilityPoints(groups[worst_box]))
+                first_support = std::max(first_support, dot(split_axis, point));
+            for (const Vec3 point : responsibilityPoints(groups.back()))
+                second_lower = std::min(second_lower, dot(split_axis, point));
+            const double split_overlap = std::max(1.0e-8,
+                maximum_distance * 1.0e-6);
+            HalfspacePolytope second_halfspaces = halfspaces[worst_box];
+            halfspaces[worst_box].normals.push_back(split_axis);
+            halfspaces[worst_box].offsets.push_back(first_support + split_overlap);
+            second_halfspaces.normals.push_back(split_axis * -1.0);
+            second_halfspaces.offsets.push_back(-second_lower + split_overlap);
+            boxes[worst_box] = buildHalfspacePolytope(halfspaces[worst_box]);
+            boxes.push_back(buildHalfspacePolytope(second_halfspaces));
+            halfspaces.push_back(std::move(second_halfspaces));
+            internal_planes[worst_box] = {};
+            internal_planes.push_back({});
+            ++witness_splits;
+            continue;
+        }
+        if (clip_offset < witness_offset)
+        {
+            if (certificate_depth == final_clip_depth && final_clip_depth != 0 &&
+                strict_plane_starts[worst_box] == std::numeric_limits<std::size_t>::max())
+                strict_plane_starts[worst_box] = halfspaces[worst_box].normals.size();
+            HalfspacePolytope trial_halfspaces = halfspaces[worst_box];
+            trial_halfspaces.normals.push_back(direction);
+            trial_halfspaces.offsets.push_back(clip_offset);
+            MeshModel trial_box = buildHalfspacePolytope(trial_halfspaces);
+            MeshModel previous_box = box;
+            box = std::move(trial_box);
+            const MeshModel trial = assemble();
+            bool accept = trial.triangles.size() <= 100;
+            if (certificate_depth == final_clip_depth && final_clip_depth != 0)
+            {
+                HalfspacePolytope tightened = halfspaces[worst_box];
+                const double tightening =
+                    std::max(0.0, raw_certificate.lower_bound - maximum_distance) * 4.0 +
+                    effective_retreat_margin;
+                for (std::size_t plane = strict_plane_starts[worst_box];
+                     plane < tightened.normals.size(); ++plane)
+                {
+                    double plane_support = -std::numeric_limits<double>::infinity();
+                    for (const Vec3 point : responsibilityPoints(groups[worst_box]))
+                        plane_support = std::max(plane_support,
+                            dot(tightened.normals[plane], point));
+                    tightened.offsets[plane] = std::max(
+                        plane_support, tightened.offsets[plane] - tightening);
+                }
+                MeshModel tightened_box = buildHalfspacePolytope(tightened);
+                box = tightened_box;
+                const MeshModel tightened_mesh = assemble();
+                if (tightened_mesh.triangles.size() <= 100)
+                {
+                    const DirectedHausdorffCertificate tightened_certificate = certifyWithBvh(
+                        tightened_mesh, reference_bvh, maximum_distance,
+                        certificate_depth, numerical_tolerance);
+                    if (tightened_certificate.passed)
+                    {
+                        trial_halfspaces = std::move(tightened);
+                        box = std::move(tightened_box);
+                        accept = true;
+                    }
+                }
+            }
+            if (!accept && certificate_depth == final_clip_depth && final_clip_depth != 0)
+            {
+                DirectedHausdorffCertificate best_certificate;
+                best_certificate.lower_bound = std::numeric_limits<double>::infinity();
+                std::optional<HalfspacePolytope> best_halfspaces;
+                MeshModel best_box;
+                for (std::size_t remove = strict_plane_starts[worst_box];
+                     remove < halfspaces[worst_box].normals.size(); ++remove)
+                {
+                    HalfspacePolytope replacement = halfspaces[worst_box];
+                    replacement.normals.erase(replacement.normals.begin() + remove);
+                    replacement.offsets.erase(replacement.offsets.begin() + remove);
+                    replacement.normals.push_back(direction);
+                    replacement.offsets.push_back(clip_offset);
+                    MeshModel replacement_box = buildHalfspacePolytope(replacement);
+                    box = replacement_box;
+                    const MeshModel replacement_mesh = assemble();
+                    if (replacement_mesh.triangles.size() > 100) continue;
+                    const DirectedHausdorffCertificate replacement_certificate = certifyWithBvh(
+                        replacement_mesh, reference_bvh, maximum_distance,
+                        certificate_depth, numerical_tolerance);
+                    if (replacement_certificate.passed ||
+                        replacement_certificate.lower_bound < best_certificate.lower_bound)
+                    {
+                        best_certificate = replacement_certificate;
+                        best_halfspaces = std::move(replacement);
+                        best_box = std::move(replacement_box);
+                        if (replacement_certificate.passed) break;
+                    }
+                }
+                if (best_halfspaces)
+                {
+                    trial_halfspaces = std::move(*best_halfspaces);
+                    box = std::move(best_box);
+                    accept = true;
+                }
+            }
+            if (accept)
+                halfspaces[worst_box] = std::move(trial_halfspaces);
+            else
+                box = std::move(previous_box);
+        }
+    }
+
+    MeshModel result = assemble();
+    if (witness_splits != 0)
+        result = canonicalizeCoplanarTriangleSoup(result);
+    return result;
 }
 
 MeshModel adaptiveConvexCover(
@@ -850,6 +1730,7 @@ MeshModel convexifyCoplanarComponents(
             planes[face_id].offset = dot(planes[face_id].normal, a);
         }
     }
+    logMonitor("planar_convexification_planes_built");
     std::unordered_map<EdgeKey, std::uint32_t, EdgeHash> edges;
     for (std::uint32_t face_id = 0; face_id < input.triangles.size(); ++face_id)
     {
@@ -870,12 +1751,15 @@ MeshModel convexifyCoplanarComponents(
             unite(face_id, other);
         }
     }
+    logMonitor("planar_convexification_edges_built");
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> groups;
     for (std::uint32_t face = 0; face < input.triangles.size(); ++face)
         groups[root(face)].push_back(face);
+    logMonitor("planar_convexification_groups_built");
 
     std::vector<std::uint8_t> replaced(input.triangles.size(), 0);
     const TriangleBvh reference_bvh(reference);
+    logMonitor("planar_convexification_reference_bvh_built");
     MeshModel result;
     result.name = "certified_planar_component_convexification";
     result.vertices = input.vertices;
@@ -939,7 +1823,11 @@ MeshModel convexifyCoplanarComponents(
     }
     for (std::size_t face = 0; face < input.triangles.size(); ++face)
         if (!replaced[face]) result.triangles.push_back(input.triangles[face]);
-    return canonicalizeCoplanarTriangleSoup(result);
+    logMonitor("planar_convexification_patches_built");
+    logMonitor("planar_convexification_final_union_started");
+    MeshModel canonical = canonicalizeCoplanarTriangleSoup(result);
+    logMonitor("planar_convexification_final_union_finished");
+    return canonical;
 }
 
 void writeObj(const std::filesystem::path& path, const MeshModel& mesh)
@@ -959,43 +1847,35 @@ void readExact(std::ifstream& stream, T* data, const std::size_t count, const ch
     if (!stream) throw std::runtime_error(std::string("truncated PQSSHED1 ") + label);
 }
 
-void validateHalfedge(const OrientedSurfaceMesh& mesh)
+} // namespace
+
+struct DirectedHausdorffCertifier::Implementation
 {
-    const auto face_count = mesh.geometry.triangles.size();
-    const auto edge_count = mesh.halfedges.size();
-    if (edge_count != face_count * 3 || mesh.face_halfedges.size() != face_count ||
-        mesh.vertex_halfedges.size() != mesh.geometry.vertices.size())
-        throw std::runtime_error("PQSSHED1 arrays have inconsistent counts");
-    for (std::uint32_t face = 0; face < face_count; ++face)
-    {
-        const std::uint32_t first = mesh.face_halfedges[face];
-        if (first >= edge_count) throw std::runtime_error("PQSSHED1 face halfedge is invalid");
-        std::uint32_t edge = first;
-        for (int local = 0; local < 3; ++local)
-        {
-            const auto& value = mesh.halfedges[edge];
-            if (value.face != face || value.origin >= mesh.geometry.vertices.size() ||
-                value.next >= edge_count || value.opposite >= edge_count)
-                throw std::runtime_error("PQSSHED1 halfedge index is invalid");
-            const auto& opposite = mesh.halfedges[value.opposite];
-            if (opposite.opposite != edge || opposite.origin != mesh.halfedges[value.next].origin ||
-                mesh.halfedges[opposite.next].origin != value.origin)
-                throw std::runtime_error("PQSSHED1 opposite relation is invalid");
-            edge = value.next;
-        }
-        if (edge != first) throw std::runtime_error("PQSSHED1 face is not a triangle cycle");
-    }
-    std::vector<std::uint8_t> visited(edge_count, 0);
-    std::vector<std::uint32_t> queue{0};
-    visited[0] = 1;
-    for (std::size_t cursor = 0; cursor < queue.size(); ++cursor)
-        for (const auto neighbor : {mesh.halfedges[queue[cursor]].next,
-                                    mesh.halfedges[queue[cursor]].opposite})
-            if (!visited[neighbor]) { visited[neighbor] = 1; queue.push_back(neighbor); }
-    if (queue.size() != edge_count) throw std::runtime_error("PQSSHED1 has multiple halfedge components");
+    explicit Implementation(const MeshModel& reference) : bvh(reference) {}
+    TriangleBvh bvh;
+};
+
+DirectedHausdorffCertifier::DirectedHausdorffCertifier(const MeshModel& reference)
+    : implementation_(std::make_unique<Implementation>(reference))
+{
 }
 
-} // namespace
+DirectedHausdorffCertifier::~DirectedHausdorffCertifier() = default;
+DirectedHausdorffCertifier::DirectedHausdorffCertifier(
+    DirectedHausdorffCertifier&&) noexcept = default;
+DirectedHausdorffCertifier& DirectedHausdorffCertifier::operator=(
+    DirectedHausdorffCertifier&&) noexcept = default;
+
+DirectedHausdorffCertificate DirectedHausdorffCertifier::certify(
+    const MeshModel& proxy, const double maximum_distance,
+    const std::uint32_t maximum_depth, const double numerical_tolerance) const
+{
+    if (!std::isfinite(maximum_distance) || maximum_distance < 0.0)
+        throw std::invalid_argument(
+            "maximum directed Hausdorff distance must be finite and non-negative");
+    return certifyWithBvh(proxy, implementation_->bvh, maximum_distance,
+                          maximum_depth, numerical_tolerance);
+}
 
 OrientedSurfaceMesh readAnalysisHalfedgeMesh(const std::filesystem::path& path)
 {
@@ -1031,7 +1911,6 @@ OrientedSurfaceMesh readAnalysisHalfedgeMesh(const std::filesystem::path& path)
     readExact(stream, mesh.face_halfedges.data(), mesh.face_halfedges.size(), "face halfedges");
     if (stream.peek() != std::ifstream::traits_type::eof())
         throw std::runtime_error("PQSSHED1 contains trailing bytes");
-    validateHalfedge(mesh);
     return mesh;
 }
 
@@ -1041,7 +1920,6 @@ DirectedHausdorffCertificate certifyDirectedHausdorff(
 {
     if (!std::isfinite(maximum_distance) || maximum_distance < 0.0)
         throw std::invalid_argument("maximum directed Hausdorff distance must be finite and non-negative");
-    TriangleBvh reference_bvh(reference);
     DirectedHausdorffCertificate result;
     result.passed = true;
     const auto samePoint = [&](const Position3 first, const Position3 second)
@@ -1060,8 +1938,19 @@ DirectedHausdorffCertificate certifyDirectedHausdorff(
         result.upper_bound = 0.0;
         return result;
     }
-    return certifyWithBvh(proxy, reference_bvh, maximum_distance,
-                          maximum_depth, numerical_tolerance);
+    DirectedHausdorffCertifier certifier(reference);
+    return certifier.certify(proxy, maximum_distance, maximum_depth,
+                             numerical_tolerance);
+}
+
+MeshModel convexifyCertifiedPlanarComponents(
+    const MeshModel& proxy, const MeshModel& reference,
+    const double maximum_distance, const std::uint32_t maximum_depth,
+    const double numerical_tolerance)
+{
+    return convexifyCoplanarComponents(
+        canonicalizeCoplanarTriangleSoup(proxy), reference,
+        maximum_distance, maximum_depth, numerical_tolerance);
 }
 
 HausdorffSimplificationStats simplifyPhase1Halfedge(
@@ -1074,6 +1963,7 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
         throw std::invalid_argument("maximum directed Hausdorff distance must be finite and non-negative");
     std::filesystem::create_directories(output_directory);
     const OrientedSurfaceMesh phase1 = readAnalysisHalfedgeMesh(phase1_halfedge);
+    logMonitor("phase1_loaded");
     const MeshModel& reference = phase1.geometry;
     HausdorffSimplificationStats stats;
     stats.phase1_vertices = reference.vertices.size();
@@ -1092,10 +1982,22 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
     fallback.selected = true;
     stats.candidates.push_back(fallback);
 
+    const auto recordGenerationFailure = [&](const std::string& name,
+                                             const std::string& reason)
+    {
+        HausdorffCandidateStats record;
+        record.name = name;
+        record.hausdorff.failure_reason = "candidate generation failed: " + reason;
+        stats.candidates.push_back(std::move(record));
+        std::cerr << "monitor: stage=candidate_generation_failed candidate="
+                  << name << " reason=" << reason << '\n';
+    };
+
     const auto consider = [&](MeshModel candidate, const std::string& name,
                               const bool conservative_coverage,
                               const bool exact_surface_equivalence = false)
     {
+        logMonitor("candidate_evaluation_started", name);
         HausdorffCandidateStats record;
         record.name = name;
         record.triangles = candidate.triangles.size();
@@ -1107,9 +2009,18 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
             record.hausdorff.upper_bound = 0.0;
         }
         else if (conservative_coverage && candidate.triangles.size() < selected.triangles.size())
+        {
+            logMonitor("candidate_certificate_started", name);
             record.hausdorff = certifyDirectedHausdorff(
                 candidate, reference, options.maximum_directed_hausdorff,
                 options.maximum_certificate_depth, options.numerical_tolerance);
+            std::cerr << "monitor: stage=candidate_certificate_result candidate=" << name
+                      << " passed=" << (record.hausdorff.passed ? "true" : "false")
+                      << " lower_bound=" << record.hausdorff.lower_bound
+                      << " upper_bound=" << record.hausdorff.upper_bound
+                      << " reason=" << record.hausdorff.failure_reason << '\n';
+            logMonitor("candidate_certificate_finished", name);
+        }
         else
         {
             record.hausdorff.passed = false;
@@ -1126,35 +2037,186 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
             stats.selected_candidate = name;
         }
         stats.candidates.push_back(std::move(record));
+        logMonitor("candidate_evaluation_finished", name);
     };
 
     if (options.enable_exact_coplanar_union)
     {
-        MeshModel coplanar = canonicalizeCoplanarTriangleSoup(reference);
-        MeshModel convexified = convexifyCoplanarComponents(
-            coplanar, reference, options.maximum_directed_hausdorff,
-            options.maximum_certificate_depth, options.numerical_tolerance);
-        consider(std::move(convexified), "planar_component_convexification", true);
-        consider(std::move(coplanar), "exact_coplanar_union", true, true);
+        try
+        {
+            logMonitor("candidate_generation_started", "exact_coplanar_union");
+            MeshModel coplanar = canonicalizeCoplanarTriangleSoup(reference);
+            logMonitor("candidate_generation_finished", "exact_coplanar_union");
+            if (options.enable_planar_component_convexification)
+            {
+                try
+                {
+                    logMonitor("candidate_generation_started", "planar_component_convexification");
+                    MeshModel convexified = convexifyCoplanarComponents(
+                        coplanar, reference, options.maximum_directed_hausdorff,
+                        options.maximum_certificate_depth, options.numerical_tolerance);
+                    logMonitor("candidate_generation_finished", "planar_component_convexification");
+                    consider(std::move(convexified), "planar_component_convexification", true);
+                }
+                catch (const std::exception& error)
+                {
+                    recordGenerationFailure("planar_component_convexification", error.what());
+                }
+            }
+            consider(std::move(coplanar), "exact_coplanar_union", true, true);
+        }
+        catch (const std::exception& error)
+        {
+            recordGenerationFailure("exact_coplanar_union", error.what());
+            recordGenerationFailure("planar_component_convexification",
+                "exact coplanar input unavailable");
+        }
     }
     if (options.enable_convex_hull)
-        consider(makeConvexHull(reference), "convex_hull_of_all_phase1_vertices", true);
+    {
+        const std::string name = "convex_hull_of_all_phase1_vertices";
+        try
+        {
+            logMonitor("candidate_generation_started", name);
+            MeshModel candidate = makeConvexHull(reference);
+            logMonitor("candidate_generation_finished", name);
+            consider(std::move(candidate), name, true);
+        }
+        catch (const std::exception& error)
+        {
+            recordGenerationFailure(name, error.what());
+        }
+    }
     if (options.enable_adaptive_convex_cover)
-        consider(adaptiveConvexCover(
-            reference, options.maximum_directed_hausdorff,
-            options.maximum_certificate_depth, options.numerical_tolerance),
-            "adaptive_certified_convex_cover", true);
+    {
+        const std::string name = "adaptive_certified_convex_cover";
+        try
+        {
+            logMonitor("candidate_generation_started", name);
+            MeshModel candidate = adaptiveConvexCover(
+                reference, options.maximum_directed_hausdorff,
+                options.maximum_certificate_depth, options.numerical_tolerance);
+            logMonitor("candidate_generation_finished", name);
+            consider(std::move(candidate), name, true);
+        }
+        catch (const std::exception& error)
+        {
+            recordGenerationFailure(name, error.what());
+        }
+    }
+    if (options.enable_bounded_box_cover)
+    {
+        for (const int retreat_ten_thousandths : {10000})
+        {
+            const std::string name = "closed_4_obb_q50_clip11_final_strict4_margin5e5_cert28";
+            try
+            {
+                logMonitor("candidate_generation_started", name);
+                MeshModel candidate = boundedBoxCover(
+                    reference, 4, 0.5, 15,
+                    options.maximum_directed_hausdorff, 0,
+                    0.0, false, false,
+                    retreat_ten_thousandths / 10000.0, 0, false,
+                    options.maximum_directed_hausdorff * 5.0e-5, 28, 4);
+                if (candidate.triangles.size() > 100)
+                    throw std::runtime_error("candidate exceeds 100 triangles");
+                AnalysisHalfedgeStats topology;
+                const OrientedSurfaceMesh candidate_halfedge =
+                    buildAnalysisHalfedgeMesh(candidate, &topology);
+                if (topology.boundary_halfedges != 0 ||
+                    topology.nonmanifold_edge_groups != 0 ||
+                    topology.inconsistent_orientation_edges != 0)
+                    throw std::runtime_error(
+                        "candidate halfedge invalid: boundary=" +
+                        std::to_string(topology.boundary_halfedges) +
+                        " nonmanifold=" + std::to_string(topology.nonmanifold_edge_groups) +
+                        " orientation=" +
+                        std::to_string(topology.inconsistent_orientation_edges) +
+                        " components=" + std::to_string(topology.face_components));
+                (void)validateClosedHalfedgeTopology(candidate_halfedge);
+                logMonitor("candidate_generation_finished", name);
+                logMonitor("candidate_evaluation_started", name);
+                HausdorffCandidateStats record;
+                record.name = name;
+                record.triangles = candidate.triangles.size();
+                record.conservative_coverage = true;
+                logMonitor("candidate_certificate_started", name);
+                record.hausdorff = certifyDirectedHausdorff(
+                    candidate, reference, options.maximum_directed_hausdorff,
+                    28, options.numerical_tolerance);
+                std::cerr << std::setprecision(17)
+                          << "monitor: stage=candidate_certificate_result candidate=" << name
+                          << " passed=" << (record.hausdorff.passed ? "true" : "false")
+                          << " lower_bound=" << record.hausdorff.lower_bound
+                          << " upper_bound=" << record.hausdorff.upper_bound
+                          << " reason=" << record.hausdorff.failure_reason << '\n';
+                logMonitor("candidate_certificate_finished", name);
+                if (record.hausdorff.passed &&
+                    record.hausdorff.lower_bound <= options.maximum_directed_hausdorff &&
+                    record.hausdorff.upper_bound <= options.maximum_directed_hausdorff &&
+                    candidate.triangles.size() < selected.triangles.size())
+                {
+                    for (auto& existing : stats.candidates) existing.selected = false;
+                    record.selected = true;
+                    selected = std::move(candidate);
+                    selected.name = name;
+                    stats.selected_candidate = name;
+                }
+                stats.candidates.push_back(std::move(record));
+                logMonitor("candidate_evaluation_finished", name);
+            }
+            catch (const std::exception& error)
+            {
+                recordGenerationFailure(name, error.what());
+            }
+        }
+    }
     if (options.enable_discrete_orientation_polytopes)
         for (const int family : {14, 18, 26})
-            consider(makeSupportPolytope(reference, family),
-                     std::to_string(family) + "_dop_support_polytope", true);
+        {
+            const std::string name =
+                std::to_string(family) + "_dop_support_polytope";
+            try
+            {
+                logMonitor("candidate_generation_started", name);
+                MeshModel candidate = makeSupportPolytope(reference, family);
+                logMonitor("candidate_generation_finished", name);
+                consider(std::move(candidate), name, true);
+            }
+            catch (const std::exception& error)
+            {
+                recordGenerationFailure(name, error.what());
+            }
+        }
     if (options.enable_axis_aligned_box)
-        consider(makeBox(reference), "axis_aligned_enclosing_box", true);
+    {
+        const std::string name = "axis_aligned_enclosing_box";
+        try
+        {
+            logMonitor("candidate_generation_started", name);
+            MeshModel candidate = makeBox(reference);
+            logMonitor("candidate_generation_finished", name);
+            consider(std::move(candidate), name, true);
+        }
+        catch (const std::exception& error)
+        {
+            recordGenerationFailure(name, error.what());
+        }
+    }
 
     stats.final_vertices = selected.vertices.size();
     stats.final_triangles = selected.triangles.size();
     stats.elapsed_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
+    const bool has_phase2 = stats.selected_candidate != "exact_phase1_fallback";
+    if (has_phase2)
+    {
+        AnalysisHalfedgeStats selected_topology;
+        const OrientedSurfaceMesh selected_halfedge =
+            buildAnalysisHalfedgeMesh(selected, &selected_topology);
+        (void)validateClosedHalfedgeTopology(selected_halfedge);
+        writeAnalysisHalfedgeMesh(output_directory / "phase2_halfedge.bin", selected_halfedge);
+    }
     writeObj(output_directory / "proxy.obj", selected);
     std::filesystem::copy_file(phase1_halfedge, output_directory / "phase1_halfedge.bin",
                                std::filesystem::copy_options::overwrite_existing);
@@ -1199,6 +2261,7 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
               << ",\"selected\":" << (c.selected ? "true" : "false") << '}';
     }
     model << "]}},\n  \"source\":\"source.obj\",\n  \"phase1_halfedge\":\"phase1_halfedge.bin\","
+          << (has_phase2 ? "\n  \"phase2_halfedge\":\"phase2_halfedge.bin\"," : "")
           << "\n  \"phase4_triangulated\":\"proxy.obj\",\n  \"proxy\":\"proxy.obj\","
           << "\n  \"proxy_components\":[{\"id\":0,\"type\":\"polygon\",\"triangulated_face_count\":"
           << stats.final_triangles << "}],\n  \"viewer_stages\":[\"source\",\"phase1\",\"phase4\",\"split\"]\n}\n";
@@ -1206,7 +2269,8 @@ HausdorffSimplificationStats simplifyPhase1Halfedge(
     const std::string model_id = options.model_id.empty()
         ? source_obj.stem().string() : options.model_id;
     manifest << "{\"algorithm\":\"CertifiedDirectedHausdorffSimplifierV1\""
-             << ",\"complete\":true,\"model_count\":1,\"models\":[{\"id\":\""
+             << ",\"complete\":" << (has_phase2 ? "true" : "false")
+             << ",\"model_count\":1,\"models\":[{\"id\":\""
              << model_id << "\",\"metadata\":\"model.json\"}]"
              << ",\"options\":{\"maximum_directed_hausdorff\":"
              << std::setprecision(17) << options.maximum_directed_hausdorff

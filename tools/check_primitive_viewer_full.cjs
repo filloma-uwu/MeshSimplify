@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 
-const baseUrl = process.argv[2] || 'http://127.0.0.1:8091/viewer/primitive_analysis.html?manifest=/outputs/audit_owner_geometry_full_v1/viewer_manifest.json&model=2';
+const baseUrl = process.argv[2] || 'http://127.0.0.1:8137/viewer/primitive_analysis.html?manifest=/outputs/direct_coverage_uniform_closed_responsibility_full_v13/viewer_manifest.json&model=2';
 const screenshots = path.join(__dirname, '..', 'viewer', 'screenshots');
 fs.mkdirSync(screenshots, { recursive: true });
 let activeBrowser = null;
@@ -60,6 +60,21 @@ async function waitLoaded(page, model) {
   await page.click('[data-mode="split"]');
   await page.waitForFunction(() => window.__primitiveViewerDiagnostics().mode === 'split');
   await page.screenshot({ path: path.join(screenshots, 'primitive-analysis-full-model-16.png'), fullPage: true });
+
+  await page.selectOption('#modelSelect', '18');
+  await waitLoaded(page, 18);
+  await page.click('[data-mode="error"]');
+  await page.waitForFunction(() => window.__primitiveViewerDiagnostics().mode === 'error');
+  const errorOverlay = await page.evaluate(() => window.__primitiveViewerDiagnostics());
+  if (errorOverlay.maximumErrorDistance > 0 &&
+      (errorOverlay.maximumErrorSegmentCount !== 1 ||
+       errorOverlay.maximumErrorEndpointCount !== 2 ||
+       errorOverlay.maximumErrorLinePixels < 6 ||
+       !errorOverlay.maximumErrorOverlayDepthTest ||
+       errorOverlay.maximumErrorOverlayOrder < 100)) {
+    throw new Error(`maximum-error overlay failed: ${JSON.stringify(errorOverlay)}`);
+  }
+  await page.screenshot({ path: path.join(screenshots, 'primitive-analysis-error-model-18.png'), fullPage: true });
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
   mobile.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
